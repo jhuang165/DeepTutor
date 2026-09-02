@@ -1,0 +1,110 @@
+recipes:
+  - id: memory-retrieval
+    version: 1
+    knowledge_type: memory
+    instruction: 通过简要讲解、主动提取和延迟复习建立记忆。
+    evidence_requirements:
+      - 学习者的提取回答
+      - 延迟提取结果
+    default_route: chat
+    activity_sequence:
+      - kind: explanation
+        assessment_method: none
+        independent_required: false
+        transfer_required: false
+        learner_action: 阅读核心事实，并指出应触发回忆的线索。
+      - kind: retrieval
+        assessment_method: retrieval
+        independent_required: true
+        transfer_required: false
+        learner_action: 不查看讲解，回忆该事实。
+      - kind: review
+        assessment_method: delayed_retrieval
+        independent_required: true
+        transfer_required: false
+        learner_action: 间隔一段时间后再次提取该事实。
+  - id: concept-transfer
+    version: 1
+    knowledge_type: concept
+    instruction: 先形成预测，再理解关系，并在新情境中应用概念。
+    evidence_requirements:
+      - 初始预测
+      - 复述讲解
+      - 迁移应用
+    default_route: chat
+    activity_sequence:
+      - kind: prediction
+        assessment_method: diagnostic
+        independent_required: false
+        transfer_required: false
+        learner_action: 在查看讲解前先作出预测。
+      - kind: explanation
+        assessment_method: none
+        independent_required: false
+        transfer_required: false
+        learner_action: 将讲解与自己的预测进行比较。
+      - kind: teach_back
+        assessment_method: teach_back
+        independent_required: true
+        transfer_required: false
+        learner_action: 用自己的话解释这个概念。
+      - kind: guided_attempt
+        assessment_method: transfer_application
+        independent_required: true
+        transfer_required: true
+        learner_action: 将概念应用到一个新例子中。
+  - id: procedure-fading
+    version: 1
+    knowledge_type: procedure
+    instruction: 从示例逐步过渡到带提示、独立和变式练习。
+    evidence_requirements:
+      - 带提示练习结果
+      - 独立解答
+      - 迁移变式结果
+    default_route: chat
+    activity_sequence:
+      - kind: worked_example
+        assessment_method: none
+        independent_required: false
+        transfer_required: false
+        learner_action: 学习示例，并标注每一步的作用。
+      - kind: guided_attempt
+        assessment_method: scaffolded_practice
+        independent_required: false
+        transfer_required: false
+        learner_action: 在提示帮助下完成一道相似题目。
+      - kind: guided_attempt
+        assessment_method: independent_solution
+        independent_required: true
+        transfer_required: false
+        learner_action: 独立解决一道可比题目。
+      - kind: guided_attempt
+        assessment_method: transfer_variation
+        independent_required: true
+        transfer_required: true
+        learner_action: 解决一道改变条件的变式题目。
+  - id: design-critique
+    version: 1
+    knowledge_type: design
+    instruction: 比较证据、创建作品，并独立批评作品。
+    evidence_requirements:
+      - 来源比较
+      - 项目作品
+      - 独立批评
+    default_route: chat
+    activity_sequence:
+      - kind: evidence_comparison
+        assessment_method: source_comparison
+        independent_required: false
+        transfer_required: false
+        learner_action: 比较证据，并找出相关的取舍。
+      - kind: project_step
+        assessment_method: project_artifact
+        independent_required: true
+        transfer_required: false
+        learner_action: 创建一个应用证据的小型作品。
+      - kind: evidence_comparison
+        assessment_method: independent_critique
+        independent_required: true
+        transfer_required: false
+        learner_action: 独立依据证据批评该作品。

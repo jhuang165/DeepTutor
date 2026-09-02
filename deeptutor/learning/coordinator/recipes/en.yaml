@@ -1,0 +1,110 @@
+recipes:
+  - id: memory-retrieval
+    version: 1
+    knowledge_type: memory
+    instruction: Build recall through a brief explanation, active retrieval, and delayed review.
+    evidence_requirements:
+      - Recall response from the learner
+      - Delayed retrieval result
+    default_route: chat
+    activity_sequence:
+      - kind: explanation
+        assessment_method: none
+        independent_required: false
+        transfer_required: false
+        learner_action: Read the core fact and identify the cue that should trigger it.
+      - kind: retrieval
+        assessment_method: retrieval
+        independent_required: true
+        transfer_required: false
+        learner_action: Recall the fact without looking at the explanation.
+      - kind: review
+        assessment_method: delayed_retrieval
+        independent_required: true
+        transfer_required: false
+        learner_action: Retrieve the fact again after a delay.
+  - id: concept-transfer
+    version: 1
+    knowledge_type: concept
+    instruction: Surface a prediction, explain the relationship, and apply it in a new setting.
+    evidence_requirements:
+      - Initial prediction
+      - Teach-back explanation
+      - Transfer application
+    default_route: chat
+    activity_sequence:
+      - kind: prediction
+        assessment_method: diagnostic
+        independent_required: false
+        transfer_required: false
+        learner_action: Make a prediction before seeing the explanation.
+      - kind: explanation
+        assessment_method: none
+        independent_required: false
+        transfer_required: false
+        learner_action: Compare the explanation with the prediction.
+      - kind: teach_back
+        assessment_method: teach_back
+        independent_required: true
+        transfer_required: false
+        learner_action: Explain the concept in your own words.
+      - kind: guided_attempt
+        assessment_method: transfer_application
+        independent_required: true
+        transfer_required: true
+        learner_action: Apply the concept to a new example.
+  - id: procedure-fading
+    version: 1
+    knowledge_type: procedure
+    instruction: Move from a worked example to scaffolded, independent, and varied practice.
+    evidence_requirements:
+      - Scaffolded practice result
+      - Independent solution
+      - Transfer variation result
+    default_route: chat
+    activity_sequence:
+      - kind: worked_example
+        assessment_method: none
+        independent_required: false
+        transfer_required: false
+        learner_action: Study the worked example and annotate each step.
+      - kind: guided_attempt
+        assessment_method: scaffolded_practice
+        independent_required: false
+        transfer_required: false
+        learner_action: Complete a similar problem with prompts.
+      - kind: guided_attempt
+        assessment_method: independent_solution
+        independent_required: true
+        transfer_required: false
+        learner_action: Solve a comparable problem independently.
+      - kind: guided_attempt
+        assessment_method: transfer_variation
+        independent_required: true
+        transfer_required: true
+        learner_action: Solve a variation that changes the problem conditions.
+  - id: design-critique
+    version: 1
+    knowledge_type: design
+    instruction: Compare evidence, create an artifact, and critique it independently.
+    evidence_requirements:
+      - Source comparison
+      - Project artifact
+      - Independent critique
+    default_route: chat
+    activity_sequence:
+      - kind: evidence_comparison
+        assessment_method: source_comparison
+        independent_required: false
+        transfer_required: false
+        learner_action: Compare the evidence and identify relevant trade-offs.
+      - kind: project_step
+        assessment_method: project_artifact
+        independent_required: true
+        transfer_required: false
+        learner_action: Create a small artifact that applies the evidence.
+      - kind: evidence_comparison
+        assessment_method: independent_critique
+        independent_required: true
+        transfer_required: false
+        learner_action: Critique the artifact against the evidence independently.
