@@ -19,9 +19,10 @@ async def test_claude_code_provider_streams_text_and_uses_cli_flags(monkeypatch)
 
     monkeypatch.setattr(module.shutil, "which", lambda command: "/usr/local/bin/claude")
 
-    async def fake_stream(command, *, cwd=None):
+    async def fake_stream(command, *, cwd=None, env=None):
         captured["command"] = list(command)
         captured["cwd"] = cwd
+        captured["env"] = env
         yield _line(
             {
                 "type": "stream_event",
@@ -74,6 +75,27 @@ async def test_claude_code_provider_streams_text_and_uses_cli_flags(monkeypatch)
     assert command[command.index("--tools") + 1] == ""
     assert "--restricted" in command
     assert "--no-session-persistence" in command
+    assert captured["env"] is None
+
+
+@pytest.mark.asyncio
+async def test_claude_code_provider_isolates_login_with_config_dir(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(module.shutil, "which", lambda command: "/usr/local/bin/claude")
+
+    async def fake_stream(command, *, cwd=None, env=None):
+        captured["env"] = env
+        yield _line({"type": "result", "subtype": "success", "result": "ok"})
+        yield "exit", "0"
+
+    monkeypatch.setattr(module, "stream_process_lines", fake_stream)
+
+    response = await ClaudeCodeProvider(
+        default_model="sonnet", config_dir="~/.claude-work"
+    ).chat(messages=[{"role": "user", "content": "hello"}])
+
+    assert response.content == "ok"
+    assert captured["env"] == {"CLAUDE_CONFIG_DIR": "~/.claude-work"}
 
 
 @pytest.mark.asyncio
@@ -81,7 +103,7 @@ async def test_claude_code_provider_exposes_deeptutor_mcp_tool_call(monkeypatch)
     captured: dict[str, object] = {}
     monkeypatch.setattr(module.shutil, "which", lambda command: "/usr/local/bin/claude")
 
-    async def fake_stream(command, *, cwd=None):
+    async def fake_stream(command, *, cwd=None, env=None):
         captured["command"] = list(command)
         mcp_path = Path(command[command.index("--mcp-config") + 1])
         mcp_config = json.loads(mcp_path.read_text(encoding="utf-8"))

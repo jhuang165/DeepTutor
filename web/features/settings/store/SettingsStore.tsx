@@ -95,6 +95,8 @@ export type CatalogProfile = {
   api_version: string;
   extra_headers?: Record<string, string> | string;
   wire_api?: "auto" | "responses" | "chat_completions";
+  /** claude_code only: CLAUDE_CONFIG_DIR override, isolating this profile's Claude Code login. */
+  config_dir?: string;
   proxy?: string;
   max_results?: number;
   /** Set when this profile's credentials come from a catalog connection. */
@@ -1016,6 +1018,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
           api_version: "",
           extra_headers: service === "search" ? undefined : {},
           wire_api: service === "llm" ? "auto" : undefined,
+          config_dir: service === "llm" ? "" : undefined,
           proxy: service === "search" ? "" : undefined,
           models: [],
         };

@@ -214,9 +214,15 @@ class ClaudeCodeProvider(LLMProvider):
         api_key: str | None = None,  # noqa: ARG002 - auth belongs to Claude Code
         api_base: str | None = None,  # noqa: ARG002 - transport is the local CLI
         default_model: str = DEFAULT_CLAUDE_CODE_MODEL,
+        config_dir: str | None = None,
     ):
         super().__init__(api_key=None, api_base=None)
         self.default_model = default_model or DEFAULT_CLAUDE_CODE_MODEL
+        # Isolates this profile's login from the default `~/.claude`, so two
+        # profiles (e.g. a personal and a work subscription) can each hold a
+        # concurrently-valid `claude auth login` session. See CLAUDE_CONFIG_DIR
+        # in the Claude Code CLI docs.
+        self.config_dir = (config_dir or "").strip() or None
 
     def get_default_model(self) -> str:
         return self.default_model or DEFAULT_CLAUDE_CODE_MODEL
@@ -394,8 +400,9 @@ class ClaudeCodeProvider(LLMProvider):
                 allowed_tools=allowed_tools,
             )
 
+            env = {"CLAUDE_CONFIG_DIR": self.config_dir} if self.config_dir else None
             try:
-                async for channel, line in stream_process_lines(command, cwd=cwd):
+                async for channel, line in stream_process_lines(command, cwd=cwd, env=env):
                     if channel == "stderr":
                         if line.strip():
                             stderr_lines.append(line.strip())

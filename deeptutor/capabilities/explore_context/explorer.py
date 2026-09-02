@@ -101,6 +101,7 @@ class ContextExplorer:
         self.binding = getattr(cfg, "binding", None) or "openai"
         self.extra_headers = getattr(cfg, "extra_headers", None) or {}
         self.reasoning_effort = getattr(cfg, "reasoning_effort", None)
+        self.config_dir = getattr(cfg, "config_dir", None)
         self.registry = get_tool_registry()
         self._client_config = LLMClientConfig(
             binding=self.binding,
@@ -111,6 +112,7 @@ class ContextExplorer:
             extra_headers=self.extra_headers or None,
             reasoning_effort=self.reasoning_effort,
             wire_api=getattr(cfg, "wire_api", None) or "auto",
+            config_dir=self.config_dir,
         )
 
     async def investigate(

@@ -283,6 +283,7 @@ class AgenticChatPipeline:
             extra_headers=self.extra_headers or None,
             reasoning_effort=self.reasoning_effort,
             wire_api=getattr(self.llm_config, "wire_api", None) or "auto",
+            config_dir=getattr(self.llm_config, "config_dir", None),
         )
 
     @property

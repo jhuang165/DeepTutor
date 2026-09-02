@@ -565,6 +565,12 @@ class ResolvedLLMConfig:
     api_version: str | None = None
     extra_headers: dict[str, str] = field(default_factory=dict)
     wire_api: str = "auto"
+    # Maps to CLAUDE_CONFIG_DIR for the claude_code provider, isolating one
+    # profile's local Claude Code login from another's. Unused by every other
+    # provider. Read straight off the active profile — never merged in from
+    # another profile with the same binding, or two accounts would collapse
+    # into one.
+    config_dir: str | None = None
     reasoning_effort: str | None = None
     context_window: int | None = None
 
@@ -795,6 +801,7 @@ def resolve_llm_runtime_config(
     if selection is not None and selection.reasoning_effort:
         reasoning_effort = selection.reasoning_effort
     active_extra_headers = _to_headers((profile or {}).get("extra_headers"))
+    active_config_dir = _as_str((profile or {}).get("config_dir")) or None
     context_window = _coerce_optional_int((model or {}).get("context_window"))
     if context_window is None:
         context_window = _coerce_optional_int((model or {}).get("context_window_tokens"))
@@ -830,6 +837,7 @@ def resolve_llm_runtime_config(
         api_version=api_version or None,
         extra_headers=extra_headers,
         wire_api=wire_api_for_provider(configured_wire_api, spec),
+        config_dir=active_config_dir,
         reasoning_effort=reasoning_effort,
         context_window=context_window,
     )

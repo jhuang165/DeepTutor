@@ -41,6 +41,7 @@ def _provider_cache_key(config: LLMConfig, loop: asyncio.AbstractEventLoop) -> t
         config.temperature,
         config.max_tokens,
         config.reasoning_effort,
+        config.config_dir or "",
     )
 
 
@@ -62,7 +63,10 @@ def _build_runtime_provider(llm_config: LLMConfig) -> LLMProvider:
             ClaudeCodeProvider,
         )
 
-        provider = ClaudeCodeProvider(default_model=llm_config.model)
+        provider = ClaudeCodeProvider(
+            default_model=llm_config.model,
+            config_dir=llm_config.config_dir,
+        )
     elif backend == "github_copilot":
         from deeptutor.services.llm.provider_core.github_copilot_provider import (
             GitHubCopilotProvider,

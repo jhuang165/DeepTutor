@@ -756,6 +756,15 @@ claude auth status
 
 Then choose **Claude Code (subscription)** under Settings → Models → LLM, select a Claude Code model alias such as `sonnet`, `opus`, or `haiku`, and apply the profile. DeepTutor invokes the local `claude` CLI in headless streaming mode; it does not collect or forward an Anthropic API key. For each turn it gives Claude an ephemeral MCP catalog of the current DeepTutor tools, while the existing DeepTutor host loop continues to execute retrieval, memory, and knowledge-base tools and returns their results on the next turn. Claude Code's own local authentication and account selection remain outside DeepTutor.
 
+You can add more than one **Claude Code (subscription)** profile to switch between separate accounts (e.g. personal and work). Each profile's card has an optional **Config directory** field mapping to `CLAUDE_CONFIG_DIR`, which isolates that profile's `claude auth login` session from the default `~/.claude`. To set up a second account, sign in with a distinct config directory and point the profile at the same path:
+
+```bash
+CLAUDE_CONFIG_DIR=~/.claude-work claude auth login
+CLAUDE_CONFIG_DIR=~/.claude-work claude auth status
+```
+
+Leave the field blank to keep using the default `~/.claude` login.
+
 Default local Docker and Podman deployments use separate loopback networks and need a temporary bridge during sign-in. Follow the [temporary local Codex OAuth bridge guide](./CONTAINERIZATION.md#temporary-local-codex-oauth-bridge) for the exact Docker, Compose, Podman, and teardown commands.
 
 For a remote deployment, the browser's `localhost` and the server's `localhost` are different machines, so an ordinary reverse proxy alone cannot carry the browser's localhost callback to the server. Use an SSH tunnel as the callback bridge. The tunnel reaches the already-published Web port; Next.js rewrites only the exact callback path to the public callback broker, and the broker validates `state` before routing to the original OAuth operation. The callback listener remains on the backend loopback, ports `1455` and `1457` are not published, and this path supports the default Docker bridge network.

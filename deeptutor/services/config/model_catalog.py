@@ -392,6 +392,9 @@ class ModelCatalogService:
                     profile.setdefault("binding", "openai")
                     profile.setdefault("extra_headers", {})
                     if service_name == "llm":
+                        # CLAUDE_CONFIG_DIR override for the claude_code provider;
+                        # lets two llm profiles hold separate Claude Code logins.
+                        profile.setdefault("config_dir", "")
                         before_wire_api = profile.get("wire_api")
                         after_wire_api = wire_api_for_provider(
                             before_wire_api,

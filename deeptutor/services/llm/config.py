@@ -43,6 +43,7 @@ class LLMConfigUpdate(TypedDict, total=False):
     api_version: str | None
     extra_headers: dict[str, str]
     wire_api: str
+    config_dir: str | None
     reasoning_effort: str | None
     context_window: int | None
     max_tokens: int
@@ -115,6 +116,7 @@ class LLMConfig:
     api_version: str | None = None
     extra_headers: dict[str, str] | None = None
     wire_api: str = "auto"
+    config_dir: str | None = None
     reasoning_effort: str | None = None
     context_window: int | None = None
     max_tokens: int = 4096
@@ -207,6 +209,7 @@ def _get_llm_config_from_resolver() -> LLMConfig:
         api_version=resolved.api_version,
         extra_headers=resolved.extra_headers,
         wire_api=resolved.wire_api,
+        config_dir=resolved.config_dir,
         reasoning_effort=resolved.reasoning_effort,
         context_window=resolved.context_window,
     )

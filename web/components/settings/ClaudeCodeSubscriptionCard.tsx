@@ -3,8 +3,18 @@
 import { CheckCircle2, ExternalLink, Terminal } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-/** Explains the local subscription-backed transport; it does not handle auth. */
-export function ClaudeCodeSubscriptionCard() {
+/**
+ * Explains the local subscription-backed transport and, when the profile
+ * supports multiple concurrent accounts, lets the user point this profile at
+ * an isolated Claude Code login directory. Auth itself is never handled here.
+ */
+export function ClaudeCodeSubscriptionCard({
+  configDir,
+  onConfigDirChange,
+}: {
+  configDir?: string;
+  onConfigDirChange?: (value: string) => void;
+}) {
   const { t } = useTranslation();
 
   return (
@@ -43,6 +53,23 @@ export function ClaudeCodeSubscriptionCard() {
       <p className="mt-2 text-[11px] leading-relaxed text-[var(--muted-foreground)]">
         {t("claude_code.primary.signInHint")}
       </p>
+      {onConfigDirChange && (
+        <div className="mt-3 border-t border-[var(--border)] pt-3">
+          <div className="mb-1.5 text-[12px] text-[var(--muted-foreground)]">
+            {t("claude_code.primary.configDirLabel")}
+          </div>
+          <input
+            className="w-full rounded-md border border-[var(--border)] bg-[var(--background)] px-3 py-1.5 text-[12px] text-[var(--foreground)] placeholder:text-[var(--muted-foreground)] focus:outline-none focus:ring-1 focus:ring-[var(--foreground)]/30"
+            value={configDir ?? ""}
+            onChange={(e) => onConfigDirChange(e.target.value)}
+            placeholder={t("claude_code.primary.configDirPlaceholder")}
+            spellCheck={false}
+          />
+          <p className="mt-1.5 text-[11px] leading-relaxed text-[var(--muted-foreground)]">
+            {t("claude_code.primary.configDirHelp")}
+          </p>
+        </div>
+      )}
     </div>
   );
 }

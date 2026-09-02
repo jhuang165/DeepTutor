@@ -1434,7 +1434,12 @@ function ProfileFields({
       )}
       {isClaudeCodeAuth && (
         <div className="sm:col-span-2">
-          <ClaudeCodeSubscriptionCard />
+          <ClaudeCodeSubscriptionCard
+            configDir={profile.config_dir}
+            onConfigDirChange={(value) =>
+              updateProfileField(service, "config_dir", value)
+            }
+          />
         </div>
       )}
       {linkedConnection && (

@@ -68,6 +68,9 @@ class LLMClientConfig:
     extra_headers: dict[str, str] | None = None
     reasoning_effort: str | None = None
     wire_api: str = "auto"
+    # Maps to CLAUDE_CONFIG_DIR for the claude_code backend, isolating one
+    # profile's local Claude Code login from another's. Unused otherwise.
+    config_dir: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -95,6 +98,7 @@ def _client_cache_key(
         headers,
         config.wire_api,
         disable_ssl_verify,
+        config.config_dir or "",
     )
 
 
@@ -316,7 +320,10 @@ def _build_codebuddy_adapter(config: LLMClientConfig, spec: Any) -> Any:
 def _build_claude_code_adapter(config: LLMClientConfig, spec: Any) -> Any:
     from deeptutor.services.llm.provider_core import ClaudeCodeProvider
 
-    claude_provider = ClaudeCodeProvider(default_model=config.model or "sonnet")
+    claude_provider = ClaudeCodeProvider(
+        default_model=config.model or "sonnet",
+        config_dir=config.config_dir,
+    )
     return _ProviderOpenAIAdapter(claude_provider)
 
 
