@@ -14,3 +14,7 @@ test("firstParam returns scalar param unchanged", () => {
 test("firstParam returns first element for catch-all array", () => {
   assert.equal(firstParam(["ielts-tutor", "extra"]), "ielts-tutor");
 });
+
+test("firstParam decodes URL-encoded resource identities", () => {
+  assert.equal(firstParam("stats%2C%20ds%2C%20ml"), "stats, ds, ml");
+});

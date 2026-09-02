@@ -11,13 +11,14 @@ import KnowledgeHome, { type KnowledgeHomeSection } from "./KnowledgeHome";
 import EngineDetail from "@/features/knowledge/components/engines/EngineDetail";
 import CreateKbModal from "./CreateKbModal";
 import { knowledgeBaseRoute } from "@/lib/resource-routes";
+import { firstParam } from "@/lib/route-params";
 
 export default function KnowledgePage() {
   const { t } = useTranslation();
   const router = useRouter();
   const routeParams = useParams<{ kbName?: string }>();
   const searchParams = useSearchParams();
-  const initialKb = routeParams.kbName?.trim() || null;
+  const initialKb = firstParam(routeParams.kbName)?.trim() || null;
   const initialEngine = searchParams.get("engine");
   const initialHomeSection: KnowledgeHomeSection =
     initialEngine || searchParams.get("section") === "engines"
