@@ -478,6 +478,27 @@ def test_llm_codebuddy_resolves_without_endpoint() -> None:
     assert resolved.effective_url is None
 
 
+def test_llm_claude_code_resolves_without_endpoint() -> None:
+    catalog = _build_catalog(
+        llm_profile={
+            "id": "llm-p",
+            "name": "Claude Code",
+            "binding": "claude_code",
+            "base_url": "",
+            "api_key": "",
+            "api_version": "",
+            "extra_headers": {},
+            "models": [{"id": "llm-m", "name": "Sonnet", "model": "sonnet"}],
+        }
+    )
+
+    resolved = resolve_llm_runtime_config(catalog=catalog)
+
+    assert resolved.provider_name == "claude_code"
+    assert resolved.provider_mode == "oauth"
+    assert resolved.effective_url is None
+
+
 def test_llm_context_window_passes_through_from_catalog() -> None:
     catalog = _build_catalog(
         llm_profile={

@@ -96,6 +96,12 @@ def test_codebuddy_capabilities_use_agent_sdk_mcp_tools() -> None:
     assert supports_vision("codebuddy", "codebuddy/default") is False
 
 
+def test_claude_code_capabilities_use_host_mcp_tools() -> None:
+    assert supports_tools("claude_code", "sonnet") is True
+    assert supports_response_format("claude_code", "sonnet") is False
+    assert supports_vision("claude_code", "sonnet") is False
+
+
 def test_qwen_model_override_enables_vision() -> None:
     assert supports_vision("dashscope", "qwen-vl-plus") is True
     assert supports_vision("openai", "qwen2.5-vl-72b-instruct") is True

@@ -57,6 +57,12 @@ def _build_runtime_provider(llm_config: LLMConfig) -> LLMProvider:
         )
 
         provider: LLMProvider = OpenAICodexProvider(default_model=llm_config.model)
+    elif backend == "claude_code":
+        from deeptutor.services.llm.provider_core.claude_code_provider import (
+            ClaudeCodeProvider,
+        )
+
+        provider = ClaudeCodeProvider(default_model=llm_config.model)
     elif backend == "github_copilot":
         from deeptutor.services.llm.provider_core.github_copilot_provider import (
             GitHubCopilotProvider,

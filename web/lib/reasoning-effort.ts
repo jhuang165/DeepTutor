@@ -96,6 +96,10 @@ export function reasoningEffortOptions(
     return options(["low", "medium", "high"], current);
   }
 
+  if (provider === "claude_code") {
+    return options(["low", "medium", "high", "xhigh", "max"], current);
+  }
+
   if (
     provider === "anthropic" ||
     provider === "custom_anthropic" ||

@@ -747,6 +747,15 @@ Most sections use a draft-and-apply flow, so you can test a provider before comm
 
 **OpenAI Codex OAuth (experimental).** Picking **OpenAI Codex** under Models → LLM replaces the API-key fields with a browser sign-in that runs against your own ChatGPT plan, so no `OPENAI_API_KEY` is needed. Tokens live only in `data/system/user-secrets/<owner>/private/openai-codex/` — in the multi-container Compose deployment, outside every tree the exec sandbox can reach — and DeepTutor never reads or modifies your `~/.codex` CLI login. The model list comes from that account's live catalog; signing in publishes the profile but only becomes the active model when no LLM is configured yet. Because a token authorizes one person's plan, the profile is not shareable through user grants — each account signs in for itself, ordinary users included: their card sits under Models → LLM, and the resulting models, catalog, and sign-out stay private to that account.
 
+**Claude Code subscription (experimental).** To use your local Claude Code subscription as DeepTutor's primary LLM, install Claude Code and sign in on the same machine as the DeepTutor backend:
+
+```bash
+claude auth login
+claude auth status
+```
+
+Then choose **Claude Code (subscription)** under Settings → Models → LLM, select a Claude Code model alias such as `sonnet`, `opus`, or `haiku`, and apply the profile. DeepTutor invokes the local `claude` CLI in headless streaming mode; it does not collect or forward an Anthropic API key. For each turn it gives Claude an ephemeral MCP catalog of the current DeepTutor tools, while the existing DeepTutor host loop continues to execute retrieval, memory, and knowledge-base tools and returns their results on the next turn. Claude Code's own local authentication and account selection remain outside DeepTutor.
+
 Default local Docker and Podman deployments use separate loopback networks and need a temporary bridge during sign-in. Follow the [temporary local Codex OAuth bridge guide](./CONTAINERIZATION.md#temporary-local-codex-oauth-bridge) for the exact Docker, Compose, Podman, and teardown commands.
 
 For a remote deployment, the browser's `localhost` and the server's `localhost` are different machines, so an ordinary reverse proxy alone cannot carry the browser's localhost callback to the server. Use an SSH tunnel as the callback bridge. The tunnel reaches the already-published Web port; Next.js rewrites only the exact callback path to the public callback broker, and the broker validates `state` before routing to the original OAuth operation. The callback listener remains on the backend loopback, ports `1455` and `1457` are not published, and this path supports the default Docker bridge network.

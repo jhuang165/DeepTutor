@@ -610,6 +610,12 @@ async def fetch_models(
         from .provider_core.codebuddy_models import fetch_codebuddy_models
 
         return await fetch_codebuddy_models(api_key)
+    if canonical_provider_name(binding) == "claude_code":
+        # Claude Code exposes model aliases through the local CLI rather than
+        # an OpenAI-style /models endpoint. Keep the stable aliases useful in
+        # the settings API; users may still type any alias supported by their
+        # installed Claude Code version.
+        return ["sonnet", "opus", "haiku"]
 
     if is_local_llm_server(base_url):
         from . import local_provider

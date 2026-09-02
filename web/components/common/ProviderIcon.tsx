@@ -14,6 +14,7 @@ const PROVIDER_ICONS: Record<string, { file: string; mono?: boolean }> = {
   openai_codex: { file: "openai.svg", mono: true },
   anthropic: { file: "anthropic.svg", mono: true },
   custom_anthropic: { file: "anthropic.svg", mono: true },
+  claude_code: { file: "anthropic.svg", mono: true },
   azure_openai: { file: "azure-color.svg" },
   openrouter: { file: "openrouter.svg", mono: true },
   aihubmix: { file: "aihubmix-color.svg" },

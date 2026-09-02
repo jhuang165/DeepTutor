@@ -53,6 +53,17 @@ test("provider aliases resolve to the canonical adapter", () => {
   assert.deepEqual(values("claude", "claude-opus-5"), ["", "none", "adaptive"]);
 });
 
+test("Claude Code exposes the effort levels supported by its CLI", () => {
+  assert.deepEqual(values("claude_code", "claude-sonnet-4"), [
+    "",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+  ]);
+});
+
 test("effort-based Claude families offer adaptive, older ones do not", () => {
   // Opus 4.7+ reject enabled+budget_tokens and every real level collapses to
   // adaptive; the older families 400 on adaptive instead.

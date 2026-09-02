@@ -300,6 +300,31 @@ def test_build_openai_client_routes_codebuddy_backend_through_adapter(monkeypatc
     assert captured["default_model"] == "codebuddy/hy3"
 
 
+def test_build_openai_client_routes_claude_code_backend_through_adapter(monkeypatch) -> None:
+    captured = {}
+
+    class FakeProvider:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "deeptutor.services.llm.provider_core.ClaudeCodeProvider",
+        FakeProvider,
+    )
+
+    client = build_openai_client(
+        LLMClientConfig(
+            binding="claude_code",
+            model="sonnet",
+            api_key=None,
+            base_url=None,
+        )
+    )
+
+    assert isinstance(client, _ProviderOpenAIAdapter)
+    assert captured["default_model"] == "sonnet"
+
+
 @pytest.mark.asyncio
 async def test_direct_openai_gpt5_agentic_tools_use_provider_adapter(monkeypatch) -> None:
     captured: dict = {}
@@ -437,6 +462,10 @@ def test_openai_codex_backend_can_use_native_tool_calling() -> None:
 
 def test_codebuddy_backend_can_use_native_tool_calling() -> None:
     assert can_use_native_tool_calling(binding="codebuddy", model="codebuddy/hy3") is True
+
+
+def test_claude_code_backend_can_use_native_tool_calling() -> None:
+    assert can_use_native_tool_calling(binding="claude_code", model="sonnet") is True
 
 
 def test_local_and_github_copilot_backends_stay_opted_out_of_native_tools() -> None:

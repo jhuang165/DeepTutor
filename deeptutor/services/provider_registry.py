@@ -30,7 +30,7 @@ class ProviderSpec:
     display_name: str = ""
 
     # Which provider implementation to use:
-    # "openai_compat" | "anthropic" | "azure_openai" | "openai_codex" | "github_copilot" | "codebuddy"
+    # "openai_compat" | "anthropic" | "azure_openai" | "openai_codex" | "github_copilot" | "codebuddy" | "claude_code"
     backend: str = "openai_compat"
 
     env_extras: tuple[tuple[str, str], ...] = ()
@@ -304,6 +304,16 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         backend="openai_codex",
         is_oauth=True,
         default_api_base="https://chatgpt.com/backend-api",
+    ),
+    ProviderSpec(
+        name="claude_code",
+        keywords=("claude_code", "claude-code"),
+        env_key="",
+        display_name="Claude Code (subscription)",
+        backend="claude_code",
+        is_oauth=True,
+        strip_model_prefix=True,
+        supports_stream_options=False,
     ),
     ProviderSpec(
         name="github_copilot",

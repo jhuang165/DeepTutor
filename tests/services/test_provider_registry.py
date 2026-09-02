@@ -65,6 +65,15 @@ def test_openai_codex_provider_is_oauth_backed() -> None:
     assert spec.env_key == ""
 
 
+def test_claude_code_provider_is_oauth_backed() -> None:
+    spec = find_by_name("claude_code")
+
+    assert spec is not None
+    assert spec.auth_mode == "oauth"
+    assert spec.backend == "claude_code"
+    assert spec.env_key == ""
+
+
 def test_github_copilot_is_oauth_backed() -> None:
     spec = find_by_name("github_copilot")
 

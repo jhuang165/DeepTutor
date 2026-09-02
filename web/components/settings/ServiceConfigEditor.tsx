@@ -28,6 +28,7 @@ import {
 } from "@/lib/reasoning-effort";
 import { CodexOAuthCard } from "./CodexOAuthCard";
 import { CodeBuddyAuthCard } from "./CodeBuddyAuthCard";
+import { ClaudeCodeSubscriptionCard } from "./ClaudeCodeSubscriptionCard";
 import {
   isBoundManagedCodexProfile,
   isCodexOAuthProfile,
@@ -278,7 +279,11 @@ export function ServiceConfigEditor({ service }: { service: ServiceName }) {
     const binding = connection?.binding ?? activeProfile.binding ?? "";
     const baseUrl = connection?.base_url ?? activeProfile.base_url ?? "";
     const apiKey = connection?.api_key ?? activeProfile.api_key ?? "";
-    if (!binding || (binding !== "codebuddy" && !baseUrl.trim())) return;
+    if (
+      !binding ||
+      (binding !== "codebuddy" && binding !== "claude_code" && !baseUrl.trim())
+    )
+      return;
 
     const profileId = activeProfile.id;
     setModelsSyncing(true);
@@ -541,10 +546,12 @@ export function ServiceConfigEditor({ service }: { service: ServiceName }) {
                   supportedSearchProviderNames={supportedSearchProviderNames}
                   onProviderChanged={(provider, previousProvider) => {
                     if (service !== "llm" || !activeProfile) return;
-                    const crossesCodeBuddyBoundary =
+                    const crossesCliProviderBoundary =
                       provider.value === "codebuddy" ||
-                      previousProvider === "codebuddy";
-                    if (crossesCodeBuddyBoundary) {
+                      provider.value === "claude_code" ||
+                      previousProvider === "codebuddy" ||
+                      previousProvider === "claude_code";
+                    if (crossesCliProviderBoundary) {
                       const profileId = activeProfile.id;
                       mutateCatalog((next) => {
                         const target = next.services.llm;
@@ -563,7 +570,8 @@ export function ServiceConfigEditor({ service }: { service: ServiceName }) {
                           {
                             id: modelId,
                             name: defaultModelLabel(language, 1),
-                            model: "",
+                            model:
+                              provider.value === "claude_code" ? "sonnet" : "",
                           },
                         ];
                         target.active_model_id = modelId;
@@ -1295,12 +1303,13 @@ function ProfileFields({
     profile,
   );
   const isCodeBuddyAuth = service === "llm" && providerValue === "codebuddy";
+  const isClaudeCodeAuth = service === "llm" && providerValue === "claude_code";
   const supportsWireApiSelection =
     service === "llm" && providerOption?.supports_wire_api_selection === true;
   const wireApi = profile.wire_api || "auto";
 
   const fields =
-    isCodexOAuth || isCodeBuddyAuth
+    isCodexOAuth || isCodeBuddyAuth || isClaudeCodeAuth
       ? { apiKey: false, baseUrl: false, baseUrlRequired: false }
       : service === "search"
         ? searchProviderFields(profile.provider, providerOption)
@@ -1343,7 +1352,7 @@ function ProfileFields({
               if (renamed !== profile.name) {
                 updateProfileField(service, "name", renamed);
               }
-              if (val === "codebuddy") {
+              if (val === "codebuddy" || val === "claude_code") {
                 updateProfileField(service, "base_url", "");
                 updateProfileField(service, "api_key", "");
               } else if (match?.base_url) {
@@ -1421,6 +1430,11 @@ function ProfileFields({
       {isCodeBuddyAuth && (
         <div className="sm:col-span-2">
           <CodeBuddyAuthCard />
+        </div>
+      )}
+      {isClaudeCodeAuth && (
+        <div className="sm:col-span-2">
+          <ClaudeCodeSubscriptionCard />
         </div>
       )}
       {linkedConnection && (
@@ -1554,7 +1568,7 @@ function ProfileFields({
           </p>
         </div>
       )}
-      {!isCodexOAuth && !isCodeBuddyAuth && (
+      {!isCodexOAuth && !isCodeBuddyAuth && !isClaudeCodeAuth && (
         <div className="sm:col-span-2 rounded-xl border border-[var(--border)]/60 bg-[var(--muted)]/20">
           <button
             type="button"
