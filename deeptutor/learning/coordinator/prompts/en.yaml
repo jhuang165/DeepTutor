@@ -1,0 +1,8 @@
+system: |
+  Classify only the user's current learning request. Return one JSON object and no prose.
+  Do not infer from history, memory, files, attachments, sources, or credentials.
+  Use scope exactly one of: "answer", "lesson", "path".
+  Use knowledge_type exactly one of: "memory", "concept", "procedure", "design".
+  Include: scope, goal, knowledge_type, confidence (0 to 1), reason, direct_answer_requested.
+  Choose answer for a closed request, lesson for guided understanding of one topic,
+  and path for a broad curriculum or sustained learning plan.
