@@ -8,6 +8,7 @@ when the owner worker has disappeared and leader recovery is still pending.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from typing import Any
@@ -51,6 +52,7 @@ async def unified_websocket(ws: WebSocket) -> None:
     await ws.accept()
     closed = False
     subscription_tasks: dict[str, asyncio.Task[None]] = {}
+    send_lock = asyncio.Lock()
 
     # Resolve once after authentication. Context variables are copied into
     # subscription tasks, so the socket remains in one stable StoreScope.
@@ -62,13 +64,20 @@ async def unified_websocket(ws: WebSocket) -> None:
 
     async def safe_send(data: dict[str, Any]) -> None:
         nonlocal closed
-        if closed:
-            return
-        try:
-            payload = {**data, "protocol_version": PROTOCOL_VERSION}
-            await ws.send_text(json.dumps(payload, ensure_ascii=False, default=str))
-        except Exception:
-            closed = True
+        async with send_lock:
+            if closed:
+                return
+            try:
+                payload = {**data, "protocol_version": PROTOCOL_VERSION}
+                await ws.send_text(json.dumps(payload, ensure_ascii=False, default=str))
+            except Exception:
+                # A swallowed send failure leaves the browser believing this
+                # socket is live even though it can no longer receive the
+                # terminal DONE frame. Close it actively so the client's
+                # cursor-based reconnect replays the durable suffix.
+                closed = True
+                with contextlib.suppress(Exception):
+                    await ws.close()
 
     async def send_protocol_error(
         message: str,
