@@ -1,0 +1,1 @@
+export const DOCUMENT_UPLOAD_MAX_BYTES = 300 * 1024 * 1024

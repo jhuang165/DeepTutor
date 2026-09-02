@@ -1,5 +1,6 @@
 import { apiFetch, apiUrl } from "@/lib/api";
 import { invalidateClientCache, withClientCache } from "@/lib/client-cache";
+import { DOCUMENT_UPLOAD_MAX_BYTES } from "@/lib/document-upload-policy";
 import type { ImaKnowledgeBaseOption } from "@/lib/ima-connection";
 
 const KNOWLEDGE_CACHE_PREFIX = "knowledge:";
@@ -216,7 +217,7 @@ function normalizeUploadPolicy(data: unknown): KnowledgeUploadPolicy {
     max_file_size_bytes:
       typeof payload?.max_file_size_bytes === "number"
         ? payload.max_file_size_bytes
-        : 200 * 1024 * 1024,
+        : DOCUMENT_UPLOAD_MAX_BYTES,
   };
 }
 

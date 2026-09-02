@@ -936,7 +936,7 @@ async def upload_material(
                         status_code=413,
                         detail=(
                             f"{filename} exceeds the "
-                            f"{MAX_MATERIAL_BYTES // (1024 * 1024)} MB limit."
+                            f"{MAX_MATERIAL_BYTES // (1024 * 1024)} MiB limit."
                         ),
                     )
                 sink.write(chunk)

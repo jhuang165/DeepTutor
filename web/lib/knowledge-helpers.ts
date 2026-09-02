@@ -1,4 +1,5 @@
 import type { TFunction } from "i18next";
+import { DOCUMENT_UPLOAD_MAX_BYTES } from "./document-upload-policy";
 
 export interface KnowledgeUploadPolicy {
   extensions: string[];
@@ -10,7 +11,7 @@ export interface KnowledgeUploadPolicy {
 export const DEFAULT_UPLOAD_POLICY: KnowledgeUploadPolicy = {
   extensions: [],
   accept: "",
-  max_file_size_bytes: 200 * 1024 * 1024,
+  max_file_size_bytes: DOCUMENT_UPLOAD_MAX_BYTES,
   allow_any_extension: false,
 };
 

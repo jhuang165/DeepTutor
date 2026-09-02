@@ -122,11 +122,12 @@ const nextConfig = {
   outputFileTracingRoot: __dirname,
 
   // web/proxy.ts clones request bodies before rewriting them. Keep enough room
-  // for individual large-body endpoints that still use Proxy. Knowledge-base
-  // create/upload batches use dedicated streaming route handlers instead, so
-  // their total size is not coupled to this in-memory clone limit.
+  // for individual large-body endpoints that still use Proxy, including
+  // Reading uploads. Knowledge-base create/upload batches use dedicated
+  // streaming route handlers, so their total size is not coupled to this
+  // in-memory clone limit.
   experimental: {
-    proxyClientMaxBodySize: 210 * 1024 * 1024,
+    proxyClientMaxBodySize: 310 * 1024 * 1024,
     // Agentic reads and full-draft edits routinely exceed Next's 30-second
     // rewrite default; the browser remains responsible for cancelling them.
     proxyTimeout: 30 * 60 * 1000,

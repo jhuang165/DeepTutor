@@ -25,6 +25,7 @@ from deeptutor.utils.document_extractor import (
     extract_text_from_path,
     is_document_extension,
 )
+from deeptutor.utils.document_validator import DocumentValidator
 
 # ---------------------------------------------------------------------------
 # Fixtures — generate office docs on the fly
@@ -226,6 +227,29 @@ class TestExtractPptx:
 
 
 class TestExtractEpub:
+    def test_archive_accepts_member_at_shared_document_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(DocumentValidator, "MAX_FILE_SIZE", 8)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as archive:
+            archive.writestr("chapter.xhtml", b"x" * 8)
+        with zipfile.ZipFile(buf) as archive:
+            document_extractor_module._validate_epub_archive(archive, "book.epub")
+
+    def test_archive_rejects_total_above_shared_document_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(DocumentValidator, "MAX_FILE_SIZE", 8)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as archive:
+            archive.writestr("one.xhtml", b"x" * 4)
+            archive.writestr("two.xhtml", b"x" * 5)
+
+        with zipfile.ZipFile(buf) as archive:
+            with pytest.raises(DocumentTooLargeError, match="uncompressed contents"):
+                document_extractor_module._validate_epub_archive(archive, "book.epub")
+
     def test_follows_spine_reading_order(self) -> None:
         data = _make_epub(
             {
