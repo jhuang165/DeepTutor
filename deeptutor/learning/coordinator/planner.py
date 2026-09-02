@@ -104,9 +104,10 @@ class ActivityPlanner:
                 goal=goal,
                 help_level=_help_level(effective_request),
             )
-            route = self._route_for(activity.kind, available_capabilities)
             if request.requested_capability != "chat":
                 route = request.requested_capability
+            else:
+                route = self._route_for(activity.kind, available_capabilities)
 
         return LearningDecision(
             scope=scope.scope,

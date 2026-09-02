@@ -91,7 +91,7 @@ def test_explicit_non_chat_capability_is_preserved_for_direct_callers() -> None:
     decision = ActivityPlanner().plan(
         ScopeResult(scope="answer", goal="Compare sources", confidence=1.0, reason="explicit"),
         LearningRequest(message="Compare sources", requested_capability="deep_research"),
-        {"chat"},
+        {"deep_research"},
     )
 
     assert decision.route == "deep_research"
@@ -418,6 +418,32 @@ def test_only_server_learning_state_supplies_progression_fields() -> None:
     assert request.repeated_request is True
     assert request.server_next_activity is not None
     assert request.server_next_activity.recipe_step == 2
+
+
+def test_public_config_cannot_supply_server_owned_progression_fields() -> None:
+    request = learning_request_from_payload(
+        {
+            "content": "Continue eigenvectors",
+            "config": {
+                "previous_help_level": 4,
+                "last_outcome": "correct",
+                "repeated_request": True,
+                "server_next_activity": {
+                    "kind": "teach_back",
+                    "objective": "Understand eigenvectors",
+                    "learner_action": "Explain it",
+                    "recipe_id": "concept-transfer",
+                    "recipe_version": 1,
+                    "recipe_step": 2,
+                },
+            },
+        }
+    )
+
+    assert request.previous_help_level == 0
+    assert request.last_outcome == ""
+    assert request.repeated_request is False
+    assert request.server_next_activity is None
 
 
 @pytest.mark.asyncio
