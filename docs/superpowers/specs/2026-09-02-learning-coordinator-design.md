@@ -65,23 +65,23 @@ The Learning Coordinator wraps capability selection; it doesn't become a new all
 Learner request
     |
     v
-ChatOrchestrator
+TurnRequestPreparer
     |
     +--> LearningCoordinator.prepare(context)
     |        |-- ScopeDetector
     |        |-- TeachingStrategist
     |        `-- ActivityPlanner
     |
-    +--> existing capability selected by the plan
+    +--> ChatOrchestrator executes the selected capability
     |        chat | mastery_path | course_study | reading
     |        deep_solve | visualize | other registered capability
     |
-    +--> LearningCoordinator.finish(result)
+    +--> turn executor calls LearningCoordinator.finish(result)
              |-- EvidenceAdapter
              `-- LearningQueue projection
 ```
 
-`ChatOrchestrator` keeps ownership of session IDs, the `StreamBus`, capability lifecycle, errors, and completion events. The coordinator receives an interface for inspecting available capabilities and returns a typed decision. It must not call the orchestrator recursively.
+`TurnRequestPreparer` owns the narrow preparation hook so capability validation, tools, leases, and the stored turn all agree on the selected route. `ChatOrchestrator` keeps ownership of the `StreamBus`, capability lifecycle, errors, and completion events; the executor owns the finish hook after a structured result exists. The coordinator receives an interface for inspecting available capabilities and returns a typed decision. It must not call the orchestrator recursively.
 
 When the coordinator is disabled, when a client explicitly selects a capability, or when preparation fails, current routing behavior remains available. An explicit learner or client choice always wins.
 
@@ -329,7 +329,7 @@ deeptutor/learning/coordinator/
     service.py         prepare/finish public interface
 ```
 
-The runtime change belongs behind a narrow injected hook in `deeptutor/runtime/orchestrator.py`. Storage changes stay in `deeptutor.learning`; API and web changes consume the same typed contracts. Prompt files follow DeepTutor's existing English/Chinese layout.
+The runtime change belongs behind narrow hooks in `deeptutor/services/session/turns/request_preparer.py` and `deeptutor/services/session/turns/executor.py`; `ChatOrchestrator` remains the unchanged execution owner. Storage changes stay in `deeptutor.learning`; API and web changes consume the same typed contracts. Prompt files follow DeepTutor's existing English/Chinese layout.
 
 No implementation file should need to understand courses, reading, mastery internals, and UI rendering at once. Adapters own those boundaries.
 
@@ -346,6 +346,8 @@ The work satisfies this design when a learner can enter one request and DeepTuto
 ## References
 
 - [OpenMAIC repository at the reviewed commit](https://github.com/THU-MAIC/OpenMAIC/tree/f760f58a70e6d624a8e49dcb2f7bfbda8c1069e1)
+- `deeptutor/services/session/turns/request_preparer.py`
+- `deeptutor/services/session/turns/executor.py`
 - `deeptutor/runtime/orchestrator.py`
 - `deeptutor/core/context.py`
 - `deeptutor/capabilities/mastery/capability.py`
