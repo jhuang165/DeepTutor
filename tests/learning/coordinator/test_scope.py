@@ -2,7 +2,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from deeptutor.learning.coordinator.models import LearningRequest, LearningScope
+from deeptutor.learning.coordinator.models import LearningRequest, LearningScope, ScopeResult
 from deeptutor.learning.coordinator.scope import LLMScopeClassifier, ScopeDetector
 from deeptutor.learning.models import KnowledgeType
 from deeptutor.services.llm.config import LLMConfig
@@ -66,6 +66,73 @@ async def test_classifier_failure_falls_back_to_answer() -> None:
     )
     assert result.scope is LearningScope.ANSWER
     assert result.reason == "classifier_fallback"
+
+
+@pytest.mark.asyncio
+async def test_malformed_classifier_result_falls_back_with_deterministic_type() -> None:
+    """A protocol-violating classifier result must not escape the safe fallback."""
+    classifier = AsyncMock(return_value=None)
+    result = await ScopeDetector(classifier=classifier).detect(
+        LearningRequest(message="Eigenvectors keep appearing in my work")
+    )
+    assert result.scope is LearningScope.ANSWER
+    assert result.knowledge_type is KnowledgeType.CONCEPT
+    assert result.reason == "classifier_fallback"
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_classifier_result_falls_back_with_deterministic_type() -> None:
+    """A low-confidence classifier result must not override conservative routing."""
+    classifier = AsyncMock(
+        return_value=ScopeResult(
+            scope=LearningScope.LESSON,
+            goal="Eigenvectors",
+            knowledge_type=KnowledgeType.DESIGN,
+            confidence=0.64,
+            reason="uncertain",
+        )
+    )
+    result = await ScopeDetector(classifier=classifier).detect(
+        LearningRequest(message="Eigenvectors keep appearing in my work")
+    )
+    assert result.scope is LearningScope.ANSWER
+    assert result.knowledge_type is KnowledgeType.CONCEPT
+    assert result.reason == "classifier_fallback"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message", ["谁发现了 X 射线？", "X 射线是什么时候发现的？", "X 射线在哪里被发现？"]
+)
+async def test_chinese_closed_fact_does_not_call_classifier(message: str) -> None:
+    """Common Chinese who-when-where facts must remain closed answer requests."""
+    classifier = AsyncMock()
+    result = await ScopeDetector(classifier=classifier).detect(LearningRequest(message=message))
+    assert result.scope is LearningScope.ANSWER
+    classifier.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    ["Explain eigenvectors", "Show me how eigenvectors work", "请解释特征向量"],
+)
+async def test_explicit_teaching_request_does_not_call_classifier(message: str) -> None:
+    """Explicit English and Chinese teaching requests must produce a lesson locally."""
+    classifier = AsyncMock()
+    result = await ScopeDetector(classifier=classifier).detect(LearningRequest(message=message))
+    assert result.scope is LearningScope.LESSON
+    classifier.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_direct_answer_precedes_broad_path_signal() -> None:
+    """An explicit answer request must win even when curriculum language appears."""
+    result = await ScopeDetector().detect(
+        LearningRequest(message="Just tell me the answer about this complete course")
+    )
+    assert result.scope is LearningScope.ANSWER
+    assert result.direct_answer_requested is True
 
 
 @pytest.mark.asyncio

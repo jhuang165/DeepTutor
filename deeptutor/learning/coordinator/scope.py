@@ -90,6 +90,8 @@ _NARROW_REQUEST_PHRASES = (
     "翻译",
     "简答",
 )
+_NARROW_REQUEST_PREFIXES = ("who ", "when ", "where ")
+_NARROW_CHINESE_FACT_PHRASES = ("谁", "什么时候", "在哪里", "何时", "何地")
 _TEACHING_PHRASES = (
     "help me understand",
     "teach me",
@@ -98,6 +100,8 @@ _TEACHING_PHRASES = (
     "帮我理解",
     "讲解",
 )
+_TEACHING_REQUEST_PREFIXES = ("explain ", "please explain ", "show me how ")
+_TEACHING_CHINESE_PREFIXES = ("请解释", "解释一下", "解释")
 
 
 def _normalized_message(request: LearningRequest) -> str:
@@ -120,6 +124,22 @@ def _deterministic_knowledge_type(message: str) -> KnowledgeType:
     if _contains_any(message, _DESIGN_PHRASES):
         return KnowledgeType.DESIGN
     return KnowledgeType.CONCEPT
+
+
+def _is_narrow_request(message: str) -> bool:
+    return (
+        _contains_any(message, _NARROW_REQUEST_PHRASES)
+        or message.startswith(_NARROW_REQUEST_PREFIXES)
+        or _contains_any(message, _NARROW_CHINESE_FACT_PHRASES)
+    )
+
+
+def _is_explicit_teaching_request(message: str) -> bool:
+    return (
+        _contains_any(message, _TEACHING_PHRASES)
+        or message.startswith(_TEACHING_REQUEST_PREFIXES)
+        or message.startswith(_TEACHING_CHINESE_PREFIXES)
+    )
 
 
 class ScopeDetector:
@@ -156,7 +176,7 @@ class ScopeDetector:
 
         knowledge_type = _deterministic_knowledge_type(message)
 
-        if _contains_any(message, _NARROW_REQUEST_PHRASES):
+        if _is_narrow_request(message):
             return self._result(
                 LearningScope.ANSWER,
                 goal,
@@ -164,7 +184,7 @@ class ScopeDetector:
                 reason="narrow_request",
             )
 
-        if _contains_any(message, _TEACHING_PHRASES):
+        if _is_explicit_teaching_request(message):
             return self._result(
                 LearningScope.LESSON,
                 goal,
@@ -176,10 +196,10 @@ class ScopeDetector:
             return self._fallback(goal, knowledge_type)
 
         try:
-            result = await self._classify(request)
+            result = ScopeResult.model_validate(await self._classify(request))
+            if result.confidence < 0.65:
+                return self._fallback(goal, knowledge_type)
         except Exception:
-            return self._fallback(goal, knowledge_type)
-        if result.confidence < 0.65:
             return self._fallback(goal, knowledge_type)
         return result
 
