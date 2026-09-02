@@ -28,6 +28,7 @@ test("dynamic resource parameters decode back to stored identities", () => {
   );
   assert.equal(decodeResourceSegment("calculus%20%2F%20%E5%BE%AE%E7%A7%AF%E5%88%86"), "calculus / 微积分");
   assert.equal(decodeResourceSegment("100%25%20coverage"), "100% coverage");
+  assert.equal(decodeResourceSegment("stats%2C%20ds%2C%20ml"), "stats, ds, ml");
   assert.equal(decodeResourceSegment(null), null);
 });
 
