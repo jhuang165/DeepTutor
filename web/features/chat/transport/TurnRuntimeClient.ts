@@ -34,6 +34,7 @@ export interface TurnRuntimeClientOptions {
   random?: () => number;
   maxBufferedGap?: number;
   replayProbeDelayMs?: number;
+  heartbeatIntervalMs?: number;
   onEvent: (event: ServerEvent) => void;
   onStateChange?: (state: RuntimeConnectionState) => void;
   onDiagnostic?: (diagnostic: string) => void;
@@ -90,6 +91,7 @@ export class TurnRuntimeClient {
       | "random"
       | "maxBufferedGap"
       | "replayProbeDelayMs"
+      | "heartbeatIntervalMs"
     >
   > &
     Omit<
@@ -100,10 +102,12 @@ export class TurnRuntimeClient {
       | "random"
       | "maxBufferedGap"
       | "replayProbeDelayMs"
+      | "heartbeatIntervalMs"
     >;
   private socket: TurnSocket | null = null;
   private reconnectHandle: unknown = null;
   private replayProbeHandle: unknown = null;
+  private heartbeatHandle: unknown = null;
   private reconnectAttempt = 0;
   private generation = 0;
   private stopped = false;
@@ -114,6 +118,7 @@ export class TurnRuntimeClient {
   private pending: PendingCommand[] = [];
   private connectionState: RuntimeConnectionState = "idle";
   private terminalObserved = false;
+  private heartbeatAcknowledged = true;
 
   constructor(options: TurnRuntimeClientOptions) {
     this.options = {
@@ -123,6 +128,7 @@ export class TurnRuntimeClient {
       random: Math.random,
       maxBufferedGap: 32,
       replayProbeDelayMs: 5_000,
+      heartbeatIntervalMs: 30_000,
       ...options,
     };
   }
@@ -139,6 +145,7 @@ export class TurnRuntimeClient {
     if (this.stopped) this.stopped = false;
     if (this.socket && this.socket.readyState <= SOCKET_OPEN) return;
     this.clearReconnect();
+    this.clearHeartbeat();
     this.setState(this.turnId ? "recovering" : "connecting");
     const socket = this.options.socketFactory(this.options.url);
     this.socket = socket;
@@ -218,6 +225,7 @@ export class TurnRuntimeClient {
     this.stopped = true;
     this.clearReconnect();
     this.clearReplayProbe();
+    this.clearHeartbeat();
     const socket = this.socket;
     this.socket = null;
     socket?.close(1000, "client stopped");
@@ -230,6 +238,7 @@ export class TurnRuntimeClient {
     if (socket !== this.socket || this.stopped) return;
     this.generation += 1;
     this.reconnectAttempt = 0;
+    this.heartbeatAcknowledged = true;
     this.setState("connected");
     if (this.turnId) {
       this.sendNow(
@@ -237,10 +246,12 @@ export class TurnRuntimeClient {
       );
     }
     this.flushPending();
+    this.scheduleHeartbeat();
   }
 
   private handleMessage(socket: TurnSocket, raw: unknown): void {
     if (socket !== this.socket || this.stopped) return;
+    this.heartbeatAcknowledged = true;
     const parsed = parseTurnEvent(raw);
     if (!parsed.ok) {
       if (parsed.reason !== "heartbeat")
@@ -334,6 +345,7 @@ export class TurnRuntimeClient {
     if (socket !== this.socket) return;
     this.socket = null;
     this.clearReplayProbe();
+    this.clearHeartbeat();
     if (this.stopped) return;
     this.setState(this.turnId ? "recovering" : "connecting");
     this.scheduleReconnect();
@@ -398,6 +410,39 @@ export class TurnRuntimeClient {
     if (this.replayProbeHandle === null) return;
     this.options.scheduler.clearTimeout(this.replayProbeHandle);
     this.replayProbeHandle = null;
+  }
+
+  private scheduleHeartbeat(): void {
+    if (
+      this.options.heartbeatIntervalMs <= 0 ||
+      this.stopped ||
+      !this.socket ||
+      this.socket.readyState !== SOCKET_OPEN
+    ) {
+      return;
+    }
+    this.clearHeartbeat();
+    this.heartbeatHandle = this.options.scheduler.setTimeout(() => {
+      this.heartbeatHandle = null;
+      const socket = this.socket;
+      if (!socket || socket.readyState !== SOCKET_OPEN || this.stopped) return;
+      if (!this.heartbeatAcknowledged && this.turnId) {
+        this.options.onDiagnostic?.(
+          "turn socket heartbeat timed out; reconnecting for replay",
+        );
+        socket.close();
+        return;
+      }
+      this.heartbeatAcknowledged = false;
+      this.sendNow(buildPing());
+      this.scheduleHeartbeat();
+    }, this.options.heartbeatIntervalMs);
+  }
+
+  private clearHeartbeat(): void {
+    if (this.heartbeatHandle === null) return;
+    this.options.scheduler.clearTimeout(this.heartbeatHandle);
+    this.heartbeatHandle = null;
   }
 
   private setState(state: RuntimeConnectionState): void {

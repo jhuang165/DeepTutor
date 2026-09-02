@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   buildCancelTurn,
+  buildStartTurn,
   buildSubmitUserReply,
 } from "../contracts/parse/turn-command";
 import {
@@ -104,6 +105,7 @@ function harness() {
     random: () => 0.5,
     maxBufferedGap: 3,
     replayProbeDelayMs: 5_000,
+    heartbeatIntervalMs: 0,
     onEvent: (event) => events.push(event),
     onStateChange: (state) => states.push(state),
     onDiagnostic: (value) => diagnostics.push(value),
@@ -207,6 +209,72 @@ test("an idle non-terminal stream probes durable replay for a missed done", () =
     ["content", "done"],
   );
   assert.equal(scheduler.tasks.length, 0);
+});
+
+test("a silent half-open socket reconnects and replays from the live cursor", () => {
+  const sockets: FakeSocket[] = [];
+  const scheduler = new FakeScheduler();
+  const events: Array<{ type?: string; seq?: number }> = [];
+  const client = new TurnRuntimeClient({
+    socketFactory: () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    scheduler,
+    heartbeatIntervalMs: 100,
+    onEvent: (event) => events.push(event),
+  });
+  client.setResumeCursor("turn-1", 7);
+  client.connect();
+  sockets[0].open();
+
+  scheduler.runNext();
+  assert.equal(sockets[0].sent.at(-1)?.type, "ping");
+
+  scheduler.runNext();
+  assert.equal(sockets[0].readyState, 3);
+
+  scheduler.runNext();
+  sockets[1].open();
+  assert.deepEqual(sockets[1].sent[0], {
+    type: "resume_from",
+    turn_id: "turn-1",
+    seq: 7,
+    protocol_version: "2.0",
+  });
+
+  sockets[1].message(stream(8, "done"));
+  assert.equal(events.at(-1)?.type, "done");
+  assert.equal(events.at(-1)?.seq, 8);
+});
+
+test("heartbeat does not replay a turn before the server provides a cursor", () => {
+  const sockets: FakeSocket[] = [];
+  const scheduler = new FakeScheduler();
+  const client = new TurnRuntimeClient({
+    socketFactory: () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    scheduler,
+    heartbeatIntervalMs: 100,
+    onEvent: () => undefined,
+  });
+  client.connect();
+  sockets[0].open();
+  client.send(buildStartTurn({ content: "hello" }));
+
+  scheduler.runNext();
+  scheduler.runNext();
+
+  assert.equal(sockets.length, 1);
+  assert.equal(sockets[0].readyState, SOCKET_OPEN);
+  assert.equal(
+    sockets[0].sent.filter((command) => command.type === "start_turn").length,
+    1,
+  );
 });
 
 test("a stale React resume cursor cannot rewind the live transport", () => {
