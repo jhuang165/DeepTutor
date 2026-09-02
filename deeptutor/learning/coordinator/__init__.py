@@ -11,16 +11,24 @@ from deeptutor.learning.coordinator.models import (
     SourcePolicy,
     TeachingRecipe,
 )
+from deeptutor.learning.coordinator.planner import ROUTE_PREFERENCES, ActivityPlanner
 from deeptutor.learning.coordinator.recipes import (
     TeachingStrategist,
     load_recipes,
     recipe_for_knowledge_type,
 )
+from deeptutor.learning.coordinator.service import (
+    LearningCoordinator,
+    decision_payload,
+    learning_request_from_payload,
+)
 
 __all__ = [
     "ActivityKind",
     "ActivityPlan",
+    "ActivityPlanner",
     "LearningDecision",
+    "LearningCoordinator",
     "LearningRequest",
     "LearningScope",
     "RecipeActivity",
@@ -28,6 +36,9 @@ __all__ = [
     "SourcePolicy",
     "TeachingRecipe",
     "TeachingStrategist",
+    "ROUTE_PREFERENCES",
+    "decision_payload",
+    "learning_request_from_payload",
     "load_recipes",
     "recipe_for_knowledge_type",
 ]
