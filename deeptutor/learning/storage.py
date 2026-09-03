@@ -55,6 +55,15 @@ _ACTIVE_INTERACTION_STATES = (
     InteractionStatus.AWAITING_INPUT.value,
     InteractionStatus.ANSWERED.value,
 )
+_READ_ONLY_SNAPSHOT_RETRIES = 3
+_READ_ONLY_ROW_ERRORS = (
+    IndexError,
+    KeyError,
+    TypeError,
+    ValueError,
+    json.JSONDecodeError,
+    ValidationError,
+)
 _ALLOWED_INTERACTION_TRANSITIONS: dict[InteractionStatus, frozenset[InteractionStatus]] = {
     InteractionStatus.REGISTERED: frozenset(InteractionStatus),
     InteractionStatus.AWAITING_INPUT: frozenset(
@@ -547,16 +556,11 @@ class LearningStore:
     def _connect_read_only(self) -> Iterator[sqlite3.Connection | None]:
         """Read a temporary SQLite snapshot without touching source database files."""
 
-        if not self.db_path.exists():
-            yield None
-            return
         with tempfile.TemporaryDirectory(prefix="deeptutor-learning-projection-") as directory:
-            snapshot = Path(directory) / self.db_path.name
-            shutil.copyfile(self.db_path, snapshot)
-            for suffix in ("-wal", "-shm"):
-                source_sidecar = self.db_path.with_name(f"{self.db_path.name}{suffix}")
-                if source_sidecar.exists():
-                    shutil.copyfile(source_sidecar, snapshot.with_name(f"{snapshot.name}{suffix}"))
+            snapshot = self._copy_verified_read_only_snapshot(Path(directory))
+            if snapshot is None:
+                yield None
+                return
             conn = sqlite3.connect(
                 f"{snapshot.resolve().as_uri()}?mode=ro",
                 uri=True,
@@ -568,6 +572,45 @@ class LearningStore:
                 yield conn
             finally:
                 conn.close()
+
+    def _read_only_snapshot_fingerprint(self) -> tuple[tuple[Path, str], ...] | None:
+        components = [self.db_path]
+        components.extend(
+            self.db_path.with_name(f"{self.db_path.name}{suffix}")
+            for suffix in ("-wal", "-shm")
+            if self.db_path.with_name(f"{self.db_path.name}{suffix}").exists()
+        )
+        fingerprint: list[tuple[Path, str]] = []
+        for component in components:
+            digest = hashlib.sha256()
+            try:
+                with component.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            except OSError:
+                return None
+            fingerprint.append((component, digest.hexdigest()))
+        return tuple(fingerprint)
+
+    def _copy_verified_read_only_snapshot(self, directory: Path) -> Path | None:
+        """Copy only a source-stable main/WAL/SHM set into *directory*."""
+
+        for attempt in range(_READ_ONLY_SNAPSHOT_RETRIES):
+            before = self._read_only_snapshot_fingerprint()
+            if before is None:
+                continue
+            attempt_dir = directory / str(attempt)
+            attempt_dir.mkdir()
+            try:
+                for source, _digest in before:
+                    shutil.copyfile(source, attempt_dir / source.name)
+            except OSError:
+                shutil.rmtree(attempt_dir, ignore_errors=True)
+                continue
+            if self._read_only_snapshot_fingerprint() == before:
+                return attempt_dir / self.db_path.name
+            shutil.rmtree(attempt_dir, ignore_errors=True)
+        return None
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -808,7 +851,10 @@ class LearningStore:
         except sqlite3.DatabaseError:
             row = None
         if row is not None:
-            return self._progress_from_row(row)
+            try:
+                return self._progress_from_row(row)
+            except _READ_ONLY_ROW_ERRORS:
+                return None
         try:
             progress = LearningProgress.model_validate_json(self._path(path_id).read_text("utf-8"))
         except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError, ValidationError):
@@ -1071,7 +1117,8 @@ class LearningStore:
                 stored = (
                     {
                         str(row["path_id"])
-                        for row in conn.execute("SELECT path_id FROM mastery_paths").fetchall()
+                        for row in conn.execute("SELECT * FROM mastery_paths").fetchall()
+                        if self._read_only_progress_is_valid(row)
                     }
                     if conn is not None
                     else set()
@@ -1082,6 +1129,14 @@ class LearningStore:
             path.stem for path in Path(self._root).glob("*.json") if not path.name.startswith(".")
         }
         return sorted(stored | legacy)
+
+    @staticmethod
+    def _read_only_progress_is_valid(row: sqlite3.Row) -> bool:
+        try:
+            progress = LearningStore._progress_from_row(row)
+            return progress.book_id == str(row["path_id"])
+        except _READ_ONLY_ROW_ERRORS:
+            return False
 
     # ---- durable learning threads and evidence -------------------------
 

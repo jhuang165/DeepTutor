@@ -24,6 +24,7 @@ from deeptutor.learning.queue import (
     keep_best_identity,
 )
 from deeptutor.learning.service import LearningService
+import deeptutor.learning.storage as storage_module
 from deeptutor.learning.storage import LearningStore
 
 
@@ -356,6 +357,101 @@ def test_queue_read_only_apis_ignore_existing_database_without_required_tables(
     assert store.get_active_interaction_read_only("missing") is None
     assert service.list_items() == []
     assert _storage_snapshot(tmp_path) == before
+
+
+def test_queue_read_only_apis_skip_partial_column_rows_without_source_changes(
+    service: LearningQueueService, store: LearningStore, tmp_path
+) -> None:
+    for path in tmp_path.glob("mastery.sqlite3*"):
+        path.unlink()
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute("CREATE TABLE mastery_paths (path_id TEXT PRIMARY KEY)")
+        connection.execute("INSERT INTO mastery_paths (path_id) VALUES ('partial')")
+    before = _storage_snapshot(tmp_path)
+
+    assert store.list_all_read_only() == []
+    assert store.load_read_only("partial") is None
+    assert store.list_learning_threads_read_only() == []
+    assert store.list_paths_for_session_read_only("s") == []
+    assert store.get_active_interaction_read_only("partial") is None
+    assert service.list_items() == []
+    assert _storage_snapshot(tmp_path) == before
+
+
+def test_queue_read_only_apis_skip_malformed_progress_rows_without_source_changes(
+    service: LearningQueueService, store: LearningStore, tmp_path
+) -> None:
+    for path in tmp_path.glob("mastery.sqlite3*"):
+        path.unlink()
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE mastery_paths (
+                path_id TEXT PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO mastery_paths (path_id, state_json, revision, created_at, updated_at)
+            VALUES ('malformed', '{not json', 1, 0.0, 0.0)
+            """
+        )
+    before = _storage_snapshot(tmp_path)
+
+    assert store.list_all_read_only() == []
+    assert store.load_read_only("malformed") is None
+    assert store.list_learning_threads_read_only() == []
+    assert store.list_paths_for_session_read_only("s") == []
+    assert store.get_active_interaction_read_only("malformed") is None
+    assert service.list_items() == []
+    assert _storage_snapshot(tmp_path) == before
+
+
+def test_queue_retries_an_interleaved_snapshot_instead_of_returning_mixed_state(
+    service: LearningQueueService,
+    store: LearningStore,
+    learning_service: LearningService,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    _seed_path(learning_service, "interleaved-path")
+    progress = store.load("interleaved-path")
+    assert progress is not None
+    progress.name = "After checkpoint"
+    source_before_interleave = _storage_snapshot(tmp_path)
+    original_copyfile = storage_module.shutil.copyfile
+    interleaved = False
+    source_after_interleave: dict[str, bytes] = {}
+
+    def copyfile_with_writer(source, destination, *args, **kwargs):
+        nonlocal interleaved, source_after_interleave
+        copied = original_copyfile(source, destination, *args, **kwargs)
+        if not interleaved and source == store.db_path:
+            interleaved = True
+            store.save(progress)
+            with sqlite3.connect(store.db_path) as connection:
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            source_after_interleave = _storage_snapshot(tmp_path)
+        return copied
+
+    monkeypatch.setattr(storage_module.shutil, "copyfile", copyfile_with_writer)
+
+    loaded = store.load_read_only("interleaved-path")
+    items = service.list_items()
+
+    assert interleaved is True
+    assert source_after_interleave != source_before_interleave
+    assert loaded is not None
+    assert loaded.name == "After checkpoint"
+    assert [(item.path_id, item.activity["name"]) for item in items] == [
+        ("interleaved-path", "After checkpoint")
+    ]
+    assert _storage_snapshot(tmp_path) == source_after_interleave
 
 
 def test_queue_projects_answered_interactions_as_waiting_for_grading(
