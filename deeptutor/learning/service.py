@@ -10,6 +10,7 @@ from deeptutor.learning.grading import classify_error, grade_answer
 from deeptutor.learning.mastery import compute_mastery
 from deeptutor.learning.models import (
     ErrorRecord,
+    EvidenceRecord,
     InteractionStatus,
     LearnerMasteryOverride,
     LearningModule,
@@ -88,15 +89,29 @@ class LearningService:
                 if record.thread_id in bound_thread_ids
             ]
             passed = evidence_gate(kp.type, records)
-            changed = bool(tx.progress.evidence_mastery.get(objective_id, False)) != passed
+            previous = bool(tx.progress.evidence_mastery.get(objective_id, False))
+            changed = objective_id not in tx.progress.evidence_mastery or previous != passed
+            gate_changed = previous != passed
+            if not changed:
+                return passed
             tx.progress.evidence_mastery[objective_id] = passed
-            if changed:
-                tx.progress.review_queue = SpacedRepetitionScheduler().build_review_queue(tx.progress)
+            if gate_changed:
+                tx.progress.review_queue = SpacedRepetitionScheduler().build_review_queue(
+                    tx.progress
+                )
             tx.emit(
                 "mastery.evidence_recalculated",
                 {"objective_id": objective_id, "passed": passed},
             )
             return passed
+
+    def remove_evidence(self, evidence_id: str) -> EvidenceRecord | None:
+        """Tombstone evidence and reconcile only its bound objective."""
+
+        removed = self._store.remove_evidence(evidence_id)
+        if removed is not None and removed.path_id and removed.objective_id:
+            self.recalculate_evidence_mastery(removed.path_id, removed.objective_id)
+        return removed
 
     def init_modules(self, progress: LearningProgress, modules: list[LearningModule]) -> None:
         """Initialize the runnable module set (replace semantics)."""
@@ -116,6 +131,9 @@ class LearningService:
         for key in list(progress.qualitative_mastery.keys()):
             if key not in new_kp_ids:
                 del progress.qualitative_mastery[key]
+        for key in list(progress.evidence_mastery.keys()):
+            if key not in new_kp_ids:
+                del progress.evidence_mastery[key]
         for key in list(progress.repetition_states.keys()):
             if key not in new_kp_ids:
                 del progress.repetition_states[key]

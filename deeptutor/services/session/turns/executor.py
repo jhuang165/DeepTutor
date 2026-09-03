@@ -100,6 +100,27 @@ def trusted_source_ids_from_turn(
     return source_ids
 
 
+def trusted_artifact_refs_from_turn(
+    attachment_records: Collection[Mapping[str, object]],
+    generated_attachments: Collection[Mapping[str, object]],
+) -> set[str]:
+    """Return artifact references backed by persisted turn attachments."""
+
+    artifact_refs = {_nonempty_id(record.get("id")) for record in attachment_records}
+    artifact_refs.update(
+        _nonempty_id(record.get("id"))
+        for record in generated_attachments
+        if record.get("generated") is True
+    )
+    artifact_refs.update(
+        _nonempty_id(record.get("url"))
+        for record in generated_attachments
+        if record.get("generated") is True
+    )
+    artifact_refs.discard("")
+    return artifact_refs
+
+
 async def _finalize_learning_evidence(
     context: Any,
     *,
@@ -108,6 +129,7 @@ async def _finalize_learning_evidence(
     raw_user_content: str,
     source_index: Mapping[str, object],
     attachment_records: Collection[Mapping[str, object]],
+    generated_attachments: Collection[Mapping[str, object]],
     done_metadata: dict[str, Any],
     learner_response_ref: str = "",
 ) -> None:
@@ -138,6 +160,10 @@ async def _finalize_learning_evidence(
                 source_index,
                 attachment_records,
                 context.capability_output.event_metadata,
+            ),
+            allowed_artifact_refs=trusted_artifact_refs_from_turn(
+                attachment_records,
+                generated_attachments,
             ),
             learner_response_ref=learner_response_ref,
         )
@@ -1027,6 +1053,7 @@ class TurnExecutor:
                     raw_user_content=raw_user_content,
                     source_index=source_index,
                     attachment_records=attachment_records,
+                    generated_attachments=generated_attachments,
                     done_metadata=pending_done_event.metadata,
                     learner_response_ref=(
                         f"chat-message:{regenerated_user_message_id}:user"

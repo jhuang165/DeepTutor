@@ -561,8 +561,11 @@ def test_queue_retries_an_interleaved_snapshot_instead_of_returning_mixed_state(
         if not interleaved and source == store.db_path:
             interleaved = True
             store.save(progress)
-            with sqlite3.connect(store.db_path) as connection:
+            connection = sqlite3.connect(store.db_path)
+            try:
                 connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            finally:
+                connection.close()
             source_after_interleave = _storage_snapshot(tmp_path)
         return copied
 
@@ -636,3 +639,111 @@ def test_queue_listing_does_not_mutate_projected_learning_state(
         "events": [event.model_dump(mode="json") for event in store.list_events("path-1")],
     }
     assert after == before
+
+
+def test_queue_uses_one_verified_snapshot_for_the_whole_projection(
+    service: LearningQueueService,
+    store: LearningStore,
+    learning_service: LearningService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for path_id in ("path-1", "path-2"):
+        _seed_path(learning_service, path_id)
+        _seed_due_review(store, path_id)
+        _seed_active_interaction(store, path_id)
+        _seed_thread(store, f"thread-{path_id}", path_id=path_id)
+        store.bind_session(path_id, "s")
+    original_copy = store._copy_verified_read_only_snapshot
+    snapshot_copies = 0
+
+    def counted_copy(directory):
+        nonlocal snapshot_copies
+        snapshot_copies += 1
+        return original_copy(directory)
+
+    monkeypatch.setattr(store, "_copy_verified_read_only_snapshot", counted_copy)
+
+    items = service.list_items(session_id="s", now=1_000.0)
+
+    assert items
+    assert snapshot_copies == 1
+
+
+def test_default_queue_construction_and_read_do_not_initialize_storage(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "uninitialized-workspace"
+
+    class FakePathService:
+        @staticmethod
+        def get_workspace_dir():
+            return workspace
+
+    def fail_migration(_root):
+        raise AssertionError("queue read attempted workspace migration")
+
+    monkeypatch.setattr(storage_module, "get_path_service", lambda: FakePathService())
+    monkeypatch.setattr(
+        "deeptutor.learning.migration.prepare_mastery_v2_root",
+        fail_migration,
+    )
+
+    service = LearningQueueService()
+
+    assert service.list_items() == []
+    assert not workspace.exists()
+
+
+def test_queue_skips_malformed_thread_next_activity_with_content_safe_warning(
+    service: LearningQueueService,
+    store: LearningStore,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _seed_thread(store, "valid-thread", next_activity={"kind": "retrieval"})
+    private_payload = "PRIVATE malformed next activity"
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO learning_threads (
+                thread_id, session_id, scope, goal, status, path_id, course_id,
+                source_refs_json, next_activity_json, created_at, updated_at
+            ) VALUES (?, 's', 'lesson', 'Malformed goal', 'active', '', '', '[]', ?, 0, 0)
+            """,
+            ("malformed-thread", "{" + private_payload),
+        )
+
+    items = service.list_items(session_id="s")
+
+    assert [item.thread_id for item in items] == ["valid-thread"]
+    assert "malformed learning projection thread row" in caplog.text
+    assert private_payload not in caplog.text
+
+
+def test_queue_skips_malformed_interaction_with_content_safe_warning(
+    service: LearningQueueService,
+    store: LearningStore,
+    learning_service: LearningService,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _seed_path(learning_service, "valid-path")
+    _seed_path(learning_service, "malformed-path")
+    _seed_active_interaction(store, "valid-path")
+    private_payload = "PRIVATE malformed learner interaction"
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO mastery_interactions (
+                interaction_id, path_id, status, question_json, session_id,
+                turn_id, user_answer, result_json, created_at, updated_at
+            ) VALUES (?, ?, 'awaiting_input', ?, 's', '', '', '{}', 0, 0)
+            """,
+            ("malformed-interaction", "malformed-path", "{" + private_payload),
+        )
+
+    items = service.list_items(session_id="s")
+
+    assert [(item.path_id, item.reason) for item in items] == [
+        ("valid-path", LearningQueueReason.UNFINISHED_ATTEMPT)
+    ]
+    assert "malformed learning projection interaction row" in caplog.text
+    assert private_payload not in caplog.text

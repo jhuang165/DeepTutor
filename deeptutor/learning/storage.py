@@ -329,12 +329,171 @@ class LearningTransaction:
         )
 
 
+class LearningReadSnapshot:
+    """One coherent, automatically cleaned read view for queue projections."""
+
+    def __init__(self, store: LearningStore, conn: sqlite3.Connection | None) -> None:
+        self._store = store
+        self._conn = conn
+        self._progress_by_id: dict[str, LearningProgress] | None = None
+
+    @staticmethod
+    def _warn_malformed(row_kind: str, exc: Exception) -> None:
+        logger.warning(
+            "Skipping malformed learning projection %s row exception_class=%s",
+            row_kind,
+            type(exc).__name__,
+        )
+
+    def progress_by_id(self) -> dict[str, LearningProgress]:
+        """Return every valid SQLite/legacy path parsed once for this snapshot."""
+
+        if self._progress_by_id is not None:
+            return self._progress_by_id
+        progress_by_id: dict[str, LearningProgress] = {}
+        sqlite_path_ids: set[str] = set()
+        rows: list[sqlite3.Row] = []
+        if self._conn is not None:
+            try:
+                rows = self._conn.execute("SELECT * FROM mastery_paths").fetchall()
+            except sqlite3.DatabaseError:
+                rows = []
+        for row in rows:
+            try:
+                path_id = str(row["path_id"])
+                sqlite_path_ids.add(path_id)
+                progress = self._store._progress_from_row(row)
+                if progress.book_id != path_id:
+                    raise ValueError("mastery path row identity mismatch")
+            except _READ_ONLY_ROW_ERRORS as exc:
+                self._warn_malformed("path", exc)
+                continue
+            progress_by_id[path_id] = progress
+
+        try:
+            legacy_paths = sorted(
+                path
+                for path in Path(self._store._root).glob("*.json")
+                if not path.name.startswith(".")
+            )
+        except OSError:
+            legacy_paths = []
+        for path in legacy_paths:
+            if path.stem in sqlite_path_ids:
+                continue
+            try:
+                path_id = self._store._validate_id(path.stem)
+                progress = LearningProgress.model_validate_json(path.read_text("utf-8"))
+                if progress.book_id != path_id:
+                    raise ValueError("legacy mastery path identity mismatch")
+            except (
+                FileNotFoundError,
+                OSError,
+                UnicodeError,
+                json.JSONDecodeError,
+                ValidationError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                self._warn_malformed("legacy path", exc)
+                continue
+            progress_by_id[path_id] = progress
+
+        self._progress_by_id = progress_by_id
+        return progress_by_id
+
+    def session_path_ids(self, session_id: str) -> set[str]:
+        """Return valid paths bound to *session_id* from this same read view."""
+
+        session_id = str(session_id or "").strip()
+        if not session_id or self._conn is None:
+            return set()
+        try:
+            rows = self._conn.execute(
+                "SELECT path_id FROM mastery_path_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            return set()
+        valid_path_ids = set(self.progress_by_id())
+        return {str(row["path_id"]) for row in rows if str(row["path_id"]) in valid_path_ids}
+
+    def learning_threads(
+        self,
+        session_id: str = "",
+        *,
+        status: LearningThreadStatus | str | None = None,
+    ) -> list[LearningThread]:
+        clauses: list[str] = []
+        params: list[str] = []
+        if session_id:
+            clauses.append("session_id = ?")
+            params.append(str(session_id))
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status.value if isinstance(status, LearningThreadStatus) else str(status))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        try:
+            rows = (
+                self._conn.execute(
+                    f"SELECT * FROM learning_threads{where} "
+                    "ORDER BY updated_at DESC, thread_id ASC",
+                    params,
+                ).fetchall()
+                if self._conn is not None
+                else []
+            )
+        except sqlite3.DatabaseError:
+            rows = []
+        threads: list[LearningThread] = []
+        for row in rows:
+            try:
+                thread = self._store._learning_thread_from_row(row)
+            except _READ_ONLY_ROW_ERRORS as exc:
+                self._warn_malformed("thread", exc)
+                continue
+            if thread is not None:
+                threads.append(thread)
+        return threads
+
+    def active_interactions(self, path_ids: set[str]) -> dict[str, MasteryInteraction]:
+        """Return the newest valid active interaction for each requested path."""
+
+        if not path_ids or self._conn is None:
+            return {}
+        placeholders = ",".join("?" for _ in _ACTIVE_INTERACTION_STATES)
+        try:
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM mastery_interactions
+                WHERE status IN ({placeholders})
+                ORDER BY path_id ASC, created_at DESC, rowid DESC
+                """,  # nosec B608 - placeholders is generated from fixed states
+                _ACTIVE_INTERACTION_STATES,
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            return {}
+        interactions: dict[str, MasteryInteraction] = {}
+        for row in rows:
+            try:
+                path_id = str(row["path_id"])
+                if path_id not in path_ids or path_id in interactions:
+                    continue
+                interaction = LearningTransaction._interaction_from_row(row)
+            except _READ_ONLY_ROW_ERRORS as exc:
+                self._warn_malformed("interaction", exc)
+                continue
+            if interaction is not None:
+                interactions[path_id] = interaction
+        return interactions
+
+
 class LearningStore:
     """Workspace-scoped transactional store for Mastery Path state."""
 
     _DB_FILENAME = "mastery.sqlite3"
 
-    def __init__(self, root: Path | None = None) -> None:
+    def __init__(self, root: Path | None = None, *, initialize: bool = True) -> None:
         if root is None:
             # Explicit roots are used by tests and SDK callers as direct store
             # directories.  The app-owned default is the only location that
@@ -342,12 +501,13 @@ class LearningStore:
             from deeptutor.learning.migration import prepare_mastery_v2_root
 
             learning_root = get_path_service().get_workspace_dir() / "learning"
-            self._root = prepare_mastery_v2_root(learning_root)
+            self._root = prepare_mastery_v2_root(learning_root) if initialize else learning_root
         else:
             self._root = Path(root)
-        self._root.mkdir(parents=True, exist_ok=True)
         self._initialized = False
-        self._ensure_initialized()
+        if initialize:
+            self._root.mkdir(parents=True, exist_ok=True)
+            self._ensure_initialized()
 
     @property
     def db_path(self) -> Path:
@@ -572,6 +732,13 @@ class LearningStore:
                 yield conn
             finally:
                 conn.close()
+
+    @contextmanager
+    def read_snapshot(self) -> Iterator[LearningReadSnapshot]:
+        """Yield one reusable verified snapshot without initializing source storage."""
+
+        with self._connect_read_only() as conn:
+            yield LearningReadSnapshot(self, conn)
 
     @staticmethod
     def _read_only_component_names(database: Path) -> tuple[str, ...] | None:
@@ -1263,10 +1430,24 @@ class LearningStore:
         now = time.time()
         with self._transaction() as conn:
             row = conn.execute(
-                "SELECT session_id FROM learning_threads WHERE thread_id = ?", (thread_id,)
+                "SELECT session_id, next_activity_json FROM learning_threads WHERE thread_id = ?",
+                (thread_id,),
             ).fetchone()
             if row is None:
                 raise LearningStoreError(f"Unknown learning thread: {thread_id}")
+            try:
+                current_activity = json.loads(row["next_activity_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                current_activity = None
+            if current_activity == next_activity:
+                existing = self._learning_thread_from_row(
+                    conn.execute(
+                        "SELECT * FROM learning_threads WHERE thread_id = ?", (thread_id,)
+                    ).fetchone()
+                )
+                if existing is None:  # pragma: no cover - row was read above
+                    raise LearningStoreError(f"Unknown learning thread: {thread_id}")
+                return existing
             conn.execute(
                 """
                 UPDATE learning_threads
@@ -1292,24 +1473,31 @@ class LearningStore:
         now = time.time()
         with self._transaction() as conn:
             row = conn.execute(
-                "SELECT session_id FROM learning_threads WHERE thread_id = ?", (thread_id,)
+                "SELECT session_id, status FROM learning_threads WHERE thread_id = ?",
+                (thread_id,),
             ).fetchone()
             if row is None:
                 raise LearningStoreError(f"Unknown learning thread: {thread_id}")
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE learning_threads
                 SET status = ?, updated_at = ?
-                WHERE thread_id = ?
+                WHERE thread_id = ? AND status != ?
                 """,
-                (LearningThreadStatus.COMPLETED.value, now, thread_id),
+                (
+                    LearningThreadStatus.COMPLETED.value,
+                    now,
+                    thread_id,
+                    LearningThreadStatus.COMPLETED.value,
+                ),
             )
-            self._append_learning_event(
-                conn,
-                thread_id,
-                "thread.completed",
-                session_id=str(row["session_id"]),
-            )
+            if cursor.rowcount == 1:
+                self._append_learning_event(
+                    conn,
+                    thread_id,
+                    "thread.completed",
+                    session_id=str(row["session_id"]),
+                )
         completed = self.get_learning_thread(thread_id)
         if completed is None:  # pragma: no cover - committed update guarantees this row
             raise LearningStoreError(f"Unknown learning thread: {thread_id}")

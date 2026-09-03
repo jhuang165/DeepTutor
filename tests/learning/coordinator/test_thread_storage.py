@@ -121,3 +121,24 @@ def test_concurrent_evidence_append_reports_only_one_insertion(
     assert [stored for stored, _inserted in results] == [record, record]
     assert sorted(inserted for _stored, inserted in results) == [False, True]
     assert _audit_event_types(store) == ["thread.created", "evidence.appended"]
+
+
+def test_concurrent_replayed_next_activity_update_does_not_duplicate_audit(
+    store: LearningStore, thread: LearningThread
+) -> None:
+    store.create_learning_thread(thread)
+    next_activity = {"kind": "retrieval", "recipe_step": 2}
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        updated = list(
+            executor.map(
+                lambda _index: store.set_learning_thread_next_activity(
+                    thread.thread_id, next_activity
+                ),
+                range(2),
+            )
+        )
+
+    assert [item.next_activity for item in updated] == [next_activity, next_activity]
+    assert store.get_learning_thread(thread.thread_id).next_activity == next_activity
+    assert _audit_event_types(store) == ["thread.created", "thread.next_activity"]

@@ -134,6 +134,7 @@ class LearningCoordinator:
         turn_id: str,
         learner_response: str,
         allowed_source_refs: Collection[str],
+        allowed_artifact_refs: Collection[str] = (),
         learner_response_ref: str = "",
     ) -> EvidenceRecord | None:
         """Persist server-derived evidence after a successful teaching turn."""
@@ -158,11 +159,26 @@ class LearningCoordinator:
                 turn_id,
                 dropped_source_count,
             )
+        artifact_ref = (
+            result.artifact_ref
+            if result.artifact_ref and result.artifact_ref in set(allowed_artifact_refs)
+            else ""
+        )
+        if result.artifact_ref and not artifact_ref:
+            logger.warning(
+                "Dropped unverified learning artifact ref turn=%s dropped_count=1",
+                turn_id,
+            )
 
         thread_id = (
             decision.thread_id
             or hashlib.sha256(f"{session_id}:{decision.goal}".encode()).hexdigest()[:32]
         )
+        evidence_id = hashlib.sha256(
+            f"{turn_id}:{decision.objective_id}:{decision.activity.kind.value}:"
+            f"{decision.activity.recipe_step}".encode()
+        ).hexdigest()[:32]
+        existing_evidence = self._store.get_evidence(evidence_id)
         thread = self._store.get_learning_thread(thread_id)
         if thread is None:
             if decision.thread_id:
@@ -182,6 +198,7 @@ class LearningCoordinator:
                 thread,
                 decision=decision,
                 session_id=session_id,
+                allow_completed=existing_evidence is not None,
             )
 
         validated = validate_open_assessment(result.assessment, learner_response)
@@ -190,10 +207,6 @@ class LearningCoordinator:
             if validated is not None
             else EvidenceOutcome.UNASSESSED
         )
-        evidence_id = hashlib.sha256(
-            f"{turn_id}:{decision.objective_id}:{decision.activity.kind.value}:"
-            f"{decision.activity.recipe_step}".encode()
-        ).hexdigest()[:32]
         independent = (
             validated is not None
             and decision.activity.independent_required
@@ -213,7 +226,7 @@ class LearningCoordinator:
                 if len(learner_response) > 8_000
                 else ""
             ),
-            artifact_ref=result.artifact_ref,
+            artifact_ref=artifact_ref,
             outcome=outcome,
             help_level=decision.activity.help_level,
             independent=independent,
@@ -229,14 +242,40 @@ class LearningCoordinator:
             session_id=session_id,
             turn_id=turn_id,
         )
-        stored, inserted = self._store.append_evidence_if_absent(record)
-        if not inserted:
-            return stored
-        if validated is not None and thread.path_id and decision.objective_id:
-            self._learning_service.recalculate_evidence_mastery(
-                thread.path_id, decision.objective_id
+        stored, _inserted = self._store.append_evidence_if_absent(record)
+        if (
+            stored.thread_id != thread_id
+            or stored.path_id != thread.path_id
+            or stored.objective_id != decision.objective_id
+            or stored.activity_kind != decision.activity.kind.value
+            or stored.recipe_id != decision.activity.recipe_id
+            or stored.recipe_version != decision.activity.recipe_version
+            or stored.session_id != session_id
+            or stored.turn_id != turn_id
+        ):
+            raise ValueError("The persisted evidence recipe or binding does not match the replay")
+        mastery_passed: bool | None = None
+        if (
+            stored.removed_at is None
+            and stored.outcome is not EvidenceOutcome.UNASSESSED
+            and stored.path_id
+            and stored.objective_id
+        ):
+            mastery_passed = self._learning_service.recalculate_evidence_mastery(
+                stored.path_id, stored.objective_id
             )
-        next_activity = self._planner.next_after(decision, outcome.value)
+        terminal = (
+            stored.removed_at is None
+            and stored.outcome is EvidenceOutcome.CORRECT
+            and self._planner.is_terminal(decision)
+            and (not stored.path_id or mastery_passed is True)
+        )
+        if terminal:
+            self._store.complete_learning_thread(thread_id)
+            return stored
+        if thread.status is LearningThreadStatus.COMPLETED:
+            return stored
+        next_activity = self._planner.next_after(decision, stored.outcome.value)
         self._store.set_learning_thread_next_activity(
             thread_id, next_activity.model_dump(mode="json")
         )
@@ -248,6 +287,7 @@ class LearningCoordinator:
         *,
         decision: LearningDecision,
         session_id: str,
+        allow_completed: bool = False,
     ) -> None:
         if thread.session_id != session_id:
             raise ValueError("Learning thread belongs to another session")
@@ -255,7 +295,9 @@ class LearningCoordinator:
             raise ValueError("Learning thread goal does not match the decision")
         if thread.scope != "lesson":
             raise ValueError("Learning thread scope is not lesson")
-        if thread.status is not LearningThreadStatus.ACTIVE:
+        if thread.status is LearningThreadStatus.COMPLETED and allow_completed:
+            pass
+        elif thread.status is not LearningThreadStatus.ACTIVE:
             raise ValueError("Learning thread is not active")
         if not thread.path_id:
             return

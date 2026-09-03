@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import sqlite3
+
+import pytest
 
 from deeptutor.learning.evidence import evidence_gate, validate_open_assessment
 from deeptutor.learning.models import (
@@ -23,6 +26,7 @@ NOW = 1_700_000_000.0
 def _evidence(
     evidence_id: str,
     *,
+    objective_id: str = "objective-1",
     activity_kind: str = "retrieval",
     outcome: EvidenceOutcome = EvidenceOutcome.CORRECT,
     help_level: int = 0,
@@ -38,7 +42,7 @@ def _evidence(
         evidence_id=evidence_id,
         thread_id=thread_id,
         path_id=path_id,
-        objective_id="objective-1",
+        objective_id=objective_id,
         activity_kind=activity_kind,
         recipe_id="recipe",
         recipe_version=1,
@@ -56,27 +60,33 @@ def _evidence(
 
 
 def test_assessment_requires_cited_learner_text() -> None:
-    assert validate_open_assessment(
-        {
-            "outcome": "correct",
-            "rubric": [{"id": "mechanism", "passed": True}],
-            "cited_evidence": ["words the learner never wrote"],
-            "uncertainty": 0.1,
-        },
-        "Eigenvectors keep their direction under the transform.",
-    ) is None
+    assert (
+        validate_open_assessment(
+            {
+                "outcome": "correct",
+                "rubric": [{"id": "mechanism", "passed": True}],
+                "cited_evidence": ["words the learner never wrote"],
+                "uncertainty": 0.1,
+            },
+            "Eigenvectors keep their direction under the transform.",
+        )
+        is None
+    )
 
 
 def test_high_uncertainty_is_unassessed() -> None:
-    assert validate_open_assessment(
-        {
-            "outcome": "correct",
-            "rubric": [{"id": "mechanism", "passed": True}],
-            "cited_evidence": ["keep their direction"],
-            "uncertainty": 0.6,
-        },
-        "They keep their direction.",
-    ) is None
+    assert (
+        validate_open_assessment(
+            {
+                "outcome": "correct",
+                "rubric": [{"id": "mechanism", "passed": True}],
+                "cited_evidence": ["keep their direction"],
+                "uncertainty": 0.6,
+            },
+            "They keep their direction.",
+        )
+        is None
+    )
 
 
 def test_memory_gate_requires_independent_retrievals_on_separate_days() -> None:
@@ -100,7 +110,9 @@ def test_procedure_gate_requires_independent_solution_and_transfer() -> None:
     independent_solution = _evidence("solution", activity_kind="solution")
     transfer_variation = _evidence("transfer", activity_kind="solution", transfer=True)
 
-    assert evidence_gate(KnowledgeType.PROCEDURE, [independent_solution, transfer_variation]) is True
+    assert (
+        evidence_gate(KnowledgeType.PROCEDURE, [independent_solution, transfer_variation]) is True
+    )
 
 
 def test_design_gate_requires_artifact_and_independent_critique() -> None:
@@ -122,7 +134,9 @@ def test_gate_ignores_removed_unassessed_and_guided_evidence() -> None:
     assert evidence_gate(KnowledgeType.MEMORY, [delayed, removed, unassessed, guided]) is False
 
 
-def test_recalculate_evidence_mastery_changes_only_evidence_gate_and_records_event(tmp_path) -> None:
+def test_recalculate_evidence_mastery_changes_only_evidence_gate_and_records_event(
+    tmp_path,
+) -> None:
     store = LearningStore(root=tmp_path)
     service = LearningService(store)
     objective = KnowledgePoint(
@@ -167,9 +181,7 @@ def test_recalculate_ignores_evidence_from_a_thread_bound_to_another_path(tmp_pa
     objective = KnowledgePoint(
         id="objective-1", name="Remember", type=KnowledgeType.MEMORY, module_id="module-1"
     )
-    module = LearningModule(
-        id="module-1", name="Module", order=0, knowledge_points=[objective]
-    )
+    module = LearningModule(id="module-1", name="Module", order=0, knowledge_points=[objective])
     service.replace_modules_for_path("path-1", [module])
     service.replace_modules_for_path("path-2", [module])
     store.create_learning_thread(
@@ -248,3 +260,143 @@ def test_recalculate_false_gate_preserves_an_existing_review_queue(tmp_path) -> 
     assert progress is not None
     assert progress.evidence_mastery == {"objective-1": False}
     assert progress.review_queue[0].id == "review_objective-1"
+
+
+def test_concurrent_recalculation_emits_only_the_state_change(tmp_path) -> None:
+    store = LearningStore(root=tmp_path)
+    service = LearningService(store)
+    objective = KnowledgePoint(
+        id="objective-1",
+        name="Concept",
+        type=KnowledgeType.CONCEPT,
+        module_id="module-1",
+    )
+    service.replace_modules_for_path(
+        "path-1",
+        [LearningModule(id="module-1", name="Module", order=0, knowledge_points=[objective])],
+    )
+    store.create_learning_thread(
+        LearningThread(
+            thread_id="thread-1",
+            session_id="session-1",
+            scope="lesson",
+            goal="Learn the concept",
+            status="active",
+            path_id="path-1",
+        )
+    )
+    store.append_evidence(_evidence("evidence-1", activity_kind="teach_back"))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda _index: service.recalculate_evidence_mastery("path-1", "objective-1"),
+                range(2),
+            )
+        )
+
+    assert results == [True, True]
+    recalculation_events = [
+        event
+        for event in store.list_events("path-1")
+        if event.event_type == "mastery.evidence_recalculated"
+    ]
+    assert len(recalculation_events) == 1
+
+
+def test_service_removal_recalculates_only_the_bound_objective(tmp_path) -> None:
+    store = LearningStore(root=tmp_path)
+    service = LearningService(store)
+    objectives = [
+        KnowledgePoint(
+            id=objective_id,
+            name=objective_id,
+            type=KnowledgeType.CONCEPT,
+            module_id="module-1",
+        )
+        for objective_id in ("objective-1", "objective-2")
+    ]
+    service.replace_modules_for_path(
+        "path-1",
+        [LearningModule(id="module-1", name="Module", order=0, knowledge_points=objectives)],
+    )
+    store.create_learning_thread(
+        LearningThread(
+            thread_id="thread-1",
+            session_id="session-1",
+            scope="lesson",
+            goal="Learn both objectives",
+            status="active",
+            path_id="path-1",
+        )
+    )
+    for objective_id in ("objective-1", "objective-2"):
+        store.append_evidence(
+            _evidence(
+                f"evidence-{objective_id}",
+                objective_id=objective_id,
+                activity_kind="teach_back",
+            )
+        )
+        assert service.recalculate_evidence_mastery("path-1", objective_id) is True
+
+    removed = service.remove_evidence("evidence-objective-1")
+
+    progress = store.load("path-1")
+    assert removed is not None and removed.removed_at is not None
+    assert progress is not None
+    assert progress.evidence_mastery == {"objective-1": False, "objective-2": True}
+
+
+def test_service_removal_replay_repairs_failed_recalculation_without_duplicate_audit(
+    tmp_path, monkeypatch
+) -> None:
+    store = LearningStore(root=tmp_path)
+    service = LearningService(store)
+    objective = KnowledgePoint(
+        id="objective-1",
+        name="Concept",
+        type=KnowledgeType.CONCEPT,
+        module_id="module-1",
+    )
+    service.replace_modules_for_path(
+        "path-1",
+        [LearningModule(id="module-1", name="Module", order=0, knowledge_points=[objective])],
+    )
+    store.create_learning_thread(
+        LearningThread(
+            thread_id="thread-1",
+            session_id="session-1",
+            scope="lesson",
+            goal="Learn the concept",
+            status="active",
+            path_id="path-1",
+        )
+    )
+    store.append_evidence(_evidence("evidence-1", activity_kind="teach_back"))
+    assert service.recalculate_evidence_mastery("path-1", "objective-1") is True
+    real_recalculate = service.recalculate_evidence_mastery
+    calls = 0
+
+    def fail_once(path_id: str, objective_id: str) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("injected recalculation failure")
+        return real_recalculate(path_id, objective_id)
+
+    monkeypatch.setattr(service, "recalculate_evidence_mastery", fail_once)
+
+    with pytest.raises(RuntimeError, match="injected recalculation failure"):
+        service.remove_evidence("evidence-1")
+    repaired = service.remove_evidence("evidence-1")
+
+    progress = store.load("path-1")
+    assert repaired is not None and repaired.removed_at is not None
+    assert progress is not None
+    assert progress.evidence_mastery == {"objective-1": False}
+    with sqlite3.connect(store.db_path) as connection:
+        removal_audits = connection.execute(
+            "SELECT COUNT(*) FROM learning_audit_events WHERE event_type = 'evidence.removed'"
+        ).fetchone()[0]
+    assert removal_audits == 1

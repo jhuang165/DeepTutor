@@ -7,9 +7,9 @@ from typing import TypeVar
 
 from deeptutor.learning import policy
 from deeptutor.learning.coordinator.models import LearningQueueItem, LearningQueueReason
-from deeptutor.learning.models import InteractionStatus, LearningThreadStatus
+from deeptutor.learning.models import InteractionStatus, LearningProgress, LearningThreadStatus
 from deeptutor.learning.service import LearningService
-from deeptutor.learning.storage import LearningStore
+from deeptutor.learning.storage import LearningReadSnapshot, LearningStore
 
 _QueueItem = TypeVar("_QueueItem", bound=LearningQueueItem)
 
@@ -45,15 +45,20 @@ class LearningQueueService:
         learning_service: LearningService | None = None,
     ) -> None:
         self._store = store or (
-            learning_service.store if learning_service is not None else LearningStore()
+            learning_service.store
+            if learning_service is not None
+            else LearningStore(initialize=False)
         )
-        self._learning_service = learning_service or LearningService(self._store)
 
-    def _unfinished(self, session_id: str) -> list[LearningQueueItem]:
+    @staticmethod
+    def _unfinished(
+        snapshot: LearningReadSnapshot,
+        path_ids: set[str],
+        session_id: str,
+    ) -> list[LearningQueueItem]:
         items: list[LearningQueueItem] = []
-        for path_id in self._store.list_all_read_only():
-            interaction = self._store.get_active_interaction_read_only(path_id)
-            if interaction is None or (session_id and interaction.session_id != session_id):
+        for path_id, interaction in snapshot.active_interactions(path_ids).items():
+            if session_id and interaction.session_id != session_id:
                 continue
             objective_id = interaction.question.knowledge_point_id
             objective = objective_id or "this objective"
@@ -78,11 +83,10 @@ class LearningQueueService:
             )
         return items
 
-    def _threads(self, session_id: str) -> list[LearningQueueItem]:
+    @staticmethod
+    def _threads(snapshot: LearningReadSnapshot, session_id: str) -> list[LearningQueueItem]:
         items: list[LearningQueueItem] = []
-        for thread in self._store.list_learning_threads_read_only(
-            session_id, status=LearningThreadStatus.ACTIVE
-        ):
+        for thread in snapshot.learning_threads(session_id, status=LearningThreadStatus.ACTIVE):
             activity = dict(thread.next_activity)
             objective_id = str(activity.get("objective_id") or "")
             transfer_required = bool(activity.get("transfer_required", False))
@@ -109,10 +113,15 @@ class LearningQueueService:
             )
         return items
 
-    def _reviews(self, now: float | None, path_ids: set[str]) -> list[LearningQueueItem]:
+    @staticmethod
+    def _reviews(
+        now: float | None,
+        path_ids: set[str],
+        progress_by_id: dict[str, LearningProgress],
+    ) -> list[LearningQueueItem]:
         items: list[LearningQueueItem] = []
         for path_id in sorted(path_ids):
-            progress = self._store.load_read_only(path_id)
+            progress = progress_by_id.get(path_id)
             if progress is None:
                 continue
             for review in policy.due_reviews(progress, now=now):
@@ -136,9 +145,30 @@ class LearningQueueService:
                 )
         return items
 
-    def _paths(self, path_ids: set[str]) -> list[LearningQueueItem]:
+    @staticmethod
+    def _paths(
+        path_ids: set[str], progress_by_id: dict[str, LearningProgress]
+    ) -> list[LearningQueueItem]:
         items: list[LearningQueueItem] = []
-        for overview in self._learning_service.list_path_overviews_read_only(path_ids=path_ids):
+        overviews: list[dict[str, object]] = []
+        for path_id in path_ids:
+            progress = progress_by_id.get(path_id)
+            if progress is None:
+                continue
+            summary = policy.map_summary(progress)
+            counts = summary["counts"]
+            overviews.append(
+                {
+                    "path_id": progress.book_id,
+                    "name": policy.path_display_name(progress),
+                    "objectives": counts["total"],
+                    "mastered": counts["mastered"],
+                    "complete": summary["complete"],
+                    "updated_at": progress.updated_at,
+                }
+            )
+        overviews.sort(key=lambda overview: float(overview["updated_at"]), reverse=True)
+        for overview in overviews:
             if overview["complete"]:
                 continue
             path_id = str(overview["path_id"])
@@ -166,19 +196,15 @@ class LearningQueueService:
         limit: int = 10,
         now: float | None = None,
     ) -> list[LearningQueueItem]:
-        path_ids = (
-            {
-                str(binding["path_id"])
-                for binding in self._store.list_paths_for_session_read_only(session_id)
-            }
-            if session_id
-            else set(self._store.list_all_read_only())
-        )
-        candidates = [
-            *self._unfinished(session_id),
-            *self._threads(session_id),
-            *self._reviews(now, path_ids),
-            *self._paths(path_ids),
-        ]
+        with self._store.read_snapshot() as snapshot:
+            progress_by_id = snapshot.progress_by_id()
+            all_path_ids = set(progress_by_id)
+            path_ids = snapshot.session_path_ids(session_id) if session_id else all_path_ids
+            candidates = [
+                *self._unfinished(snapshot, all_path_ids, session_id),
+                *self._threads(snapshot, session_id),
+                *self._reviews(now, path_ids, progress_by_id),
+                *self._paths(path_ids, progress_by_id),
+            ]
         deduped = keep_best_identity(candidates, key=_rank)
         return sorted(deduped, key=_rank)[: max(0, limit)]

@@ -149,6 +149,27 @@ class ActivityPlanner:
         )
 
     @staticmethod
+    def is_terminal(decision: LearningDecision) -> bool:
+        """Whether the decision is the exact final activity of its retained recipe."""
+
+        recipe = recipe_for_version(
+            decision.activity.recipe_id,
+            decision.activity.recipe_version,
+            decision.language,
+        )
+        step = decision.activity.recipe_step
+        if step != len(recipe.activity_sequence) - 1:
+            return False
+        retained = recipe.activity_sequence[step]
+        return (
+            decision.activity.knowledge_type is recipe.knowledge_type
+            and decision.activity.kind is retained.kind
+            and decision.activity.assessment_method == retained.assessment_method
+            and decision.activity.independent_required == retained.independent_required
+            and decision.activity.transfer_required == retained.transfer_required
+        )
+
+    @staticmethod
     def _initial_step(scope: LearningScope, recipe: TeachingRecipe) -> int:
         if scope is not LearningScope.ANSWER:
             return 0
@@ -175,9 +196,8 @@ class ActivityPlanner:
             recipe = recipe_for_version(saved.recipe_id, saved.recipe_version, language)
         except ValueError:
             return None
-        valid = (
-            recipe.knowledge_type == knowledge_type
-            and saved.recipe_step < len(recipe.activity_sequence)
+        valid = recipe.knowledge_type == knowledge_type and saved.recipe_step < len(
+            recipe.activity_sequence
         )
         return recipe if valid else None
 

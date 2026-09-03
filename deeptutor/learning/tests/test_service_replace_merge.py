@@ -208,6 +208,19 @@ class TestReplaceModules:
         service.replace_modules(progress, [_make_module("m2", ["kp2"])])
         assert "kp1" not in progress.mastery_levels
 
+    def test_replace_does_not_resurrect_removed_evidence_mastery(self, tmp_path: Path):
+        store = LearningStore(root=tmp_path)
+        service = LearningService(store)
+        progress = LearningProgress(book_id="test")
+
+        service.replace_modules(progress, [_make_module("m1", ["kp1"])])
+        progress.evidence_mastery["kp1"] = True
+
+        service.replace_modules(progress, [_make_module("m2", ["kp2"])])
+        service.replace_modules(progress, [_make_module("m3", ["kp1"])])
+
+        assert "kp1" not in progress.evidence_mastery
+
     def test_replace_cleans_stale_knowledge_types(self, tmp_path: Path):
         store = LearningStore(root=tmp_path)
         service = LearningService(store)

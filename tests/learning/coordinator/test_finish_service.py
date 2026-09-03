@@ -19,6 +19,7 @@ from deeptutor.learning.models import (
     LearningModule,
     LearningThread,
 )
+from deeptutor.learning.queue import LearningQueueReason, LearningQueueService
 from deeptutor.learning.service import LearningService
 from deeptutor.learning.storage import LearningStore
 from deeptutor.services.session.turns import executor as turn_executor
@@ -43,6 +44,10 @@ def _decision(
     help_level: int = 0,
     independent_required: bool = True,
     transfer_required: bool = False,
+    knowledge_type: KnowledgeType = KnowledgeType.CONCEPT,
+    recipe_id: str = "concept-transfer",
+    recipe_version: int = 1,
+    assessment_method: str = "teach_back",
 ) -> LearningDecision:
     return LearningDecision(
         scope=scope,
@@ -54,11 +59,12 @@ def _decision(
             kind=kind,
             objective="Understand eigenvectors",
             learner_action="Explain the concept in your own words.",
-            recipe_id="concept-transfer",
-            recipe_version=1,
+            knowledge_type=knowledge_type,
+            recipe_id=recipe_id,
+            recipe_version=recipe_version,
             recipe_step=recipe_step,
             help_level=help_level,
-            assessment_method="teach_back",
+            assessment_method=assessment_method,
             independent_required=independent_required,
             transfer_required=transfer_required,
         ),
@@ -70,7 +76,7 @@ def _decision(
 
 def _valid_result(**updates: Any):
     payload = {
-        "artifact_ref": "artifact://lesson",
+        "artifact_ref": "",
         "assessment": {
             "outcome": "correct",
             "rubric": [{"id": "mechanism", "passed": True}],
@@ -208,7 +214,7 @@ async def test_finish_is_idempotent_by_turn_and_objective(
 
 
 @pytest.mark.asyncio
-async def test_path_replay_skips_mastery_recalculation_and_next_activity_audit(
+async def test_path_replay_reconciles_mastery_without_duplicate_next_activity_audit(
     store: LearningStore, learning_service: RecordingLearningService
 ) -> None:
     LearningService(store).replace_modules_for_path(
@@ -261,12 +267,349 @@ async def test_path_replay_skips_mastery_recalculation_and_next_activity_audit(
     )
 
     assert first == second
-    assert learning_service.recalculations == [("path-1", "objective-1")]
+    assert learning_service.recalculations == [
+        ("path-1", "objective-1"),
+        ("path-1", "objective-1"),
+    ]
     assert _audit_event_types(store) == [
         "thread.created",
         "evidence.appended",
         "thread.next_activity",
     ]
+
+
+@pytest.mark.asyncio
+async def test_replay_repairs_recalculation_failure_after_evidence_append(
+    store: LearningStore,
+) -> None:
+    LearningService(store).replace_modules_for_path(
+        "path-1",
+        [
+            LearningModule(
+                id="module-1",
+                name="Linear algebra",
+                order=0,
+                knowledge_points=[
+                    KnowledgePoint(
+                        id="objective-1",
+                        name="Eigenvectors",
+                        type=KnowledgeType.CONCEPT,
+                        module_id="module-1",
+                    )
+                ],
+            )
+        ],
+    )
+    store.create_learning_thread(
+        LearningThread(
+            thread_id="path-thread",
+            session_id="s",
+            scope="lesson",
+            goal="Understand eigenvectors",
+            status="active",
+            path_id="path-1",
+        )
+    )
+
+    class FailOnceLearningService:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def recalculate_evidence_mastery(self, path_id: str, objective_id: str) -> bool:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("injected post-append failure")
+            return True
+
+    learning_service = FailOnceLearningService()
+    coordinator = LearningCoordinator(store=store, learning_service=learning_service)
+    decision = _decision(thread_id="path-thread")
+
+    with pytest.raises(RuntimeError, match="injected post-append failure"):
+        await coordinator.finish(
+            decision,
+            _valid_result(),
+            session_id="s",
+            turn_id="t",
+            learner_response="It keeps its direction.",
+            allowed_source_refs=set(),
+        )
+
+    assert len(store.list_evidence(thread_id="path-thread")) == 1
+    assert store.get_learning_thread("path-thread").next_activity == {}
+
+    repaired = await coordinator.finish(
+        decision,
+        _valid_result(),
+        session_id="s",
+        turn_id="t",
+        learner_response="It keeps its direction.",
+        allowed_source_refs=set(),
+    )
+
+    assert repaired is not None
+    assert learning_service.calls == 2
+    assert store.get_learning_thread("path-thread").next_activity["recipe_step"] == 3
+    assert _audit_event_types(store) == [
+        "thread.created",
+        "evidence.appended",
+        "thread.next_activity",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_replay_repairs_next_activity_failure_after_evidence_append(
+    coordinator: LearningCoordinator,
+    store: LearningStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_update = store.set_learning_thread_next_activity
+    calls = 0
+
+    def fail_once(thread_id: str, next_activity: dict[str, Any]):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("injected next-activity failure")
+        return real_update(thread_id, next_activity)
+
+    monkeypatch.setattr(store, "set_learning_thread_next_activity", fail_once)
+    decision = _decision()
+
+    with pytest.raises(RuntimeError, match="injected next-activity failure"):
+        await coordinator.finish(
+            decision,
+            _valid_result(),
+            session_id="s",
+            turn_id="t",
+            learner_response="It keeps its direction.",
+            allowed_source_refs=set(),
+        )
+
+    assert len(store.list_evidence()) == 1
+    assert store.get_learning_thread("6cd8958a660475d4bbece77f455215cd").next_activity == {}
+
+    repaired = await coordinator.finish(
+        decision,
+        _valid_result(),
+        session_id="s",
+        turn_id="t",
+        learner_response="It keeps its direction.",
+        allowed_source_refs=set(),
+    )
+
+    assert repaired is not None
+    assert calls == 2
+    assert (
+        store.get_learning_thread("6cd8958a660475d4bbece77f455215cd").next_activity["recipe_step"]
+        == 3
+    )
+    assert _audit_event_types(store) == [
+        "thread.created",
+        "evidence.appended",
+        "thread.next_activity",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_successful_final_short_lesson_completes_once_on_replay(
+    coordinator: LearningCoordinator, store: LearningStore
+) -> None:
+    decision = _decision(
+        kind="guided_attempt",
+        recipe_step=3,
+        transfer_required=True,
+        assessment_method="transfer_application",
+    )
+
+    first = await coordinator.finish(
+        decision,
+        _valid_result(),
+        session_id="s",
+        turn_id="final-turn",
+        learner_response="It keeps its direction.",
+        allowed_source_refs=set(),
+    )
+    second = await coordinator.finish(
+        decision,
+        _valid_result(),
+        session_id="s",
+        turn_id="final-turn",
+        learner_response="It keeps its direction.",
+        allowed_source_refs=set(),
+    )
+
+    thread = store.get_learning_thread("6cd8958a660475d4bbece77f455215cd")
+    assert first == second
+    assert thread is not None and thread.status == "completed"
+    assert thread.next_activity == {}
+    assert _audit_event_types(store) == [
+        "thread.created",
+        "evidence.appended",
+        "thread.completed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_path_final_step_completes_thread_but_leaves_path_continuation(
+    store: LearningStore,
+) -> None:
+    service = LearningService(store)
+    service.replace_modules_for_path(
+        "path-1",
+        [
+            LearningModule(
+                id="module-1",
+                name="Linear algebra",
+                order=0,
+                knowledge_points=[
+                    KnowledgePoint(
+                        id="objective-1",
+                        name="Eigenvectors",
+                        type=KnowledgeType.CONCEPT,
+                        module_id="module-1",
+                    ),
+                    KnowledgePoint(
+                        id="objective-2",
+                        name="Eigenspaces",
+                        type=KnowledgeType.CONCEPT,
+                        module_id="module-1",
+                    ),
+                ],
+            )
+        ],
+    )
+    store.create_learning_thread(
+        LearningThread(
+            thread_id="path-thread",
+            session_id="s",
+            scope="lesson",
+            goal="Understand eigenvectors",
+            status="active",
+            path_id="path-1",
+        )
+    )
+    coordinator = LearningCoordinator(store=store, learning_service=service)
+
+    await coordinator.finish(
+        _decision(
+            thread_id="path-thread",
+            kind="guided_attempt",
+            recipe_step=3,
+            transfer_required=True,
+            assessment_method="transfer_application",
+        ),
+        _valid_result(),
+        session_id="s",
+        turn_id="final-path-turn",
+        learner_response="It keeps its direction.",
+        allowed_source_refs=set(),
+    )
+
+    thread = store.get_learning_thread("path-thread")
+    items = LearningQueueService(store=store, learning_service=service).list_items()
+    assert thread is not None and thread.status == "completed"
+    assert [(item.path_id, item.reason) for item in items] == [
+        ("path-1", LearningQueueReason.CONTINUE_PATH)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_final_path_step_stays_active_until_evidence_gate_passes(
+    store: LearningStore,
+) -> None:
+    service = LearningService(store)
+    service.replace_modules_for_path(
+        "path-1",
+        [
+            LearningModule(
+                id="module-1",
+                name="Facts",
+                order=0,
+                knowledge_points=[
+                    KnowledgePoint(
+                        id="objective-1",
+                        name="Remember the fact",
+                        type=KnowledgeType.MEMORY,
+                        module_id="module-1",
+                    )
+                ],
+            )
+        ],
+    )
+    store.create_learning_thread(
+        LearningThread(
+            thread_id="path-thread",
+            session_id="s",
+            scope="lesson",
+            goal="Understand eigenvectors",
+            status="active",
+            path_id="path-1",
+        )
+    )
+    coordinator = LearningCoordinator(store=store, learning_service=service)
+
+    await coordinator.finish(
+        _decision(
+            thread_id="path-thread",
+            kind="review",
+            recipe_step=2,
+            knowledge_type=KnowledgeType.MEMORY,
+            recipe_id="memory-retrieval",
+            assessment_method="delayed_retrieval",
+        ),
+        _valid_result(),
+        session_id="s",
+        turn_id="final-memory-turn",
+        learner_response="It keeps its direction.",
+        allowed_source_refs=set(),
+    )
+
+    thread = store.get_learning_thread("path-thread")
+    progress = store.load("path-1")
+    assert thread is not None and thread.status == "active"
+    assert thread.next_activity["recipe_step"] == 2
+    assert progress is not None
+    assert progress.evidence_mastery == {"objective-1": False}
+
+
+@pytest.mark.asyncio
+async def test_replay_cannot_finalize_evidence_with_a_different_recipe(
+    coordinator: LearningCoordinator, store: LearningStore
+) -> None:
+    await coordinator.finish(
+        _decision(
+            kind="guided_attempt",
+            recipe_step=3,
+            transfer_required=True,
+            assessment_method="teach_back",
+        ),
+        _valid_result(),
+        session_id="s",
+        turn_id="same-turn",
+        learner_response="It keeps its direction.",
+        allowed_source_refs=set(),
+    )
+
+    with pytest.raises(ValueError, match="persisted evidence recipe"):
+        await coordinator.finish(
+            _decision(
+                kind="guided_attempt",
+                recipe_step=3,
+                knowledge_type=KnowledgeType.PROCEDURE,
+                recipe_id="procedure-fading",
+                transfer_required=True,
+                assessment_method="transfer_variation",
+            ),
+            _valid_result(),
+            session_id="s",
+            turn_id="same-turn",
+            learner_response="It keeps its direction.",
+            allowed_source_refs=set(),
+        )
+
+    thread = store.get_learning_thread("6cd8958a660475d4bbece77f455215cd")
+    assert thread is not None and thread.status == "active"
 
 
 @pytest.mark.asyncio
@@ -325,6 +668,108 @@ async def test_finish_drops_unverified_source_ids(
     assert "dropped_count=1" in caplog.text
     assert private_rejected_source not in caplog.text
     assert "PRIVATE LEARNER TEXT" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_finish_keeps_only_executor_verified_artifact_refs(
+    coordinator: LearningCoordinator, caplog: pytest.LogCaptureFixture
+) -> None:
+    rejected_ref = "private learner text disguised as an artifact id"
+
+    accepted = await coordinator.finish(
+        _decision(),
+        _valid_result(artifact_ref="attachment-1"),
+        session_id="s",
+        turn_id="accepted-turn",
+        learner_response="It keeps its direction.",
+        allowed_source_refs=set(),
+        allowed_artifact_refs={"attachment-1"},
+    )
+    rejected = await coordinator.finish(
+        _decision(),
+        _valid_result(artifact_ref=rejected_ref),
+        session_id="s",
+        turn_id="rejected-turn",
+        learner_response="It keeps its direction. PRIVATE LEARNER TEXT",
+        allowed_source_refs=set(),
+        allowed_artifact_refs={"attachment-1"},
+    )
+
+    assert accepted is not None and accepted.artifact_ref == "attachment-1"
+    assert rejected is not None and rejected.artifact_ref == ""
+    assert "Dropped unverified learning artifact ref" in caplog.text
+    assert rejected_ref not in caplog.text
+    assert "PRIVATE LEARNER TEXT" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_unverified_artifact_cannot_satisfy_a_design_mastery_gate(
+    store: LearningStore,
+) -> None:
+    service = LearningService(store)
+    service.replace_modules_for_path(
+        "path-1",
+        [
+            LearningModule(
+                id="module-1",
+                name="Design",
+                order=0,
+                knowledge_points=[
+                    KnowledgePoint(
+                        id="objective-1",
+                        name="Defend a design",
+                        type=KnowledgeType.DESIGN,
+                        module_id="module-1",
+                    )
+                ],
+            )
+        ],
+    )
+    store.create_learning_thread(
+        LearningThread(
+            thread_id="path-thread",
+            session_id="s",
+            scope="lesson",
+            goal="Understand eigenvectors",
+            status="active",
+            path_id="path-1",
+        )
+    )
+    coordinator = LearningCoordinator(store=store, learning_service=service)
+
+    project = await coordinator.finish(
+        _decision(
+            thread_id="path-thread",
+            kind="project_step",
+            recipe_step=1,
+            independent_required=False,
+        ),
+        _valid_result(artifact_ref="invented-artifact"),
+        session_id="s",
+        turn_id="project-turn",
+        learner_response="It keeps its direction.",
+        allowed_source_refs=set(),
+        allowed_artifact_refs={"persisted-artifact"},
+    )
+    critique = await coordinator.finish(
+        _decision(
+            thread_id="path-thread",
+            kind="evidence_comparison",
+            recipe_step=2,
+        ),
+        _valid_result(artifact_ref=""),
+        session_id="s",
+        turn_id="critique-turn",
+        learner_response="It keeps its direction.",
+        allowed_source_refs=set(),
+        allowed_artifact_refs={"persisted-artifact"},
+    )
+
+    progress = store.load("path-1")
+    assert project is not None and project.artifact_ref == ""
+    assert critique is not None and critique.independent is True
+    assert progress is not None
+    assert progress.evidence_mastery == {"objective-1": False}
 
 
 @pytest.mark.asyncio
@@ -588,6 +1033,26 @@ def test_trusted_source_ids_come_only_from_resolved_turn_state() -> None:
     )
 
 
+def test_trusted_artifact_refs_come_only_from_persisted_turn_attachments() -> None:
+    trusted_artifact_refs_from_turn = getattr(turn_executor, "trusted_artifact_refs_from_turn")
+
+    assert trusted_artifact_refs_from_turn(
+        [{"id": "attachment-1"}, {"id": ""}],
+        [
+            {
+                "id": "generated-1",
+                "url": "/files/outputs/turn/chart.png",
+                "generated": True,
+            },
+            {"id": "not-generated", "url": "/files/attachments/untrusted"},
+        ],
+    ) == {
+        "attachment-1",
+        "generated-1",
+        "/files/outputs/turn/chart.png",
+    }
+
+
 @pytest.mark.asyncio
 async def test_executor_finalization_uses_raw_message_and_preserves_done_on_failure(
     monkeypatch: pytest.MonkeyPatch,
@@ -604,11 +1069,13 @@ async def test_executor_finalization_uses_raw_message_and_preserves_done_on_fail
             turn_id: str,
             learner_response: str,
             allowed_source_refs: Collection[str],
+            allowed_artifact_refs: Collection[str],
             learner_response_ref: str = "",
         ) -> None:
             captured.update(
                 learner_response=learner_response,
                 allowed_source_refs=set(allowed_source_refs),
+                allowed_artifact_refs=set(allowed_artifact_refs),
                 decision=decision,
                 result=result,
                 session_id=session_id,
@@ -643,6 +1110,13 @@ async def test_executor_finalization_uses_raw_message_and_preserves_done_on_fail
         raw_user_content="raw answer",
         source_index={"manifest-1": "private source text"},
         attachment_records=[{"id": "attachment-1"}],
+        generated_attachments=[
+            {
+                "id": "generated-1",
+                "url": "/files/outputs/turn/chart.png",
+                "generated": True,
+            }
+        ],
         done_metadata=done_metadata,
     )
 
@@ -651,6 +1125,11 @@ async def test_executor_finalization_uses_raw_message_and_preserves_done_on_fail
         "manifest-1",
         "attachment-1",
         "citation-1",
+    }
+    assert captured["allowed_artifact_refs"] == {
+        "attachment-1",
+        "generated-1",
+        "/files/outputs/turn/chart.png",
     }
     assert done_metadata == {
         "status": "completed",
