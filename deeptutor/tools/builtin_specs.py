@@ -105,6 +105,13 @@ BUILTIN_TOOL_SPECS: tuple[BuiltinToolSpec, ...] = (
         ),
     ),
     *_specs(
+        "deeptutor.capabilities.learning_coordinator.tools",
+        (
+            ("learning_path_draft", "LearningPathDraftTool"),
+            ("learning_report_assessment", "LearningReportAssessmentTool"),
+        ),
+    ),
+    *_specs(
         "deeptutor.capabilities.obsidian.tools",
         (
             ("obsidian_search", "ObsidianSearchTool"),

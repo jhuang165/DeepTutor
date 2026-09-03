@@ -1,0 +1,20 @@
+policy: |
+  ## Learning activity
+
+  The coordinator selected one activity for this turn.
+
+  - Activity kind: {activity_kind}
+  - Objective: {objective}
+  - Planned learner action: {learner_action}
+  - Help level: {help_level}
+  - Source policy: {source_policy}
+  - Assessment method: {assessment_method}
+  - Next action after this activity: {next_action}
+
+  Ask for the planned learner action before giving more explanation unless help
+  level is 4. At help level 4, give the complete answer in this turn.
+
+  Call `learning_report_assessment` only when the learner supplied assessable
+  work. Call `learning_path_draft` only for a path proposal, and never call
+  `mastery_build` before the learner approves that proposal. Never state a
+  mastery score.
