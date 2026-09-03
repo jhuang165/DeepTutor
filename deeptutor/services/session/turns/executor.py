@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Mapping
 import contextlib
 from contextvars import Token
 import logging
@@ -60,6 +60,92 @@ if TYPE_CHECKING:
     from deeptutor.services.session.protocol import SessionStoreProtocol
 
 logger = logging.getLogger(__name__)
+
+
+def _nonempty_id(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _citation_ids(value: object) -> set[str]:
+    if isinstance(value, str):
+        return {value.strip()} if value.strip() else set()
+    if isinstance(value, Mapping):
+        direct = {
+            _nonempty_id(value.get(field))
+            for field in ("id", "citation_id", "source_id", "reference_id")
+        }
+        direct.discard("")
+        if direct:
+            return direct
+        if value and all(isinstance(item, Mapping) for item in value.values()):
+            return {_nonempty_id(key) for key in value if _nonempty_id(key)}
+        return set()
+    if isinstance(value, Collection):
+        return {citation_id for item in value for citation_id in _citation_ids(item)}
+    return set()
+
+
+def trusted_source_ids_from_turn(
+    source_index: Mapping[str, object],
+    attachment_records: Collection[Mapping[str, object]],
+    event_metadata: Mapping[str, object],
+) -> set[str]:
+    """Return source IDs backed by runtime-resolved state for this turn."""
+
+    source_ids = {_nonempty_id(source_id) for source_id in source_index}
+    source_ids.update(_nonempty_id(record.get("id")) for record in attachment_records)
+    source_ids.update(_citation_ids(event_metadata.get("citations")))
+    source_ids.update(_citation_ids(event_metadata.get("citation_ids")))
+    source_ids.discard("")
+    return source_ids
+
+
+async def _finalize_learning_evidence(
+    context: Any,
+    *,
+    session_id: str,
+    turn_id: str,
+    raw_user_content: str,
+    source_index: Mapping[str, object],
+    attachment_records: Collection[Mapping[str, object]],
+    done_metadata: dict[str, Any],
+) -> None:
+    """Finalize optional learning evidence without failing a completed answer."""
+
+    coordinator_state = context.extension_state.get("learning_coordinator")
+    if not isinstance(coordinator_state, Mapping):
+        return
+    decision_raw = coordinator_state.get("decision")
+    result_raw = coordinator_state.get("result")
+    if not isinstance(decision_raw, dict) or not isinstance(result_raw, dict):
+        return
+
+    try:
+        from deeptutor.learning.coordinator import LearningCoordinator
+        from deeptutor.learning.coordinator.models import (
+            CapabilityLearningResult,
+            LearningDecision,
+        )
+
+        await LearningCoordinator().finish(
+            LearningDecision.model_validate(decision_raw),
+            CapabilityLearningResult.model_validate(result_raw),
+            session_id=session_id,
+            turn_id=turn_id,
+            learner_response=raw_user_content,
+            allowed_source_refs=trusted_source_ids_from_turn(
+                source_index,
+                attachment_records,
+                context.capability_output.event_metadata,
+            ),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Learning evidence finalization failed turn=%s exception_class=%s",
+            turn_id,
+            type(exc).__name__,
+        )
+        done_metadata["learning_evidence_status"] = "failed"
 
 
 def _decorate_done_event(event: StreamEvent, payload: dict[str, Any]) -> StreamEvent:
@@ -919,6 +1005,16 @@ class TurnExecutor:
             }
             if persisted_ids:
                 pending_done_event.metadata = {**pending_done_event.metadata, **persisted_ids}
+            if turn_status == "completed":
+                await _finalize_learning_evidence(
+                    context,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    raw_user_content=raw_user_content,
+                    source_index=source_index,
+                    attachment_records=attachment_records,
+                    done_metadata=pending_done_event.metadata,
+                )
             # Commit all non-terminal events and the terminal row before DONE
             # becomes visible. The DONE envelope itself is then appended and
             # synchronously flushed, so a reconnect can never observe a

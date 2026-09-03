@@ -2,13 +2,31 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
+import hashlib
+import logging
 from typing import Any
 
-from deeptutor.learning.coordinator.models import LearningDecision, LearningRequest
+from deeptutor.learning.coordinator.models import (
+    CapabilityLearningResult,
+    LearningDecision,
+    LearningRequest,
+    LearningScope,
+)
 from deeptutor.learning.coordinator.planner import ActivityPlanner
 from deeptutor.learning.coordinator.scope import LLMScopeClassifier, ScopeDetector
+from deeptutor.learning.evidence import validate_open_assessment
+from deeptutor.learning.models import (
+    EvidenceOutcome,
+    EvidenceRecord,
+    LearningThread,
+    LearningThreadStatus,
+)
+from deeptutor.learning.service import LearningService
+from deeptutor.learning.storage import LearningStore
 from deeptutor.services.llm.config import LLMConfig
+
+logger = logging.getLogger(__name__)
 
 _ATTACHED_ONLY_PHRASES = (
     "use only my attached",
@@ -86,9 +104,13 @@ class LearningCoordinator:
         *,
         planner: ActivityPlanner | None = None,
         detector: ScopeDetector | None = None,
+        store: LearningStore | None = None,
+        learning_service: LearningService | None = None,
     ) -> None:
         self._planner = planner or ActivityPlanner()
         self._detector = detector
+        self._store = store
+        self._learning_service = learning_service
 
     async def prepare_payload(
         self,
@@ -102,6 +124,108 @@ class LearningCoordinator:
         )
         scope = await detector.detect(request)
         return self._planner.plan(scope, request, available_capabilities)
+
+    async def finish(
+        self,
+        decision: LearningDecision,
+        result: CapabilityLearningResult,
+        *,
+        session_id: str,
+        turn_id: str,
+        learner_response: str,
+        allowed_source_refs: Collection[str],
+    ) -> EvidenceRecord | None:
+        """Persist server-derived evidence after a successful teaching turn."""
+
+        if decision.scope in {LearningScope.ANSWER, LearningScope.PATH}:
+            return None
+
+        if self._store is None:
+            self._store = (
+                self._learning_service.store
+                if self._learning_service is not None
+                else LearningStore()
+            )
+        if self._learning_service is None:
+            self._learning_service = LearningService(self._store)
+
+        source_refs = sorted(set(result.source_refs) & set(allowed_source_refs))
+        dropped_source_refs = sorted(set(result.source_refs) - set(source_refs))
+        if dropped_source_refs:
+            logger.warning(
+                "Dropped unverified learning source refs turn=%s source_refs=%s",
+                turn_id,
+                dropped_source_refs,
+            )
+
+        thread_id = (
+            decision.thread_id
+            or hashlib.sha256(f"{session_id}:{decision.goal}".encode()).hexdigest()[:32]
+        )
+        thread = self._store.get_learning_thread(thread_id)
+        if thread is None:
+            thread = self._store.create_learning_thread(
+                LearningThread(
+                    thread_id=thread_id,
+                    session_id=session_id,
+                    scope="lesson",
+                    goal=decision.goal,
+                    status=LearningThreadStatus.ACTIVE,
+                    source_refs=source_refs,
+                )
+            )
+
+        validated = validate_open_assessment(result.assessment, learner_response)
+        outcome = (
+            EvidenceOutcome(validated.outcome)
+            if validated is not None
+            else EvidenceOutcome.UNASSESSED
+        )
+        evidence_id = hashlib.sha256(
+            f"{turn_id}:{decision.objective_id}:{decision.activity.kind.value}:"
+            f"{decision.activity.recipe_step}".encode()
+        ).hexdigest()[:32]
+        independent = (
+            validated is not None
+            and decision.activity.independent_required
+            and decision.activity.help_level <= 2
+        )
+        record = EvidenceRecord(
+            evidence_id=evidence_id,
+            thread_id=thread_id,
+            path_id=thread.path_id,
+            objective_id=decision.objective_id,
+            activity_kind=decision.activity.kind.value,
+            recipe_id=decision.activity.recipe_id,
+            recipe_version=decision.activity.recipe_version,
+            response=learner_response[:8_000],
+            response_ref=(f"chat-turn:{turn_id}:user" if len(learner_response) > 8_000 else ""),
+            artifact_ref=result.artifact_ref,
+            outcome=outcome,
+            help_level=decision.activity.help_level,
+            independent=independent,
+            transfer=independent and decision.activity.transfer_required,
+            rubric=(
+                [item.model_dump(mode="json") for item in validated.rubric]
+                if validated is not None
+                else []
+            ),
+            cited_evidence=(validated.cited_evidence if validated is not None else []),
+            uncertainty=(validated.uncertainty if validated is not None else 1.0),
+            source_refs=source_refs,
+            session_id=session_id,
+            turn_id=turn_id,
+        )
+        stored = self._store.append_evidence(record)
+        if validated is not None and thread.path_id and decision.objective_id:
+            self._learning_service.recalculate_evidence_mastery(
+                thread.path_id, decision.objective_id
+            )
+        next_activity = self._planner.next_after(decision, outcome.value)
+        self._store.set_learning_thread_next_activity(
+            thread_id, next_activity.model_dump(mode="json")
+        )
+        return stored
 
 
 __all__ = ["LearningCoordinator", "decision_payload", "learning_request_from_payload"]

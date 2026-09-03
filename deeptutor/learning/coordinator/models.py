@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -103,6 +103,16 @@ class LearningDecision(BaseModel):
         if self.requires_approval != (self.scope is LearningScope.PATH):
             raise ValueError("Only path scope requires approval")
         return self
+
+
+class CapabilityLearningResult(BaseModel):
+    """Untrusted capability output accepted by learning finalization."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_ref: str = ""
+    assessment: dict[str, Any] | None = None
+    source_refs: list[str] = Field(default_factory=list)
 
 
 class RecipeActivity(BaseModel):
