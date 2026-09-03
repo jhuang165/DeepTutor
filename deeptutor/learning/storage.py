@@ -20,7 +20,9 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 from typing import Any, TypeVar
@@ -543,22 +545,29 @@ class LearningStore:
 
     @contextmanager
     def _connect_read_only(self) -> Iterator[sqlite3.Connection | None]:
-        """Open the existing database without creating or migrating state."""
+        """Read a temporary SQLite snapshot without touching source database files."""
 
         if not self.db_path.exists():
             yield None
             return
-        conn = sqlite3.connect(
-            f"{self.db_path.resolve().as_uri()}?mode=ro",
-            uri=True,
-            timeout=30.0,
-            isolation_level=None,
-        )
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-        finally:
-            conn.close()
+        with tempfile.TemporaryDirectory(prefix="deeptutor-learning-projection-") as directory:
+            snapshot = Path(directory) / self.db_path.name
+            shutil.copyfile(self.db_path, snapshot)
+            for suffix in ("-wal", "-shm"):
+                source_sidecar = self.db_path.with_name(f"{self.db_path.name}{suffix}")
+                if source_sidecar.exists():
+                    shutil.copyfile(source_sidecar, snapshot.with_name(f"{snapshot.name}{suffix}"))
+            conn = sqlite3.connect(
+                f"{snapshot.resolve().as_uri()}?mode=ro",
+                uri=True,
+                timeout=30.0,
+                isolation_level=None,
+            )
+            conn.row_factory = sqlite3.Row
+            try:
+                yield conn
+            finally:
+                conn.close()
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -787,14 +796,17 @@ class LearningStore:
         """Read SQLite or legacy JSON state without importing either representation."""
 
         path_id = self._validate_id(book_id)
-        with self._connect_read_only() as conn:
-            row = (
-                conn.execute(
-                    "SELECT * FROM mastery_paths WHERE path_id = ?", (path_id,)
-                ).fetchone()
-                if conn is not None
-                else None
-            )
+        try:
+            with self._connect_read_only() as conn:
+                row = (
+                    conn.execute(
+                        "SELECT * FROM mastery_paths WHERE path_id = ?", (path_id,)
+                    ).fetchone()
+                    if conn is not None
+                    else None
+                )
+        except sqlite3.DatabaseError:
+            row = None
         if row is not None:
             return self._progress_from_row(row)
         try:
@@ -1054,15 +1066,18 @@ class LearningStore:
     def list_all_read_only(self) -> list[str]:
         """List SQLite and legacy path identifiers without initializing storage."""
 
-        with self._connect_read_only() as conn:
-            stored = (
-                {
-                    str(row["path_id"])
-                    for row in conn.execute("SELECT path_id FROM mastery_paths").fetchall()
-                }
-                if conn is not None
-                else set()
-            )
+        try:
+            with self._connect_read_only() as conn:
+                stored = (
+                    {
+                        str(row["path_id"])
+                        for row in conn.execute("SELECT path_id FROM mastery_paths").fetchall()
+                    }
+                    if conn is not None
+                    else set()
+                )
+        except sqlite3.DatabaseError:
+            stored = set()
         legacy = {
             path.stem for path in Path(self._root).glob("*.json") if not path.name.startswith(".")
         }
@@ -1153,15 +1168,18 @@ class LearningStore:
             clauses.append("status = ?")
             params.append(status.value if isinstance(status, LearningThreadStatus) else str(status))
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-        with self._connect_read_only() as conn:
-            rows = (
-                conn.execute(
-                    f"SELECT * FROM learning_threads{where} ORDER BY updated_at DESC, thread_id ASC",
-                    params,
-                ).fetchall()
-                if conn is not None
-                else []
-            )
+        try:
+            with self._connect_read_only() as conn:
+                rows = (
+                    conn.execute(
+                        f"SELECT * FROM learning_threads{where} ORDER BY updated_at DESC, thread_id ASC",
+                        params,
+                    ).fetchall()
+                    if conn is not None
+                    else []
+                )
+        except sqlite3.DatabaseError:
+            rows = []
         threads = (self._learning_thread_from_row(row) for row in rows)
         return [thread for thread in threads if thread is not None]
 
@@ -1648,19 +1666,22 @@ class LearningStore:
         session_id = str(session_id or "").strip()
         if not session_id:
             return []
-        with self._connect_read_only() as conn:
-            rows = (
-                conn.execute(
-                    """
-                    SELECT path_id, owns_path, created_at, last_seen_at
-                    FROM mastery_path_sessions
-                    WHERE session_id = ? ORDER BY last_seen_at DESC
-                    """,
-                    (session_id,),
-                ).fetchall()
-                if conn is not None
-                else []
-            )
+        try:
+            with self._connect_read_only() as conn:
+                rows = (
+                    conn.execute(
+                        """
+                        SELECT path_id, owns_path, created_at, last_seen_at
+                        FROM mastery_path_sessions
+                        WHERE session_id = ? ORDER BY last_seen_at DESC
+                        """,
+                        (session_id,),
+                    ).fetchall()
+                    if conn is not None
+                    else []
+                )
+        except sqlite3.DatabaseError:
+            rows = []
         return [dict(row) for row in rows]
 
     def detach_session(self, session_id: str, *, delete_owned_orphans: bool = True) -> list[str]:
@@ -1864,19 +1885,22 @@ class LearningStore:
 
         path_id = self._validate_id(path_id)
         placeholders = ",".join("?" for _ in _ACTIVE_INTERACTION_STATES)
-        with self._connect_read_only() as conn:
-            row = (
-                conn.execute(
-                    f"""
-                    SELECT * FROM mastery_interactions
-                    WHERE path_id = ? AND status IN ({placeholders})
-                    ORDER BY created_at DESC LIMIT 1
-                    """,  # nosec B608 - placeholders is generated from fixed states
-                    (path_id, *_ACTIVE_INTERACTION_STATES),
-                ).fetchone()
-                if conn is not None
-                else None
-            )
+        try:
+            with self._connect_read_only() as conn:
+                row = (
+                    conn.execute(
+                        f"""
+                        SELECT * FROM mastery_interactions
+                        WHERE path_id = ? AND status IN ({placeholders})
+                        ORDER BY created_at DESC LIMIT 1
+                        """,  # nosec B608 - placeholders is generated from fixed states
+                        (path_id, *_ACTIVE_INTERACTION_STATES),
+                    ).fetchone()
+                    if conn is not None
+                    else None
+                )
+        except sqlite3.DatabaseError:
+            row = None
         return LearningTransaction._interaction_from_row(row)
 
     def list_interactions(self, path_id: str, *, limit: int = 200) -> list[MasteryInteraction]:

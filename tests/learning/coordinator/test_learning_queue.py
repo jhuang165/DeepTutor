@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 
@@ -140,6 +141,14 @@ def _seed_thread(
             next_activity=next_activity or {},
         )
     )
+
+
+def _storage_snapshot(root) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
 
 
 def test_queue_orders_unfinished_attempt_before_due_review(
@@ -295,17 +304,58 @@ def test_queue_does_not_migrate_or_archive_a_legacy_path(
         ),
         encoding="utf-8",
     )
-    before = legacy_path.read_bytes()
-    database_before = store.db_path.read_bytes()
+    before = _storage_snapshot(tmp_path)
 
     items = service.list_items()
 
     assert [(item.path_id, item.reason) for item in items] == [
         ("legacy-path", LearningQueueReason.CONTINUE_PATH)
     ]
-    assert legacy_path.read_bytes() == before
-    assert not (tmp_path / ".legacy").exists()
-    assert store.db_path.read_bytes() == database_before
+    assert _storage_snapshot(tmp_path) == before
+
+
+def test_queue_reads_committed_wal_state_without_changing_source_files(
+    service: LearningQueueService, store: LearningStore, learning_service: LearningService, tmp_path
+) -> None:
+    _seed_path(learning_service, "wal-path")
+    progress = store.load("wal-path")
+    assert progress is not None
+    progress.name = "Visible only from WAL"
+    connection = sqlite3.connect(store.db_path)
+    try:
+        connection.execute(
+            "UPDATE mastery_paths SET state_json = ? WHERE path_id = ?",
+            (json.dumps(progress.model_dump(mode="json")), "wal-path"),
+        )
+        connection.commit()
+        assert (tmp_path / "mastery.sqlite3-wal").exists()
+        before = _storage_snapshot(tmp_path)
+
+        items = service.list_items()
+
+        assert [(item.path_id, item.activity["name"]) for item in items] == [
+            ("wal-path", "Visible only from WAL")
+        ]
+        assert _storage_snapshot(tmp_path) == before
+    finally:
+        connection.close()
+
+
+def test_queue_read_only_apis_ignore_existing_database_without_required_tables(
+    service: LearningQueueService, store: LearningStore, tmp_path
+) -> None:
+    for path in tmp_path.glob("mastery.sqlite3*"):
+        path.unlink()
+    sqlite3.connect(store.db_path).close()
+    before = _storage_snapshot(tmp_path)
+
+    assert store.list_all_read_only() == []
+    assert store.load_read_only("missing") is None
+    assert store.list_learning_threads_read_only() == []
+    assert store.list_paths_for_session_read_only("s") == []
+    assert store.get_active_interaction_read_only("missing") is None
+    assert service.list_items() == []
+    assert _storage_snapshot(tmp_path) == before
 
 
 def test_queue_projects_answered_interactions_as_waiting_for_grading(
