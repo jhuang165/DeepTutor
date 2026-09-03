@@ -13,8 +13,8 @@ import unicodedata
 class DocumentValidator:
     """Document validation utilities"""
 
-    # Maximum file size in bytes (200MB), applied uniformly to every format.
-    MAX_FILE_SIZE: ClassVar[int] = 200 * 1024 * 1024
+    # Maximum file size in bytes (300 MiB), applied uniformly to every format.
+    MAX_FILE_SIZE: ClassVar[int] = 300 * 1024 * 1024
 
     # Allowed file extensions
     ALLOWED_EXTENSIONS: ClassVar[set[str]] = {

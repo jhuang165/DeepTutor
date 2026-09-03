@@ -8,6 +8,19 @@ from deeptutor.services.rag.file_routing import FileTypeRouter
 from deeptutor.utils.document_validator import DocumentValidator
 
 
+def test_validate_upload_safety_accepts_300_mib_document() -> None:
+    size = 300 * 1024 * 1024
+
+    assert DocumentValidator.validate_upload_safety("textbook.pdf", size) == "textbook.pdf"
+
+
+def test_validate_upload_safety_rejects_document_above_300_mib() -> None:
+    size = 300 * 1024 * 1024 + 1
+
+    with pytest.raises(ValueError, match="File too large"):
+        DocumentValidator.validate_upload_safety("textbook.pdf", size)
+
+
 def test_validate_upload_safety_preserves_unicode_and_lowercases_extension() -> None:
     safe_name = DocumentValidator.validate_upload_safety(
         "中文资料/数学 讲义#1(最终版).PDF",

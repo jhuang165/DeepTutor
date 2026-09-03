@@ -60,6 +60,17 @@ test("backend proxy allows long-running agent requests", () => {
   );
 });
 
+test("buffering proxy accommodates the 300 MiB document upload ceiling", () => {
+  const nextConfig = require(path.resolve(process.cwd(), "next.config.js")) as {
+    experimental?: { proxyClientMaxBodySize?: number };
+  };
+  assert.ok(
+    (nextConfig.experimental?.proxyClientMaxBodySize ?? 0) >=
+      301 * 1024 * 1024,
+    "proxyClientMaxBodySize must include multipart overhead above the document limit",
+  );
+});
+
 test("isCodexCallbackPath matches only the exact public callback path", () => {
   assert.equal(CODEX_CALLBACK_PATH, "/auth/callback");
   assert.equal(CODEX_CALLBACK_API_PATH, "/api/auth/openai-codex/callback");

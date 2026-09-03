@@ -36,6 +36,7 @@ from defusedxml import ElementTree as DefusedElementTree
 from defusedxml.common import DefusedXmlException
 
 from deeptutor.services.rag.file_routing import FileTypeRouter
+from deeptutor.utils.document_validator import DocumentValidator
 
 logger = logging.getLogger(__name__)
 
@@ -97,8 +98,6 @@ _OOXML_MAGIC = b"PK\x03\x04"
 
 _EPUB_CONTENT_EXTENSIONS: frozenset[str] = frozenset({".xhtml", ".html", ".htm"})
 _EPUB_MAX_MEMBERS = 4096
-_EPUB_MAX_MEMBER_BYTES = 20 * 1024 * 1024
-_EPUB_MAX_TOTAL_UNCOMPRESSED_BYTES = 200 * 1024 * 1024
 _EPUB_MAX_COMPRESSION_RATIO = 200.0
 _EPUB_BLOCK_TAGS: frozenset[str] = frozenset(
     {
@@ -857,6 +856,7 @@ def _extract_epub(data: bytes, filename: str) -> str:
 
 def _validate_epub_archive(zf: zipfile.ZipFile, filename: str) -> None:
     """Reject oversized or suspicious EPUB ZIPs before reading any member."""
+    max_bytes = DocumentValidator.MAX_FILE_SIZE
     members = [info for info in zf.infolist() if not info.is_dir()]
     if len(members) > _EPUB_MAX_MEMBERS:
         raise DocumentTooLargeError(
@@ -866,13 +866,13 @@ def _validate_epub_archive(zf: zipfile.ZipFile, filename: str) -> None:
 
     total = 0
     for info in members:
-        if info.file_size > _EPUB_MAX_MEMBER_BYTES:
+        if info.file_size > max_bytes:
             raise DocumentTooLargeError(
                 f"{filename}: EPUB member {info.filename} is too large",
                 filename=filename,
             )
         total += info.file_size
-        if total > _EPUB_MAX_TOTAL_UNCOMPRESSED_BYTES:
+        if total > max_bytes:
             raise DocumentTooLargeError(
                 f"{filename}: EPUB uncompressed contents are too large",
                 filename=filename,

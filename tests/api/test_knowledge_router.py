@@ -579,7 +579,7 @@ def test_supported_file_types_returns_upload_policy() -> None:
     assert ".key" in payload["extensions"]
     assert ".vsdx" in payload["extensions"]
     assert ".sqlite3" in payload["extensions"]
-    assert payload["max_file_size_bytes"] > 0
+    assert payload["max_file_size_bytes"] == 300 * 1024 * 1024
     assert "max_pdf_size_bytes" not in payload
     assert ".pdf" in payload["accept"]
     assert ".docx" in payload["accept"]
@@ -850,6 +850,35 @@ def test_upload_ready_kb_returns_task_id(monkeypatch, tmp_path: Path) -> None:
     assert response.status_code == 200
     body = response.json()
     assert isinstance(body.get("task_id"), str) and body["task_id"]
+
+
+@pytest.mark.parametrize(("size", "expected_status"), [(8, 200), (9, 400)])
+def test_upload_honors_shared_document_size_boundary(
+    monkeypatch, tmp_path: Path, size: int, expected_status: int
+) -> None:
+    manager = _FakeKBManager(tmp_path / "knowledge_bases")
+    manager.config["knowledge_bases"]["ready-kb"] = {
+        "path": "ready-kb",
+        "rag_provider": "llamaindex",
+        "needs_reindex": False,
+        "status": "ready",
+    }
+    monkeypatch.setattr(knowledge_router_module, "get_kb_manager", lambda: manager)
+    monkeypatch.setattr(knowledge_router_module, "_kb_base_dir", tmp_path / "knowledge_bases")
+    monkeypatch.setattr(knowledge_router_module.DocumentValidator, "MAX_FILE_SIZE", 8)
+
+    async def _noop_upload_task(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(knowledge_router_module, "run_upload_processing_task", _noop_upload_task)
+
+    with TestClient(_build_app()) as client:
+        response = client.post(
+            "/api/knowledge-bases/ready-kb/upload",
+            files={"files": ("boundary.txt", b"x" * size, "text/plain")},
+        )
+
+    assert response.status_code == expected_status
 
 
 def test_upload_flips_ready_kb_to_processing_before_dispatch(monkeypatch, tmp_path: Path) -> None:

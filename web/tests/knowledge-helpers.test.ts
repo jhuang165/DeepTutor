@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  DEFAULT_UPLOAD_POLICY,
   getFileExtension,
   isMarginNoteKb,
   kbCanReindex,
@@ -15,6 +16,10 @@ import {
   providerConnectionStatus,
   type KnowledgeBase,
 } from "../lib/knowledge-helpers";
+
+test("document upload fallback allows files through 300 MiB", () => {
+  assert.equal(DEFAULT_UPLOAD_POLICY.max_file_size_bytes, 300 * 1024 * 1024);
+});
 
 test("knowledge upload extension matching supports compound Docling suffixes", () => {
   const allowed = [".gz", ".tar.gz", ".xml", ".dclg.xml"];

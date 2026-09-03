@@ -114,10 +114,22 @@ def test_upload_rejects_an_oversized_file(client: TestClient, monkeypatch) -> No
 
     response = client.post(
         "/api/reading/materials",
-        files={"file": ("big.txt", io.BytesIO(b"x" * 4096), "text/plain")},
+        files={"file": ("big.txt", io.BytesIO(b"x" * 1025), "text/plain")},
     )
 
     assert response.status_code == 413
+    assert "MiB limit" in response.json()["detail"]
+
+
+def test_upload_accepts_a_file_at_the_size_limit(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setattr(reading, "MAX_MATERIAL_BYTES", 1024)
+
+    response = client.post(
+        "/api/reading/materials",
+        files={"file": ("boundary.txt", io.BytesIO(b"x" * 1024), "text/plain")},
+    )
+
+    assert response.status_code == 200
 
 
 def test_upload_of_an_image_only_pdf_explains_itself(client: TestClient) -> None:
@@ -218,7 +230,7 @@ def test_supported_formats_names_faithful_documents_and_media(client: TestClient
     assert ".pdf" in body["raw_view_extensions"]
     assert ".mp4" in body["raw_view_extensions"]
     assert ".mp3" in body["raw_view_extensions"]
-    assert body["max_bytes"] > 0
+    assert body["max_bytes"] == 300 * 1024 * 1024
 
 
 def test_epub_contract_exposes_source_refs_original_and_position(client: TestClient) -> None:
