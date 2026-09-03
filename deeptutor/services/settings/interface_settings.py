@@ -23,6 +23,7 @@ DEFAULT_UI_SETTINGS: dict[str, Any] = {
     "theme": "snow",
     "language": "en",
     "response_language": "en",
+    "learning_coordinator_enabled": False,
 }
 
 
@@ -143,6 +144,12 @@ def get_enabled_optional_tools() -> list[str]:
     if allowed is not None:
         enabled = [name for name in enabled if name in allowed]
     return enabled
+
+
+def get_learning_coordinator_enabled() -> bool:
+    """Return whether the current user opted into coordinated learning."""
+
+    return get_ui_settings().get("learning_coordinator_enabled") is True
 
 
 def atomic_update(

@@ -142,6 +142,7 @@ class UISettings(BaseModel):
     code_block_theme: Optional[str] = None
     code_block_show_line_numbers: Optional[bool] = None
     code_block_wrap_long_lines: Optional[bool] = None
+    learning_coordinator_enabled: bool = False
 
 
 class UISettingsUpdate(BaseModel):
@@ -165,6 +166,7 @@ class UISettingsUpdate(BaseModel):
     code_block_theme: str | None = None
     code_block_show_line_numbers: bool | None = None
     code_block_wrap_long_lines: bool | None = None
+    learning_coordinator_enabled: bool | None = None
 
 
 class VoiceAutoplayUpdate(BaseModel):

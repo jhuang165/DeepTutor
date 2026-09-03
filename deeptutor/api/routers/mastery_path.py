@@ -22,7 +22,6 @@ from deeptutor.learning.models import (
     LearningProgress,
     MasteryInteraction,
     MasteryTopic,
-    TopicMetadata,
     TopicSource,
     TopicSourceKind,
 )
@@ -363,32 +362,30 @@ async def generate_topic_route(body: GenerateTopicDraftRequest):
 async def create_topic(body: ConfirmTopicRequest):
     from deeptutor.learning.topic_generation import (
         TopicGenerationError,
-        materialize_modules,
+        materialize_topic_draft,
     )
 
     path_id = f"topic_{uuid.uuid4().hex}"
     try:
-        modules = materialize_modules(
-            path_id, body.modules, strict=True, module_limit=MAX_MODULE_LIMIT
+        materialized = materialize_topic_draft(
+            path_id=path_id,
+            name=body.name,
+            goal=body.goal,
+            description=body.description,
+            emoji=body.emoji,
+            sources=_topic_sources(body.sources),
+            modules=body.modules,
         )
     except TopicGenerationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    sources = _topic_sources(body.sources)
     store = LearningStore()
-    metadata = TopicMetadata(
-        path_id=path_id,
-        goal=body.goal.strip(),
-        description=body.description.strip(),
-        emoji=body.emoji.strip() or "🧭",
-        map_seed=store._default_map_seed(path_id),
-    )
     progress = await asyncio.to_thread(
         LearningService(store).create_topic,
         path_id,
-        name=body.name,
-        modules=modules,
-        metadata=metadata,
-        sources=sources,
+        name=materialized.name,
+        modules=materialized.modules,
+        metadata=materialized.metadata,
+        sources=materialized.sources,
     )
     payload = await asyncio.to_thread(_topic_payload, store, path_id)
     payload["path_revision"] = progress.version

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from deeptutor.services.settings.interface_settings import (
+    get_learning_coordinator_enabled,
     get_response_language,
     get_ui_language,
     get_ui_settings,
@@ -57,3 +58,17 @@ def test_response_language_is_scoped_independently_per_user(mu_isolated_root, as
     with as_user("u_alice", role="user"):
         assert get_ui_language() == "zh"
         assert get_response_language() == "en"
+
+
+def test_learning_coordinator_opt_in_is_scoped_independently_per_user(mu_isolated_root, as_user):
+    alice_settings = (
+        mu_isolated_root / "data" / "users" / "u_alice" / "user" / "settings" / "interface.json"
+    )
+    alice_settings.parent.mkdir(parents=True, exist_ok=True)
+    alice_settings.write_text(json.dumps({"learning_coordinator_enabled": True}))
+
+    with as_user("u_alice", role="user"):
+        assert get_learning_coordinator_enabled() is True
+
+    with as_user("u_bob", role="user"):
+        assert get_learning_coordinator_enabled() is False

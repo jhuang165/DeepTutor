@@ -25,7 +25,8 @@ import sqlite3
 import tempfile
 import threading
 import time
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
+import uuid
 
 from pydantic import ValidationError
 
@@ -46,6 +47,9 @@ from deeptutor.services.file_io import atomic_write_text as _atomic_write_text
 from deeptutor.services.path_service import get_path_service
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from deeptutor.learning.topic_generation import ConfirmedTopicDraft
 
 _schema_lock = threading.RLock()
 _initialized_db_paths: set[Path] = set()
@@ -498,10 +502,14 @@ class LearningStore:
             # Explicit roots are used by tests and SDK callers as direct store
             # directories.  The app-owned default is the only location that
             # participates in the one-way workspace V1 → V2 migration.
-            from deeptutor.learning.migration import prepare_mastery_v2_root
+            from deeptutor.learning.migration import mastery_v2_root, prepare_mastery_v2_root
 
             learning_root = get_path_service().get_workspace_dir() / "learning"
-            self._root = prepare_mastery_v2_root(learning_root) if initialize else learning_root
+            self._root = (
+                prepare_mastery_v2_root(learning_root)
+                if initialize
+                else mastery_v2_root(learning_root)
+            )
         else:
             self._root = Path(root)
         self._initialized = False
@@ -1502,6 +1510,132 @@ class LearningStore:
         if completed is None:  # pragma: no cover - committed update guarantees this row
             raise LearningStoreError(f"Unknown learning thread: {thread_id}")
         return completed
+
+    def approve_learning_thread_path(
+        self,
+        thread_id: str,
+        materialized: ConfirmedTopicDraft,
+    ) -> str:
+        """Atomically promote one draft thread into one deterministic mastery path."""
+
+        thread_id = str(thread_id)
+        path_id = f"topic_{uuid.uuid5(uuid.NAMESPACE_URL, thread_id).hex}"
+        if materialized.metadata.path_id != path_id:
+            raise LearningStoreError("Materialized path identity does not match the thread")
+
+        created = False
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM learning_threads WHERE thread_id = ?", (thread_id,)
+            ).fetchone()
+            thread = self._learning_thread_from_row(row)
+            if thread is None:
+                raise LearningStoreError(f"Unknown learning thread: {thread_id}")
+            if thread.path_id:
+                return thread.path_id
+            if thread.status is not LearningThreadStatus.DRAFT or thread.scope != "path":
+                raise LearningStoreError("Learning thread is not an approvable path draft")
+
+            now = time.time()
+            claimed = conn.execute(
+                """
+                UPDATE learning_threads
+                SET path_id = ?, status = 'active', updated_at = ?
+                WHERE thread_id = ? AND path_id = '' AND status = 'draft'
+                """,
+                (path_id, now, thread_id),
+            )
+            if claimed.rowcount != 1:
+                winner = conn.execute(
+                    "SELECT path_id FROM learning_threads WHERE thread_id = ?", (thread_id,)
+                ).fetchone()
+                winner_path_id = str(winner["path_id"] or "") if winner is not None else ""
+                if winner_path_id:
+                    return winner_path_id
+                raise LearningStoreError("Learning path approval lost its draft claim")
+
+            progress = LearningProgress(book_id=path_id)
+            progress.name = str(materialized.name or "").strip()[:200]
+            progress.modules = [module.model_copy(deep=True) for module in materialized.modules]
+            progress.current_module_id = progress.modules[0].id if progress.modules else ""
+            progress.current_kp_index = 0
+            progress.knowledge_types = {
+                point.id: point.type
+                for module in progress.modules
+                for point in module.knowledge_points
+            }
+            conn.execute(
+                """
+                INSERT INTO mastery_paths (
+                    path_id, state_json, revision, created_at, updated_at
+                ) VALUES (?, ?, 0, ?, ?)
+                """,
+                (
+                    path_id,
+                    self._progress_payload(progress, 0, progress.updated_at),
+                    progress.created_at,
+                    progress.updated_at,
+                ),
+            )
+            tx = LearningTransaction(conn, progress, created=True)
+            tx.put_topic(
+                materialized.metadata.model_copy(deep=True),
+                [source.model_copy(deep=True) for source in materialized.sources],
+            )
+            tx.touch()
+            tx.emit(
+                "topic.created",
+                {
+                    "module_count": len(progress.modules),
+                    "knowledge_point_count": sum(
+                        len(module.knowledge_points) for module in progress.modules
+                    ),
+                    "source_count": len(materialized.sources),
+                },
+            )
+            revision = 1
+            updated_path = conn.execute(
+                """
+                UPDATE mastery_paths
+                SET state_json = ?, revision = ?, updated_at = ?
+                WHERE path_id = ? AND revision = 0
+                """,
+                (self._progress_payload(progress, revision, now), revision, now, path_id),
+            )
+            if updated_path.rowcount != 1:
+                raise LearningStoreError("Failed to commit the approved mastery path")
+            for event_type, event_payload, session_id, turn_id in tx.events:
+                conn.execute(
+                    """
+                    INSERT INTO mastery_events (
+                        path_id, revision, event_type, payload_json,
+                        session_id, turn_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        path_id,
+                        revision,
+                        event_type,
+                        json.dumps(event_payload, ensure_ascii=False),
+                        session_id,
+                        turn_id,
+                        now,
+                    ),
+                )
+            self._append_learning_event(
+                conn,
+                thread_id,
+                "thread.path_approved",
+                {"path_id": path_id},
+                session_id=thread.session_id,
+            )
+            created = True
+
+        if created:
+            from deeptutor.learning.event_hub import publish_topic_signal
+
+            publish_topic_signal(path_id, 1, "topic.created", scope=self.event_scope)
+        return path_id
 
     def get_evidence(self, evidence_id: str) -> EvidenceRecord | None:
         with self._connect() as conn:

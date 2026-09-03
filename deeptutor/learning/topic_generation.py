@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from typing import Any
 import uuid
+
+from pydantic import BaseModel, ConfigDict
 
 from deeptutor.learning import prompts as learning_prompts
 from deeptutor.learning.models import (
     KnowledgePoint,
     KnowledgeType,
     LearningModule,
+    TopicMetadata,
     TopicSource,
     TopicSourceKind,
 )
@@ -41,6 +45,17 @@ _MAX_KB_DOCUMENTS = 60
 
 class TopicGenerationError(RuntimeError):
     pass
+
+
+class ConfirmedTopicDraft(BaseModel):
+    """Validated topic rows ready for one persistence transaction."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    modules: list[LearningModule]
+    metadata: TopicMetadata
+    sources: list[TopicSource]
 
 
 def source_documents(source: TopicSource) -> list[str]:
@@ -417,6 +432,45 @@ def materialize_modules(
     if not modules:
         raise TopicGenerationError("The generated route contains no usable objectives")
     return modules
+
+
+def materialize_topic_draft(
+    *,
+    path_id: str,
+    name: str,
+    goal: str,
+    description: str,
+    emoji: str,
+    sources: list[TopicSource],
+    modules: list[dict[str, Any]],
+) -> ConfirmedTopicDraft:
+    """Validate a confirmed topic without reading or writing durable state."""
+
+    normalized_name = str(name or "").strip()[:200]
+    if not normalized_name:
+        raise TopicGenerationError("A learning topic needs a name")
+    normalized_sources = [source.model_copy(deep=True) for source in sources]
+    for position, source in enumerate(normalized_sources):
+        source.position = position
+    materialized_modules = materialize_modules(
+        path_id,
+        modules,
+        strict=True,
+        module_limit=MAX_MODULE_LIMIT,
+    )
+    metadata = TopicMetadata(
+        path_id=path_id,
+        goal=str(goal or "").strip(),
+        description=str(description or "").strip(),
+        emoji=str(emoji or "").strip() or "🧭",
+        map_seed=int.from_bytes(hashlib.sha256(path_id.encode("utf-8")).digest()[:4], "big"),
+    )
+    return ConfirmedTopicDraft(
+        name=normalized_name,
+        modules=materialized_modules,
+        metadata=metadata,
+        sources=normalized_sources,
+    )
 
 
 def module_limit_for(sources: list[TopicSource]) -> int:

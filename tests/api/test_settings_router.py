@@ -21,6 +21,32 @@ from deeptutor.services.llm import config as llm_config_module
 from deeptutor.services.settings import interface_settings
 
 
+def test_fresh_ui_settings_default_learning_coordinator_to_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    settings_file = tmp_path / "interface.json"
+    monkeypatch.setattr(settings_router, "_settings_file", lambda: settings_file)
+    monkeypatch.setattr(interface_settings, "_interface_settings_file", lambda: settings_file)
+
+    assert settings_router.load_ui_settings()["learning_coordinator_enabled"] is False
+    assert interface_settings.get_ui_settings()["learning_coordinator_enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_authenticated_ui_update_persists_learning_coordinator_opt_in(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    settings_file = tmp_path / "interface.json"
+    monkeypatch.setattr(settings_router, "_settings_file", lambda: settings_file)
+
+    response = await settings_router.update_ui_settings(
+        settings_router.UISettingsUpdate(learning_coordinator_enabled=True)
+    )
+
+    assert response["learning_coordinator_enabled"] is True
+    assert settings_router.load_ui_settings()["learning_coordinator_enabled"] is True
+
+
 def test_load_ui_settings_migrates_legacy_language_to_response_language(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
@@ -1513,6 +1539,7 @@ def test_public_ui_read_omits_deployment_configuration(
         {
             **settings_router.DEFAULT_UI_SETTINGS,
             "language": "zh",
+            "learning_coordinator_enabled": True,
             "enabled_optional_tools": ["rag", "web_search"],
             "chat_response_timeout": 900,
         }
@@ -1524,6 +1551,7 @@ def test_public_ui_read_omits_deployment_configuration(
     payload = TestClient(app).get("/api/settings/ui").json()
 
     assert set(payload) == set(settings_router.PRESESSION_UI_FIELDS)
+    assert "learning_coordinator_enabled" not in payload
     assert "enabled_optional_tools" not in payload
     assert "chat_response_timeout" not in payload
     assert "sidebar_nav_order" not in payload

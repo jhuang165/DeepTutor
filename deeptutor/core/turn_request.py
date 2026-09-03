@@ -126,6 +126,8 @@ class TurnRequest(BaseModel):
     selection_tutor_context: dict[str, Any] | None = None
     subagent_consult_budget: int | None = Field(default=None, ge=0)
     auto_route: bool | None = None
+    learning_coordinator: bool | None = None
+    learning_thread_id: str | None = Field(default=None, max_length=128)
 
     @model_validator(mode="before")
     @classmethod

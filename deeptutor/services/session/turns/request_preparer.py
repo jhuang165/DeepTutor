@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
+import re
 import time
 from typing import TYPE_CHECKING, Any
 import uuid
@@ -42,6 +44,32 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+_REPEATED_LEARNING_PHRASES = (
+    "again",
+    "still don't understand",
+    "still don’t understand",
+    "再来一次",
+    "再讲一次",
+    "还是不明白",
+    "仍然不明白",
+)
+
+
+def _normalized_learning_request(value: Any) -> str:
+    return " ".join(re.findall(r"\w+", str(value or "").casefold()))
+
+
+def _is_repeated_learning_request(current: Any, previous: Any) -> bool:
+    current_text = str(current or "").casefold()
+    normalized = _normalized_learning_request(current_text)
+    return bool(
+        normalized
+        and (
+            normalized == _normalized_learning_request(previous)
+            or any(phrase in current_text for phrase in _REPEATED_LEARNING_PHRASES)
+        )
+    )
 
 
 class TurnRequestPreparer:
@@ -104,9 +132,7 @@ class TurnRequestPreparer:
         system_settings = load_system_settings()
         per_turn_auto_route = payload.get("auto_route")
         if per_turn_auto_route is None:
-            routing_enabled = _coerce_bool(
-                system_settings.get("capability_routing_enabled"), False
-            )
+            routing_enabled = _coerce_bool(system_settings.get("capability_routing_enabled"), False)
         else:
             routing_enabled = _coerce_bool(per_turn_auto_route, False)
         session = await self.store.ensure_session(payload.get("session_id"))
@@ -380,17 +406,72 @@ class TurnRequestPreparer:
         }
         learning_decision = None
         learning_decision_status = None
-        coordinator_mode = str(
-            system_settings.get("learning_coordinator_mode") or "off"
-        ).strip().lower()
+        rollout_mode = (
+            str(system_settings.get("learning_coordinator_mode") or "off").strip().lower()
+        )
+        per_turn_opt_in = payload.get("learning_coordinator")
+        if per_turn_opt_in is None:
+            from deeptutor.services.settings.interface_settings import (
+                get_learning_coordinator_enabled,
+            )
+
+            user_opted_in = get_learning_coordinator_enabled()
+        else:
+            user_opted_in = per_turn_opt_in is True
+        coordinator_mode = (
+            "shadow"
+            if rollout_mode == "shadow" and per_turn_opt_in is not False
+            else "active"
+            if rollout_mode == "active" and user_opted_in
+            else "off"
+        )
         eligible_for_learning_coordinator = (
-            requested_capability == "chat"
+            capability_route is None
+            and requested_capability == "chat"
             and not requested_course_id
             and not payload.get("mastery_path_id")
             and not payload.get("workspace_mode")
             and not payload.get("selection_tutor_context")
         )
-        if coordinator_mode == "shadow" and eligible_for_learning_coordinator:
+        learning_store = None
+        prior_learning_thread = None
+        requested_learning_thread_id = str(payload.get("learning_thread_id") or "").strip()
+        if coordinator_mode in {"shadow", "active"} and eligible_for_learning_coordinator:
+            if requested_learning_thread_id:
+                from deeptutor.learning.storage import LearningStore
+
+                learning_store = LearningStore()
+                prior_learning_thread = await asyncio.to_thread(
+                    learning_store.get_learning_thread,
+                    requested_learning_thread_id,
+                )
+                if prior_learning_thread is None:
+                    raise RuntimeError("Learning thread is unavailable for this user")
+                if prior_learning_thread.session_id != session["id"]:
+                    raise RuntimeError("Learning thread belongs to another session")
+                evidence = await asyncio.to_thread(
+                    learning_store.list_evidence,
+                    thread_id=prior_learning_thread.thread_id,
+                )
+                previous_message = await self.store.get_last_message(session["id"], role="user")
+                next_activity = dict(prior_learning_thread.next_activity)
+                try:
+                    previous_help_level = int(next_activity.get("help_level") or 0)
+                except (TypeError, ValueError):
+                    previous_help_level = 0
+                payload = {
+                    **payload,
+                    "learning_state": {
+                        "previous_help_level": max(0, min(4, previous_help_level)),
+                        "last_outcome": evidence[-1].outcome.value if evidence else "",
+                        "server_next_activity": next_activity or None,
+                        "repeated_request": _is_repeated_learning_request(
+                            payload.get("content"),
+                            previous_message.get("content") if previous_message else "",
+                        ),
+                    },
+                }
+        if coordinator_mode in {"shadow", "active"} and eligible_for_learning_coordinator:
             try:
                 from deeptutor.learning.coordinator import LearningCoordinator, decision_payload
                 from deeptutor.runtime.registry.capability_registry import (
@@ -400,13 +481,102 @@ class TurnRequestPreparer:
                     resolve_llm_config_for_selection,
                 )
 
+                registry = get_capability_registry()
                 decision = await LearningCoordinator().prepare_payload(
                     payload,
-                    set(get_capability_registry().list_capabilities()),
+                    set(registry.list_capabilities()),
                     resolve_llm_config_for_selection(payload.get("llm_selection")),
                 )
                 learning_decision = decision_payload(decision)
                 learning_decision_status = "prepared"
+                if coordinator_mode == "active":
+                    capability = (
+                        decision.route if registry.get(decision.route) is not None else "chat"
+                    )
+                    try:
+                        from deeptutor.multi_user.learning_access import apply_learning_policy
+
+                        payload = apply_learning_policy({**payload, "capability": capability})
+                    except PermissionError as exc:
+                        raise RuntimeError(str(exc)) from exc
+                    try:
+                        from deeptutor.runtime.request_contracts import validate_capability_config
+
+                        validated_public_config = validate_capability_config(capability, raw_config)
+                    except ValueError as exc:
+                        raise RuntimeError(str(exc)) from exc
+                    routed_capability = registry.get(capability)
+                    if routed_capability is not None:
+                        allowed_by_manifest = set(routed_capability.manifest.tools_used)
+                        payload = {
+                            **payload,
+                            "tools": [
+                                tool
+                                for tool in (payload.get("tools") or [])
+                                if tool in allowed_by_manifest
+                            ],
+                        }
+                    payload = {
+                        **payload,
+                        "capability": capability,
+                        "config": validated_public_config,
+                    }
+                    if decision.scope.value in {"lesson", "path"}:
+                        from deeptutor.learning.models import LearningThread, LearningThreadStatus
+                        from deeptutor.learning.storage import LearningStore
+
+                        learning_store = learning_store or LearningStore()
+                        thread_id = (
+                            requested_learning_thread_id
+                            or hashlib.sha256(
+                                f"{session['id']}:{decision.goal}".encode()
+                            ).hexdigest()[:32]
+                        )
+                        if prior_learning_thread is None:
+                            prior_learning_thread = await asyncio.to_thread(
+                                learning_store.get_learning_thread,
+                                thread_id,
+                            )
+                        expected_scope = decision.scope.value
+                        expected_status = (
+                            LearningThreadStatus.DRAFT
+                            if expected_scope == "path"
+                            else LearningThreadStatus.ACTIVE
+                        )
+                        activity_payload = decision.activity.model_dump(mode="json")
+                        if prior_learning_thread is None:
+                            prior_learning_thread = await asyncio.to_thread(
+                                learning_store.create_learning_thread,
+                                LearningThread(
+                                    thread_id=thread_id,
+                                    session_id=session["id"],
+                                    scope=expected_scope,
+                                    goal=decision.goal,
+                                    status=expected_status,
+                                    source_refs=list(decision.activity.source_refs),
+                                    next_activity=activity_payload,
+                                ),
+                            )
+                        else:
+                            if prior_learning_thread.session_id != session["id"]:
+                                raise RuntimeError("Learning thread belongs to another session")
+                            if prior_learning_thread.scope != expected_scope:
+                                raise RuntimeError(
+                                    "Learning thread scope does not match the decision"
+                                )
+                            if prior_learning_thread.goal != decision.goal:
+                                raise RuntimeError(
+                                    "Learning thread goal does not match the decision"
+                                )
+                            if prior_learning_thread.status is not expected_status:
+                                raise RuntimeError("Learning thread is not resumable")
+                            prior_learning_thread = await asyncio.to_thread(
+                                learning_store.set_learning_thread_next_activity,
+                                thread_id,
+                                activity_payload,
+                            )
+                        decision = decision.model_copy(update={"thread_id": thread_id})
+                        learning_decision = decision_payload(decision)
             except Exception as exc:
                 # The coordinator is observational in Release 1. Do not
                 # include request content in this operational error surface.
@@ -416,6 +586,10 @@ class TurnRequestPreparer:
                     type(exc).__name__,
                 )
                 learning_decision_status = "failed"
+                learning_decision = None
+                if coordinator_mode == "active":
+                    capability = "chat"
+                    payload = {**payload, "capability": capability}
         payload = {
             **payload,
             "learning_decision": learning_decision,

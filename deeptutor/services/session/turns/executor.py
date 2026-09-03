@@ -135,7 +135,9 @@ async def _finalize_learning_evidence(
 ) -> None:
     """Finalize optional learning evidence without failing a completed answer."""
 
-    coordinator_state = context.extension_state.get("learning_coordinator")
+    if "learning_coordinator" not in context.extension_state:
+        return
+    coordinator_state = context.extension("learning_coordinator")
     if not isinstance(coordinator_state, Mapping):
         return
     decision_raw = coordinator_state.get("decision")
