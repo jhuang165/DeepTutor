@@ -283,7 +283,7 @@ async def test_coordinator_failure_keeps_chat_turn_successful(
         tmp_path,
         monkeypatch,
         captured,
-        coordinator_error=RuntimeError("provider unavailable"),
+        coordinator_error=RuntimeError(secret),
         content=secret,
     )
 

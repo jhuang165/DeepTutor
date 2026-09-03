@@ -408,10 +408,14 @@ class TurnRequestPreparer:
                 )
                 learning_decision = decision_payload(decision)
                 learning_decision_status = "prepared"
-            except Exception:
+            except Exception as exc:
                 # The coordinator is observational in Release 1. Do not
                 # include request content in this operational error surface.
-                logger.exception("Learning coordinator preparation failed")
+                logger.warning(
+                    "Learning coordinator preparation failed code=coordinator_prepare_failed "
+                    "exception_class=%s",
+                    type(exc).__name__,
+                )
                 learning_decision_status = "failed"
         payload = {
             **payload,
