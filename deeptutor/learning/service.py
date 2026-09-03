@@ -1063,6 +1063,43 @@ class LearningService:
         overviews.sort(key=lambda overview: overview["updated_at"], reverse=True)
         return overviews
 
+    def list_path_overviews_read_only(self, *, path_ids: set[str] | None = None) -> list[dict]:
+        """Project path summaries without importing legacy JSON or writing SQLite."""
+
+        from deeptutor.learning import policy
+
+        overviews: list[dict] = []
+        for path_id in self._store.list_all_read_only():
+            if path_ids is not None and path_id not in path_ids:
+                continue
+            try:
+                progress = self._store.load_read_only(path_id)
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "Failed to read mastery path %s for overview", path_id, exc_info=True
+                )
+                continue
+            if progress is None:
+                continue
+            summary = policy.map_summary(progress)
+            counts = summary["counts"]
+            overviews.append(
+                {
+                    "path_id": progress.book_id,
+                    "name": policy.path_display_name(progress),
+                    "objectives": counts["total"],
+                    "mastered": counts["mastered"],
+                    "learning": counts["learning"],
+                    "not_started": counts["new"],
+                    "due_reviews": summary["due_reviews"],
+                    "complete": summary["complete"],
+                    "open_question": progress.pending_question is not None,
+                    "updated_at": progress.updated_at,
+                }
+            )
+        overviews.sort(key=lambda overview: overview["updated_at"], reverse=True)
+        return overviews
+
     def list_progress(self) -> dict:
         """Return summary of all book progress with per-book error info."""
         from deeptutor.learning import policy

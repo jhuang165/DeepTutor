@@ -542,6 +542,25 @@ class LearningStore:
             conn.close()
 
     @contextmanager
+    def _connect_read_only(self) -> Iterator[sqlite3.Connection | None]:
+        """Open the existing database without creating or migrating state."""
+
+        if not self.db_path.exists():
+            yield None
+            return
+        conn = sqlite3.connect(
+            f"{self.db_path.resolve().as_uri()}?mode=ro",
+            uri=True,
+            timeout=30.0,
+            isolation_level=None,
+        )
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
         """Run one learning-thread/evidence mutation atomically."""
 
@@ -763,6 +782,26 @@ class LearningStore:
                 "SELECT * FROM mastery_paths WHERE path_id = ?", (path_id,)
             ).fetchone()
         return self._progress_from_row(row) if row is not None else None
+
+    def load_read_only(self, book_id: str) -> LearningProgress | None:
+        """Read SQLite or legacy JSON state without importing either representation."""
+
+        path_id = self._validate_id(book_id)
+        with self._connect_read_only() as conn:
+            row = (
+                conn.execute(
+                    "SELECT * FROM mastery_paths WHERE path_id = ?", (path_id,)
+                ).fetchone()
+                if conn is not None
+                else None
+            )
+        if row is not None:
+            return self._progress_from_row(row)
+        try:
+            progress = LearningProgress.model_validate_json(self._path(path_id).read_text("utf-8"))
+        except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError, ValidationError):
+            return None
+        return progress if progress.book_id == path_id else None
 
     def save(self, progress: LearningProgress) -> None:
         path_id = self._validate_id(progress.book_id)
@@ -1012,6 +1051,23 @@ class LearningStore:
         }
         return sorted(stored | legacy)
 
+    def list_all_read_only(self) -> list[str]:
+        """List SQLite and legacy path identifiers without initializing storage."""
+
+        with self._connect_read_only() as conn:
+            stored = (
+                {
+                    str(row["path_id"])
+                    for row in conn.execute("SELECT path_id FROM mastery_paths").fetchall()
+                }
+                if conn is not None
+                else set()
+            )
+        legacy = {
+            path.stem for path in Path(self._root).glob("*.json") if not path.name.startswith(".")
+        }
+        return sorted(stored | legacy)
+
     # ---- durable learning threads and evidence -------------------------
 
     def create_learning_thread(self, thread: LearningThread) -> LearningThread:
@@ -1077,6 +1133,35 @@ class LearningStore:
                 f"SELECT * FROM learning_threads{where} ORDER BY updated_at DESC, thread_id ASC",
                 params,
             ).fetchall()
+        threads = (self._learning_thread_from_row(row) for row in rows)
+        return [thread for thread in threads if thread is not None]
+
+    def list_learning_threads_read_only(
+        self,
+        session_id: str = "",
+        *,
+        status: LearningThreadStatus | str | None = None,
+    ) -> list[LearningThread]:
+        """Read thread rows without initializing the store."""
+
+        clauses: list[str] = []
+        params: list[str] = []
+        if session_id:
+            clauses.append("session_id = ?")
+            params.append(str(session_id))
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status.value if isinstance(status, LearningThreadStatus) else str(status))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect_read_only() as conn:
+            rows = (
+                conn.execute(
+                    f"SELECT * FROM learning_threads{where} ORDER BY updated_at DESC, thread_id ASC",
+                    params,
+                ).fetchall()
+                if conn is not None
+                else []
+            )
         threads = (self._learning_thread_from_row(row) for row in rows)
         return [thread for thread in threads if thread is not None]
 
@@ -1557,6 +1642,27 @@ class LearningStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_paths_for_session_read_only(self, session_id: str) -> list[dict[str, Any]]:
+        """Read session/path bindings without creating the database."""
+
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return []
+        with self._connect_read_only() as conn:
+            rows = (
+                conn.execute(
+                    """
+                    SELECT path_id, owns_path, created_at, last_seen_at
+                    FROM mastery_path_sessions
+                    WHERE session_id = ? ORDER BY last_seen_at DESC
+                    """,
+                    (session_id,),
+                ).fetchall()
+                if conn is not None
+                else []
+            )
+        return [dict(row) for row in rows]
+
     def detach_session(self, session_id: str, *, delete_owned_orphans: bool = True) -> list[str]:
         """Remove a session association and optionally delete owned orphan paths."""
         session_id = str(session_id or "").strip()
@@ -1751,6 +1857,26 @@ class LearningStore:
                 """,  # nosec B608 - placeholders is a generated "?,?" list; every value is bound
                 (path_id, *_ACTIVE_INTERACTION_STATES),
             ).fetchone()
+        return LearningTransaction._interaction_from_row(row)
+
+    def get_active_interaction_read_only(self, path_id: str) -> MasteryInteraction | None:
+        """Read an active durable interaction without importing legacy state."""
+
+        path_id = self._validate_id(path_id)
+        placeholders = ",".join("?" for _ in _ACTIVE_INTERACTION_STATES)
+        with self._connect_read_only() as conn:
+            row = (
+                conn.execute(
+                    f"""
+                    SELECT * FROM mastery_interactions
+                    WHERE path_id = ? AND status IN ({placeholders})
+                    ORDER BY created_at DESC LIMIT 1
+                    """,  # nosec B608 - placeholders is generated from fixed states
+                    (path_id, *_ACTIVE_INTERACTION_STATES),
+                ).fetchone()
+                if conn is not None
+                else None
+            )
         return LearningTransaction._interaction_from_row(row)
 
     def list_interactions(self, path_id: str, *, limit: int = 200) -> list[MasteryInteraction]:
