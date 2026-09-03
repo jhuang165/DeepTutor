@@ -16,6 +16,25 @@ class LearningScope(str, Enum):
     PATH = "path"
 
 
+class LearningQueueReason(str, Enum):
+    UNFINISHED_ATTEMPT = "unfinished_attempt"
+    RESUME_LESSON = "resume_lesson"
+    DUE_REVIEW = "due_review"
+    NEEDS_TRANSFER = "needs_transfer"
+    CONTINUE_PATH = "continue_path"
+
+
+class LearningQueueItem(BaseModel):
+    thread_id: str = ""
+    path_id: str = ""
+    objective_id: str = ""
+    activity: dict[str, Any] = Field(default_factory=dict)
+    reason: LearningQueueReason
+    reason_text: str
+    priority: int
+    due_at: float | None = None
+
+
 class ActivityKind(str, Enum):
     EXPLANATION = "explanation"
     PREDICTION = "prediction"
