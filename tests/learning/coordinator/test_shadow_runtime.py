@@ -239,7 +239,12 @@ async def test_explicit_non_chat_capability_is_not_coordinated(
         {"course_id": "course-1"},
         {"mastery_path_id": "path-1"},
         {"workspace_mode": "reading"},
-        {"selection_tutor_context": {"selected_text": "eigenvectors"}},
+        {
+            "selection_tutor_context": {
+                "selected_text": "eigenvectors",
+                "source_message_text": "A geometric view of eigenvectors.",
+            }
+        },
     ],
     ids=["course", "mastery", "reading-workspace", "selection-tutor"],
 )

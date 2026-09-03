@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import time
 from typing import TYPE_CHECKING, Any
 import uuid
@@ -38,6 +39,9 @@ from .._turn_runtime_shared import (
 if TYPE_CHECKING:
     from deeptutor.runtime.coordination import RuntimeCoordinator
     from deeptutor.services.session.protocol import SessionStoreProtocol
+
+
+logger = logging.getLogger(__name__)
 
 
 class TurnRequestPreparer:
@@ -95,12 +99,13 @@ class TurnRequestPreparer:
 
             payload = {**payload, "language": get_response_language(default="en")}
         raw_config = dict(payload.get("config", {}) or {})
+        from deeptutor.services.config.runtime_settings import load_system_settings
+
+        system_settings = load_system_settings()
         per_turn_auto_route = payload.get("auto_route")
         if per_turn_auto_route is None:
-            from deeptutor.services.config.runtime_settings import load_system_settings
-
             routing_enabled = _coerce_bool(
-                load_system_settings().get("capability_routing_enabled"), False
+                system_settings.get("capability_routing_enabled"), False
             )
         else:
             routing_enabled = _coerce_bool(per_turn_auto_route, False)
@@ -365,7 +370,54 @@ class TurnRequestPreparer:
                         tool for tool in (payload.get("tools") or []) if tool in allowed_by_manifest
                     ],
                 }
-        payload = {**payload, "llm_selection": llm_selection}
+        # This payload is runtime-owned: public request validation rejects the
+        # same key from callers, and coordinator state must never be client
+        # supplied or persisted as a session preference.
+        payload = {
+            **payload,
+            "llm_selection": llm_selection,
+            "learning_state": {},
+        }
+        learning_decision = None
+        learning_decision_status = None
+        coordinator_mode = str(
+            system_settings.get("learning_coordinator_mode") or "off"
+        ).strip().lower()
+        eligible_for_learning_coordinator = (
+            requested_capability == "chat"
+            and not requested_course_id
+            and not payload.get("mastery_path_id")
+            and not workspace_mode_explicit
+            and not payload.get("workspace_mode")
+            and not payload.get("selection_tutor_context")
+        )
+        if coordinator_mode == "shadow" and eligible_for_learning_coordinator:
+            try:
+                from deeptutor.learning.coordinator import LearningCoordinator, decision_payload
+                from deeptutor.runtime.registry.capability_registry import (
+                    get_capability_registry,
+                )
+                from deeptutor.services.model_selection.runtime import (
+                    resolve_llm_config_for_selection,
+                )
+
+                decision = await LearningCoordinator().prepare_payload(
+                    payload,
+                    set(get_capability_registry().list_capabilities()),
+                    resolve_llm_config_for_selection(payload.get("llm_selection")),
+                )
+                learning_decision = decision_payload(decision)
+                learning_decision_status = "prepared"
+            except Exception:
+                # The coordinator is observational in Release 1. Do not
+                # include request content in this operational error surface.
+                logger.exception("Learning coordinator preparation failed")
+                learning_decision_status = "failed"
+        payload = {
+            **payload,
+            "learning_decision": learning_decision,
+            "learning_decision_status": learning_decision_status,
+        }
         lease = None
         if self.coordinator is not None:
             turn_id = f"turn_{int(time.time() * 1000)}_{uuid.uuid4().hex[:10]}"
@@ -552,6 +604,10 @@ class TurnRequestPreparer:
             session_metadata["regenerate"] = True
         if capability_route is not None:
             session_metadata["capability_route"] = capability_route.as_metadata()
+        if isinstance(payload.get("learning_decision"), dict):
+            session_metadata["learning_decision"] = dict(payload["learning_decision"])
+        if payload.get("learning_decision_status"):
+            session_metadata["learning_decision_status"] = payload["learning_decision_status"]
         try:
             await self._publish_live_event(
                 execution,

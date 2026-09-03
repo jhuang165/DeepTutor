@@ -714,6 +714,11 @@ class TurnExecutor:
                     wait_for_user_reply=_wait_for_user_reply,
                     subagent_consult_budget=payload.get("subagent_consult_budget"),
                 ),
+                extension_state=(
+                    {"learning_coordinator": {"decision": dict(payload["learning_decision"])}}
+                    if isinstance(payload.get("learning_decision"), dict)
+                    else {}
+                ),
                 metadata={
                     "conversation_summary": history_result.conversation_summary,
                     "conversation_context_text": conversation_context_text,
@@ -787,6 +792,16 @@ class TurnExecutor:
                         pending_done_event.metadata = {
                             **pending_done_event.metadata,
                             "capability_route": dict(capability_route),
+                        }
+                    if isinstance(payload.get("learning_decision"), dict):
+                        pending_done_event.metadata = {
+                            **pending_done_event.metadata,
+                            "learning_decision": dict(payload["learning_decision"]),
+                        }
+                    if payload.get("learning_decision_status"):
+                        pending_done_event.metadata = {
+                            **pending_done_event.metadata,
+                            "learning_decision_status": payload["learning_decision_status"],
                         }
                     continue
                 payload_event = await self._publish_live_event(execution, event)

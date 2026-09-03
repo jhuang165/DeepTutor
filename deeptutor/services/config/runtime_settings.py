@@ -37,6 +37,10 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     # Conservative chat -> deep_question routing. Explicit requests only, and
     # callers can still pass config.auto_route=false for a single turn.
     "capability_routing_enabled": False,
+    # Release 1 records coordinator recommendations without changing the
+    # requested capability. ``active`` is accepted for forward compatibility
+    # but remains inert until the later activation plan.
+    "learning_coordinator_mode": "off",
     # Reference policy applied after every web-search provider. This belongs in
     # runtime JSON so packaged installs and the settings service share one
     # source of truth; project main.yaml is intentionally not an operator
@@ -1142,6 +1146,7 @@ class RuntimeSettingsService:
         )
         # A per-message total below the per-file cap is contradictory; lift it.
         max_total_mb = max(max_total_mb, max_file_mb)
+        mode = str(settings.get("learning_coordinator_mode") or "off").strip().lower()
         return {
             "version": 1,
             "version_check_enabled": _coerce_bool(settings.get("version_check_enabled"), True),
@@ -1159,6 +1164,9 @@ class RuntimeSettingsService:
             ),
             "capability_routing_enabled": _coerce_bool(
                 settings.get("capability_routing_enabled"), False
+            ),
+            "learning_coordinator_mode": (
+                mode if mode in {"off", "shadow", "active"} else "off"
             ),
             "web_search_source_filtering": {
                 "enabled": _coerce_bool(source_filter.get("enabled"), True),
