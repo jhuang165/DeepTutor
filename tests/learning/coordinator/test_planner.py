@@ -7,8 +7,9 @@ from deeptutor.learning.coordinator.models import (
     ScopeResult,
     SourcePolicy,
 )
+import deeptutor.learning.coordinator.planner as planner_module
 from deeptutor.learning.coordinator.planner import ActivityPlanner
-from deeptutor.learning.coordinator.recipes import TeachingStrategist
+from deeptutor.learning.coordinator.recipes import TeachingStrategist, load_recipes
 from deeptutor.learning.coordinator.service import (
     LearningCoordinator,
     decision_payload,
@@ -237,6 +238,51 @@ def test_valid_saved_step_is_rebuilt_from_server_recipe(lesson_scope: ScopeResul
     assert decision.activity.assessment_method == "teach_back"
     assert decision.activity.independent_required is True
     assert decision.activity.transfer_required is False
+
+
+def test_saved_activity_resumes_against_retained_older_recipe(
+    lesson_scope: ScopeResult,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    version_one = load_recipes("en")["concept-transfer"]
+    version_two = version_one.model_copy(update={"version": 2})
+
+    class LatestStrategist(TeachingStrategist):
+        def select(self, knowledge_type: KnowledgeType, language: str):
+            assert knowledge_type is KnowledgeType.CONCEPT
+            assert language == "en"
+            return version_two
+
+    def exact_recipe(recipe_id: str, version: int, language: str):
+        assert (recipe_id, version, language) == ("concept-transfer", 1, "en")
+        return version_one
+
+    monkeypatch.setattr(planner_module, "recipe_for_version", exact_recipe, raising=False)
+    decision = ActivityPlanner(LatestStrategist()).plan(
+        lesson_scope,
+        LearningRequest(
+            message="Continue eigenvectors",
+            server_next_activity=ActivityPlan(
+                kind="explanation",
+                objective=lesson_scope.goal,
+                learner_action="Stored copy",
+                recipe_id="concept-transfer",
+                recipe_version=1,
+                recipe_step=2,
+            ),
+        ),
+        {"chat", "mastery_path"},
+    )
+
+    assert decision.activity.recipe_version == 1
+    assert decision.activity.recipe_step == 2
+    assert decision.activity.learner_action == "Explain the concept in your own words."
+
+    next_activity = ActivityPlanner().next_after(decision, "correct")
+
+    assert next_activity.recipe_version == 1
+    assert next_activity.recipe_step == 3
+    assert next_activity.learner_action == "Apply the concept to a new example."
 
 
 def test_saved_objective_must_equal_normalized_current_goal() -> None:

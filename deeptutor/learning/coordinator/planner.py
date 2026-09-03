@@ -14,7 +14,8 @@ from deeptutor.learning.coordinator.models import (
     SourcePolicy,
     TeachingRecipe,
 )
-from deeptutor.learning.coordinator.recipes import TeachingStrategist, load_recipes
+from deeptutor.learning.coordinator.recipes import TeachingStrategist, recipe_for_version
+from deeptutor.learning.models import KnowledgeType
 
 Outcome = Literal["correct", "partial", "incorrect", "unassessed"]
 
@@ -91,13 +92,17 @@ class ActivityPlanner:
             )
             route = "chat"
         else:
-            step = self._validated_saved_step(
+            saved_recipe = self._validated_saved_recipe(
                 request.server_next_activity,
-                recipe=recipe,
+                language=language,
+                knowledge_type=scope.knowledge_type,
                 goal=goal,
             )
-            if step is None:
+            if saved_recipe is None:
                 step = self._initial_step(scope.scope, recipe)
+            else:
+                recipe = saved_recipe
+                step = request.server_next_activity.recipe_step
             activity = self._recipe_activity(
                 recipe,
                 step=step,
@@ -122,9 +127,11 @@ class ActivityPlanner:
         )
 
     def next_after(self, decision: LearningDecision, outcome: Outcome) -> ActivityPlan:
-        recipe = load_recipes(decision.language).get(decision.activity.recipe_id)
-        if recipe is None or recipe.version != decision.activity.recipe_version:
-            raise ValueError("The activity recipe version is unavailable")
+        recipe = recipe_for_version(
+            decision.activity.recipe_id,
+            decision.activity.recipe_version,
+            decision.language,
+        )
         current_step = decision.activity.recipe_step
         if current_step >= len(recipe.activity_sequence):
             raise ValueError("The activity recipe step is out of bounds")
@@ -155,21 +162,24 @@ class ActivityPlanner:
         )
 
     @staticmethod
-    def _validated_saved_step(
+    def _validated_saved_recipe(
         saved: ActivityPlan | None,
         *,
-        recipe: TeachingRecipe,
+        language: Literal["en", "zh"],
+        knowledge_type: KnowledgeType,
         goal: str,
-    ) -> int | None:
-        if saved is None:
+    ) -> TeachingRecipe | None:
+        if saved is None or saved.objective != goal:
+            return None
+        try:
+            recipe = recipe_for_version(saved.recipe_id, saved.recipe_version, language)
+        except ValueError:
             return None
         valid = (
-            saved.recipe_id == recipe.id
-            and saved.recipe_version == recipe.version
+            recipe.knowledge_type == knowledge_type
             and saved.recipe_step < len(recipe.activity_sequence)
-            and saved.objective == goal
         )
-        return saved.recipe_step if valid else None
+        return recipe if valid else None
 
     @staticmethod
     def _recipe_activity(

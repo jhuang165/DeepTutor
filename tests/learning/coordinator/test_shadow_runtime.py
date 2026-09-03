@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 
@@ -51,6 +52,7 @@ def _configure_runtime(
     mode: str,
     auto_route: bool = False,
     coordinator_error: Exception | None = None,
+    orchestrator_outcome: str = "done",
 ) -> None:
     class FakeContextBuilder:
         def __init__(self, *_args, **_kwargs) -> None:
@@ -70,11 +72,18 @@ def _configure_runtime(
             captured["active_capability"] = context.active_capability
             captured["extension_state"] = context.extension_state
             captured["context_metadata"] = context.metadata
+            captured["orchestrator_started"] = True
+            if orchestrator_outcome == "exception":
+                raise RuntimeError("capability failed")
+            if orchestrator_outcome == "cancelled":
+                await asyncio.Event().wait()
             yield StreamEvent(
                 type=StreamEventType.CONTENT,
                 content="ok",
                 metadata={"call_kind": "llm_final_response"},
             )
+            if orchestrator_outcome == "no_done":
+                return
             yield StreamEvent(
                 type=StreamEventType.DONE,
                 source=context.active_capability,
@@ -135,6 +144,7 @@ async def _run_turn(
     mode: str = "shadow",
     auto_route: bool = False,
     coordinator_error: Exception | None = None,
+    orchestrator_outcome: str = "done",
     **overrides: Any,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     _configure_runtime(
@@ -143,6 +153,7 @@ async def _run_turn(
         mode=mode,
         auto_route=auto_route,
         coordinator_error=coordinator_error,
+        orchestrator_outcome=orchestrator_outcome,
     )
     runtime = TurnRuntimeManager(SQLiteSessionStore(tmp_path / "shadow-runtime.db"))
     request = {
@@ -158,6 +169,10 @@ async def _run_turn(
         **overrides,
     }
     session, turn = await runtime.start_turn(request)
+    if orchestrator_outcome == "cancelled":
+        while not captured.get("orchestrator_started"):
+            await asyncio.sleep(0)
+        assert await runtime.cancel_turn(turn["id"]) is True
     events = [
         event async for event in runtime.subscribe_turn(turn["id"], after_seq=0)
     ]
@@ -193,6 +208,58 @@ async def test_shadow_records_decision_without_changing_chat_route(
     assert session["preferences"]["capability"] == "chat"
     assert "learning_decision" not in session["preferences"]
     assert captured["coordinator_payload"]["learning_state"] == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("orchestrator_outcome", "terminal_status"),
+    [
+        ("no_done", "completed"),
+        ("cancelled", "cancelled"),
+        ("exception", "failed"),
+    ],
+    ids=["no-done", "cancellation", "exception"],
+)
+async def test_synthesized_done_preserves_learning_metadata(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    orchestrator_outcome: str,
+    terminal_status: str,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    await _run_turn(
+        tmp_path,
+        monkeypatch,
+        captured,
+        orchestrator_outcome=orchestrator_outcome,
+    )
+
+    assert captured["done_metadata"]["status"] == terminal_status
+    assert captured["done_metadata"]["learning_decision"]["scope"] == "lesson"
+    assert captured["done_metadata"]["learning_decision_status"] == "prepared"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workspace_mode", ["", None], ids=["empty", "null"])
+async def test_empty_workspace_binding_keeps_normal_chat_eligible_for_shadow_coordination(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    workspace_mode: str | None,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    turn, _session = await _run_turn(
+        tmp_path,
+        monkeypatch,
+        captured,
+        workspace_mode=workspace_mode,
+    )
+
+    assert captured.get("coordinator_constructed", 0) == 1
+    assert turn["capability"] == "chat"
+    assert captured["active_capability"] == "chat"
+    assert captured["done_metadata"]["learning_decision_status"] == "prepared"
 
 
 @pytest.mark.asyncio
@@ -238,7 +305,7 @@ async def test_explicit_non_chat_capability_is_not_coordinated(
     [
         {"course_id": "course-1"},
         {"mastery_path_id": "path-1"},
-        {"workspace_mode": "reading"},
+        {"workspace_mode": "immersive_reading"},
         {
             "selection_tutor_context": {
                 "selected_text": "eigenvectors",

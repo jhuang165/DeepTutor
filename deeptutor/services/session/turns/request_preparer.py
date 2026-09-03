@@ -387,7 +387,6 @@ class TurnRequestPreparer:
             requested_capability == "chat"
             and not requested_course_id
             and not payload.get("mastery_path_id")
-            and not workspace_mode_explicit
             and not payload.get("workspace_mode")
             and not payload.get("selection_tutor_context")
         )

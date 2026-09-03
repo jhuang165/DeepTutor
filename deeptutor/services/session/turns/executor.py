@@ -62,6 +62,22 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _decorate_done_event(event: StreamEvent, payload: dict[str, Any]) -> StreamEvent:
+    """Attach runtime-owned routing and learning metadata to every DONE path."""
+    metadata = dict(event.metadata or {})
+    capability_route = payload.get("capability_route")
+    if isinstance(capability_route, dict):
+        metadata["capability_route"] = dict(capability_route)
+    learning_decision = payload.get("learning_decision")
+    if isinstance(learning_decision, dict):
+        metadata["learning_decision"] = dict(learning_decision)
+    learning_decision_status = payload.get("learning_decision_status")
+    if learning_decision_status:
+        metadata["learning_decision_status"] = learning_decision_status
+    event.metadata = metadata
+    return event
+
+
 class TurnExecutor:
     if TYPE_CHECKING:
         store: SessionStoreProtocol
@@ -787,22 +803,6 @@ class TurnExecutor:
                     continue
                 if event.type == StreamEventType.DONE:
                     pending_done_event = event
-                    capability_route = payload.get("capability_route")
-                    if isinstance(capability_route, dict):
-                        pending_done_event.metadata = {
-                            **pending_done_event.metadata,
-                            "capability_route": dict(capability_route),
-                        }
-                    if isinstance(payload.get("learning_decision"), dict):
-                        pending_done_event.metadata = {
-                            **pending_done_event.metadata,
-                            "learning_decision": dict(payload["learning_decision"]),
-                        }
-                    if payload.get("learning_decision_status"):
-                        pending_done_event.metadata = {
-                            **pending_done_event.metadata,
-                            "learning_decision_status": payload["learning_decision_status"],
-                        }
                     continue
                 payload_event = await self._publish_live_event(execution, event)
                 if payload_event.get("type") not in {"done", "session"}:
@@ -928,7 +928,10 @@ class TurnExecutor:
             if not transitioned:
                 execution.lease_lost = True
                 raise asyncio.CancelledError
-            await self._publish_live_event(execution, pending_done_event)
+            await self._publish_live_event(
+                execution,
+                _decorate_done_event(pending_done_event, payload),
+            )
             stream_done_sent = True
             await self._flush_buffered_events(execution)
             if not is_regenerate and turn_status == "completed":
@@ -1030,14 +1033,17 @@ class TurnExecutor:
             if not stream_done_sent and transitioned:
                 await self._publish_live_event(
                     execution,
-                    StreamEvent(
-                        type=StreamEventType.DONE,
-                        source=capability_name,
-                        metadata={
-                            "status": terminal_status,
-                            "error_code": failure_code,
-                            "retryable": retryable,
-                        },
+                    _decorate_done_event(
+                        StreamEvent(
+                            type=StreamEventType.DONE,
+                            source=capability_name,
+                            metadata={
+                                "status": terminal_status,
+                                "error_code": failure_code,
+                                "retryable": retryable,
+                            },
+                        ),
+                        payload,
                     ),
                 )
                 stream_done_sent = True
@@ -1078,10 +1084,13 @@ class TurnExecutor:
                 )
                 await self._publish_live_event(
                     execution,
-                    StreamEvent(
-                        type=StreamEventType.DONE,
-                        source=capability_name,
-                        metadata={"status": "failed"},
+                    _decorate_done_event(
+                        StreamEvent(
+                            type=StreamEventType.DONE,
+                            source=capability_name,
+                            metadata={"status": "failed"},
+                        ),
+                        payload,
                     ),
                 )
                 with contextlib.suppress(Exception):

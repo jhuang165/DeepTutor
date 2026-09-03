@@ -16,6 +16,7 @@ from deeptutor.learning.coordinator.recipes import (
     TeachingStrategist,
     load_recipes,
     recipe_for_knowledge_type,
+    recipe_for_version,
 )
 from deeptutor.learning.coordinator.service import (
     LearningCoordinator,
@@ -41,4 +42,5 @@ __all__ = [
     "learning_request_from_payload",
     "load_recipes",
     "recipe_for_knowledge_type",
+    "recipe_for_version",
 ]
