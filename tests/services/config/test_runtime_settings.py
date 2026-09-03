@@ -66,6 +66,28 @@ def test_capability_routing_defaults_to_disabled(tmp_path) -> None:
     assert service.load_system()["capability_routing_enabled"] is False
 
 
+def test_learning_coordinator_defaults_off(tmp_path) -> None:
+    service = RuntimeSettingsService(settings_dir=tmp_path)
+
+    assert service.load_system()["learning_coordinator_mode"] == "off"
+
+
+def test_learning_coordinator_mode_normalizes_invalid_value(tmp_path) -> None:
+    service = RuntimeSettingsService(settings_dir=tmp_path)
+
+    saved = service.save_system({"learning_coordinator_mode": "invalid"})
+
+    assert saved["learning_coordinator_mode"] == "off"
+
+
+def test_learning_coordinator_mode_normalizes_supported_value(tmp_path) -> None:
+    service = RuntimeSettingsService(settings_dir=tmp_path)
+
+    saved = service.save_system({"learning_coordinator_mode": " SHADOW "})
+
+    assert saved["learning_coordinator_mode"] == "shadow"
+
+
 def test_web_search_source_filter_defaults_to_safe_runtime_json(tmp_path) -> None:
     service = RuntimeSettingsService(tmp_path / "settings")
 
