@@ -150,6 +150,33 @@ def missing_required_args(
     return [*absent, *blank]
 
 
+def unexpected_args(definition: ToolDefinition, args: dict[str, Any]) -> list[str]:
+    """Model keys rejected by an explicitly closed JSON-schema definition.
+
+    Runtime augmenters add private bindings after the model produces its call,
+    so callers must pass the original model arguments here. Open schemas retain
+    their historical permissiveness; only ``additionalProperties: false`` is
+    enforced.
+    """
+
+    raw = definition.raw_parameters
+    if not isinstance(raw, dict) or raw.get("additionalProperties") is not False:
+        return []
+    properties = raw.get("properties")
+    allowed = set(properties) if isinstance(properties, dict) else set()
+    return sorted(str(name) for name in args if name not in allowed)
+
+
+def unexpected_args_message(tool_name: str, unexpected: list[str]) -> str:
+    """Corrective response for model keys outside a closed tool schema."""
+
+    names = ", ".join(f"`{name}`" for name in unexpected)
+    return (
+        f"`{tool_name}` was called with unexpected argument(s): {names}. "
+        "Remove them and re-emit the call using only the declared schema."
+    )
+
+
 def missing_args_message(
     tool_name: str,
     missing: list[RequiredArg],

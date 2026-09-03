@@ -105,6 +105,11 @@ class LearningPathDraftTool(_DefinitionTool):
                 "a mastery path before learner approval."
             ),
             parameters=[],
+            raw_parameters={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {},
+            },
         )
 
     async def execute(self, **kwargs: Any) -> ToolResult:
@@ -202,6 +207,40 @@ class LearningReportAssessmentTool(_DefinitionTool):
                     description="Assessment uncertainty from 0.0 to 1.0.",
                 ),
             ],
+            raw_parameters={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "outcome": {
+                        "type": "string",
+                        "description": "Assessment outcome for this learner attempt.",
+                        "enum": ["correct", "partial", "incorrect"],
+                    },
+                    "rubric": {
+                        "type": "array",
+                        "description": "Criterion results as objects with id and passed.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "passed": {"type": "boolean"},
+                            },
+                            "required": ["id", "passed"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "cited_evidence": {
+                        "type": "array",
+                        "description": "Exact short excerpts from the learner's submitted work.",
+                        "items": {"type": "string"},
+                    },
+                    "uncertainty": {
+                        "type": "number",
+                        "description": "Assessment uncertainty from 0.0 to 1.0.",
+                    },
+                },
+                "required": ["outcome", "rubric", "cited_evidence", "uncertainty"],
+            },
         )
 
     async def execute(self, **kwargs: Any) -> ToolResult:

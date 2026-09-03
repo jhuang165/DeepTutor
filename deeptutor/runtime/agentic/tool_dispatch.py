@@ -36,6 +36,8 @@ from deeptutor.core.trace import (
 )
 from deeptutor.runtime.agentic.tool_arg_guard import (
     missing_args_message,
+    unexpected_args,
+    unexpected_args_message,
     unsatisfied_required_args,
 )
 from deeptutor.runtime.registry.tool_registry import get_tool_registry
@@ -176,6 +178,7 @@ async def dispatch_tool_calls(
             registry=registry,
             tool_name=tool_name,
             exec_args=exec_args,
+            model_args=raw_args[tool_index],
             stream=stream,
             source=source,
             stage=stage,
@@ -346,6 +349,7 @@ async def _reject_if_args_missing(
     registry: ToolLookup,
     tool_name: str,
     exec_args: dict[str, Any],
+    model_args: dict[str, Any],
     stream: StreamBus,
     source: str,
     stage: str,
@@ -370,6 +374,35 @@ async def _reject_if_args_missing(
         return None
     if definition is None:
         return None
+
+    unexpected = unexpected_args(definition, model_args)
+    if unexpected:
+        message = unexpected_args_message(tool_name, unexpected)
+        logger.warning(
+            "Rejected %s before dispatch: unexpected args %s",
+            tool_name,
+            unexpected,
+        )
+        if trace_meta is not None:
+            await stream.progress(
+                f"{tool_name} not dispatched: unexpected {', '.join(unexpected)}",
+                source=source,
+                stage=stage,
+                metadata=derive_trace_metadata(
+                    trace_meta,
+                    trace_kind="call_status",
+                    call_state="error",
+                    error=message,
+                ),
+            )
+        return {
+            "result_text": message,
+            "success": False,
+            "sources": [],
+            "metadata": {"error": "unexpected_arguments"},
+            "terminate_turn": False,
+            "pause_for_user": None,
+        }
 
     absent, blank = unsatisfied_required_args(definition, exec_args)
     if not absent and not blank:

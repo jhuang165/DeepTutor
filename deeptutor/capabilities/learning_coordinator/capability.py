@@ -59,7 +59,7 @@ class LearningCoordinatorLoopCapability:
         try:
             return LearningDecision.model_validate(raw)
         except (TypeError, ValidationError):
-            logger.warning("Ignoring invalid Learning Coordinator decision", exc_info=True)
+            logger.warning("Ignoring invalid Learning Coordinator decision")
             return None
 
     def is_active(self, context: UnifiedContext) -> bool:
