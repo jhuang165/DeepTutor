@@ -4,7 +4,7 @@ from enum import Enum
 import time
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 _KNOWLEDGE_TYPE_LEGACY: dict[str, str] = {
     "记忆型": "memory",
@@ -75,6 +75,69 @@ class LearningStage(str, Enum):
     def _missing_(cls, value: object) -> LearningStage | None:
         mapped = _STAGE_LEGACY.get(str(value))
         return cls(mapped) if mapped else None
+
+
+class LearningThreadStatus(str, Enum):
+    DRAFT = "draft"
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    ARCHIVED = "archived"
+
+
+class EvidenceOutcome(str, Enum):
+    CORRECT = "correct"
+    PARTIAL = "partial"
+    INCORRECT = "incorrect"
+    UNASSESSED = "unassessed"
+
+
+class LearningThread(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    thread_id: str
+    session_id: str
+    scope: Literal["lesson", "path"]
+    goal: str
+    status: LearningThreadStatus
+    path_id: str = ""
+    course_id: str = ""
+    source_refs: list[str] = Field(default_factory=list)
+    next_activity: dict[str, Any] = Field(default_factory=dict)
+    created_at: float = Field(default_factory=time.time)
+    updated_at: float = Field(default_factory=time.time)
+
+
+class EvidenceRecord(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    evidence_id: str
+    thread_id: str
+    path_id: str = ""
+    objective_id: str = ""
+    activity_kind: str
+    recipe_id: str
+    recipe_version: int = Field(ge=1)
+    response: str = Field(default="", max_length=8_000)
+    response_ref: str = ""
+    artifact_ref: str = ""
+    outcome: EvidenceOutcome
+    help_level: int = Field(ge=0, le=4)
+    independent: bool = False
+    transfer: bool = False
+    rubric: list[dict[str, Any]] = Field(default_factory=list)
+    cited_evidence: list[str] = Field(default_factory=list)
+    uncertainty: float = Field(default=1.0, ge=0.0, le=1.0)
+    source_refs: list[str] = Field(default_factory=list)
+    session_id: str
+    turn_id: str
+    created_at: float = Field(default_factory=time.time)
+    removed_at: float | None = None
+
+    @model_validator(mode="after")
+    def validate_independence(self) -> "EvidenceRecord":
+        if self.help_level >= 3 and self.independent:
+            raise ValueError("Guided work cannot count as independent")
+        return self
 
 
 class KnowledgePoint(BaseModel):
@@ -325,6 +388,7 @@ class LearningProgress(BaseModel):
     # tutor judges the learner's explanation sufficient (``mastery_assess``).
     # The quantitative ``mastery_levels`` gate covers MEMORY / PROCEDURE.
     qualitative_mastery: dict[str, bool] = Field(default_factory=dict)
+    evidence_mastery: dict[str, bool] = Field(default_factory=dict)
     knowledge_types: dict[str, KnowledgeType] = Field(default_factory=dict)
     quiz_attempts: list[QuizAttempt] = Field(default_factory=list)
     error_records: list[ErrorRecord] = Field(default_factory=list)
@@ -350,6 +414,10 @@ __all__ = [
     "KnowledgeType",
     "ErrorType",
     "LearningStage",
+    "LearningThreadStatus",
+    "EvidenceOutcome",
+    "LearningThread",
+    "EvidenceRecord",
     "KnowledgePoint",
     "LearningModule",
     "DiagnosticResult",

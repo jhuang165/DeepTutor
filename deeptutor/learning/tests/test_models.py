@@ -1,14 +1,19 @@
 import time
 
+from pydantic import ValidationError
+import pytest
+
 from deeptutor.learning.models import (
     DiagnosticResult,
     ErrorRecord,
     ErrorType,
+    EvidenceRecord,
     KnowledgePoint,
     KnowledgeType,
     LearningModule,
     LearningProgress,
     LearningStage,
+    LearningThread,
     PendingQuestion,
     QuizAttempt,
     RepetitionState,
@@ -302,3 +307,31 @@ class TestSerializationRoundtrip:
         er2 = ErrorRecord.model_validate(data)
         assert er2.error_type == ErrorType.APPLICATION_ERROR
         assert er2.status == "active"
+
+
+def test_learning_thread_round_trip() -> None:
+    thread = LearningThread(
+        thread_id="thread-1",
+        session_id="session-1",
+        scope="lesson",
+        goal="Understand eigenvectors",
+        status="active",
+    )
+    assert LearningThread.model_validate_json(thread.model_dump_json()) == thread
+
+
+def test_evidence_rejects_complete_answer_as_independent() -> None:
+    with pytest.raises(ValidationError):
+        EvidenceRecord(
+            evidence_id="ev-1",
+            thread_id="thread-1",
+            activity_kind="guided_attempt",
+            recipe_id="procedure-fading",
+            recipe_version=1,
+            outcome="correct",
+            help_level=4,
+            independent=True,
+            transfer=False,
+            session_id="session-1",
+            turn_id="turn-1",
+        )

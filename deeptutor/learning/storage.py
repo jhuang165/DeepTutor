@@ -28,8 +28,11 @@ from typing import Any, TypeVar
 from pydantic import ValidationError
 
 from deeptutor.learning.models import (
+    EvidenceRecord,
     InteractionStatus,
     LearningProgress,
+    LearningThread,
+    LearningThreadStatus,
     MasteryEvent,
     MasteryInteraction,
     MasteryPathLease,
@@ -456,6 +459,42 @@ class LearningStore:
                     );
                     CREATE INDEX IF NOT EXISTS idx_mastery_topic_sources_path
                         ON mastery_topic_sources(path_id, position);
+
+                    CREATE TABLE IF NOT EXISTS learning_threads (
+                        thread_id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL,
+                        scope TEXT NOT NULL,
+                        goal TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        path_id TEXT NOT NULL DEFAULT '',
+                        course_id TEXT NOT NULL DEFAULT '',
+                        source_refs_json TEXT NOT NULL DEFAULT '[]',
+                        next_activity_json TEXT NOT NULL DEFAULT '{}',
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_learning_threads_session
+                        ON learning_threads(session_id, updated_at DESC);
+
+                    CREATE TABLE IF NOT EXISTS learning_evidence (
+                        evidence_id TEXT PRIMARY KEY,
+                        thread_id TEXT NOT NULL REFERENCES learning_threads(thread_id),
+                        payload_json TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        removed_at REAL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_learning_evidence_thread
+                        ON learning_evidence(thread_id, created_at ASC);
+
+                    CREATE TABLE IF NOT EXISTS learning_audit_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        thread_id TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        payload_json TEXT NOT NULL DEFAULT '{}',
+                        session_id TEXT NOT NULL DEFAULT '',
+                        turn_id TEXT NOT NULL DEFAULT '',
+                        created_at REAL NOT NULL
+                    );
                     """
                 )
                 # V2 metadata is a persisted part of every topic, not a
@@ -501,6 +540,71 @@ class LearningStore:
             yield conn
         finally:
             conn.close()
+
+    @contextmanager
+    def _transaction(self) -> Iterator[sqlite3.Connection]:
+        """Run one learning-thread/evidence mutation atomically."""
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    @staticmethod
+    def _learning_thread_from_row(row: sqlite3.Row | None) -> LearningThread | None:
+        if row is None:
+            return None
+        return LearningThread(
+            thread_id=row["thread_id"],
+            session_id=row["session_id"],
+            scope=row["scope"],
+            goal=row["goal"],
+            status=LearningThreadStatus(row["status"]),
+            path_id=row["path_id"] or "",
+            course_id=row["course_id"] or "",
+            source_refs=json.loads(row["source_refs_json"] or "[]"),
+            next_activity=json.loads(row["next_activity_json"] or "{}"),
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _evidence_from_row(row: sqlite3.Row | None) -> EvidenceRecord | None:
+        if row is None:
+            return None
+        record = EvidenceRecord.model_validate_json(row["payload_json"])
+        record.removed_at = float(row["removed_at"]) if row["removed_at"] is not None else None
+        return record
+
+    @staticmethod
+    def _append_learning_event(
+        conn: sqlite3.Connection,
+        thread_id: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        session_id: str = "",
+        turn_id: str = "",
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO learning_audit_events (
+                thread_id, event_type, payload_json, session_id, turn_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                thread_id,
+                event_type,
+                json.dumps(payload or {}, ensure_ascii=False),
+                session_id,
+                turn_id,
+                time.time(),
+            ),
+        )
 
     @staticmethod
     def _progress_from_row(row: sqlite3.Row) -> LearningProgress:
@@ -907,6 +1011,236 @@ class LearningStore:
             path.stem for path in Path(self._root).glob("*.json") if not path.name.startswith(".")
         }
         return sorted(stored | legacy)
+
+    # ---- durable learning threads and evidence -------------------------
+
+    def create_learning_thread(self, thread: LearningThread) -> LearningThread:
+        """Persist a learning thread and its creation audit event together."""
+
+        with self._transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO learning_threads (
+                    thread_id, session_id, scope, goal, status, path_id, course_id,
+                    source_refs_json, next_activity_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    thread.thread_id,
+                    thread.session_id,
+                    thread.scope,
+                    thread.goal,
+                    thread.status.value,
+                    thread.path_id,
+                    thread.course_id,
+                    json.dumps(thread.source_refs, ensure_ascii=False),
+                    json.dumps(thread.next_activity, ensure_ascii=False),
+                    thread.created_at,
+                    thread.updated_at,
+                ),
+            )
+            self._append_learning_event(
+                conn,
+                thread.thread_id,
+                "thread.created",
+                session_id=thread.session_id,
+            )
+        created = self.get_learning_thread(thread.thread_id)
+        if created is None:  # pragma: no cover - committed insert guarantees this row
+            raise LearningStoreError(f"Failed to persist learning thread: {thread.thread_id}")
+        return created
+
+    def get_learning_thread(self, thread_id: str) -> LearningThread | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM learning_threads WHERE thread_id = ?", (str(thread_id),)
+            ).fetchone()
+        return self._learning_thread_from_row(row)
+
+    def list_learning_threads(
+        self,
+        session_id: str = "",
+        *,
+        status: LearningThreadStatus | str | None = None,
+    ) -> list[LearningThread]:
+        clauses: list[str] = []
+        params: list[str] = []
+        if session_id:
+            clauses.append("session_id = ?")
+            params.append(str(session_id))
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(
+                status.value if isinstance(status, LearningThreadStatus) else str(status)
+            )
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM learning_threads{where} ORDER BY updated_at DESC, thread_id ASC",
+                params,
+            ).fetchall()
+        threads = (self._learning_thread_from_row(row) for row in rows)
+        return [thread for thread in threads if thread is not None]
+
+    def set_learning_thread_next_activity(
+        self, thread_id: str, next_activity: dict[str, Any]
+    ) -> LearningThread:
+        thread_id = str(thread_id)
+        now = time.time()
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT session_id FROM learning_threads WHERE thread_id = ?", (thread_id,)
+            ).fetchone()
+            if row is None:
+                raise LearningStoreError(f"Unknown learning thread: {thread_id}")
+            conn.execute(
+                """
+                UPDATE learning_threads
+                SET next_activity_json = ?, updated_at = ?
+                WHERE thread_id = ?
+                """,
+                (json.dumps(next_activity, ensure_ascii=False), now, thread_id),
+            )
+            self._append_learning_event(
+                conn,
+                thread_id,
+                "thread.next_activity",
+                {"next_activity": next_activity},
+                session_id=str(row["session_id"]),
+            )
+        updated = self.get_learning_thread(thread_id)
+        if updated is None:  # pragma: no cover - committed update guarantees this row
+            raise LearningStoreError(f"Unknown learning thread: {thread_id}")
+        return updated
+
+    def complete_learning_thread(self, thread_id: str) -> LearningThread:
+        thread_id = str(thread_id)
+        now = time.time()
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT session_id FROM learning_threads WHERE thread_id = ?", (thread_id,)
+            ).fetchone()
+            if row is None:
+                raise LearningStoreError(f"Unknown learning thread: {thread_id}")
+            conn.execute(
+                """
+                UPDATE learning_threads
+                SET status = ?, updated_at = ?
+                WHERE thread_id = ?
+                """,
+                (LearningThreadStatus.COMPLETED.value, now, thread_id),
+            )
+            self._append_learning_event(
+                conn,
+                thread_id,
+                "thread.completed",
+                session_id=str(row["session_id"]),
+            )
+        completed = self.get_learning_thread(thread_id)
+        if completed is None:  # pragma: no cover - committed update guarantees this row
+            raise LearningStoreError(f"Unknown learning thread: {thread_id}")
+        return completed
+
+    def get_evidence(self, evidence_id: str) -> EvidenceRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM learning_evidence WHERE evidence_id = ?", (str(evidence_id),)
+            ).fetchone()
+        return self._evidence_from_row(row)
+
+    def append_evidence(self, record: EvidenceRecord) -> EvidenceRecord:
+        with self._transaction() as conn:
+            if conn.execute(
+                "SELECT 1 FROM learning_threads WHERE thread_id = ?", (record.thread_id,)
+            ).fetchone() is None:
+                raise LearningStoreError(f"Unknown learning thread: {record.thread_id}")
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO learning_evidence (
+                    evidence_id, thread_id, payload_json, created_at, removed_at
+                ) VALUES (?, ?, ?, ?, NULL)
+                """,
+                (
+                    record.evidence_id,
+                    record.thread_id,
+                    record.model_dump_json(),
+                    record.created_at,
+                ),
+            )
+            if cursor.rowcount == 1:
+                self._append_learning_event(
+                    conn,
+                    record.thread_id,
+                    "evidence.appended",
+                    {"evidence_id": record.evidence_id},
+                    session_id=record.session_id,
+                    turn_id=record.turn_id,
+                )
+        stored = self.get_evidence(record.evidence_id)
+        if stored is None:  # pragma: no cover - committed insert guarantees this row
+            raise LearningStoreError(f"Failed to persist evidence: {record.evidence_id}")
+        return stored
+
+    def list_evidence(
+        self,
+        *,
+        thread_id: str = "",
+        path_id: str = "",
+        objective_id: str = "",
+        include_removed: bool = False,
+    ) -> list[EvidenceRecord]:
+        clauses: list[str] = []
+        params: list[str] = []
+        if thread_id:
+            clauses.append("thread_id = ?")
+            params.append(str(thread_id))
+        if not include_removed:
+            clauses.append("removed_at IS NULL")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM learning_evidence{where} ORDER BY created_at ASC, evidence_id ASC",
+                params,
+            ).fetchall()
+        records = (self._evidence_from_row(row) for row in rows)
+        return [
+            record
+            for record in records
+            if record is not None
+            and (not path_id or record.path_id == path_id)
+            and (not objective_id or record.objective_id == objective_id)
+        ]
+
+    def remove_evidence(self, evidence_id: str) -> EvidenceRecord | None:
+        evidence_id = str(evidence_id)
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM learning_evidence WHERE evidence_id = ?", (evidence_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            record = self._evidence_from_row(row)
+            if record is None:  # pragma: no cover - row was present
+                return None
+            removed_at = time.time()
+            cursor = conn.execute(
+                """
+                UPDATE learning_evidence
+                SET removed_at = ?
+                WHERE evidence_id = ? AND removed_at IS NULL
+                """,
+                (removed_at, evidence_id),
+            )
+            if cursor.rowcount == 1:
+                self._append_learning_event(
+                    conn,
+                    record.thread_id,
+                    "evidence.removed",
+                    {"evidence_id": evidence_id},
+                    session_id=record.session_id,
+                    turn_id=record.turn_id,
+                )
+        return self.get_evidence(evidence_id)
 
     # ---- product topic metadata -----------------------------------------
 
