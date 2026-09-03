@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection
+import sqlite3
 from types import SimpleNamespace
 from typing import Any
 
@@ -11,7 +12,14 @@ from deeptutor.core.context import UnifiedContext
 from deeptutor.learning.coordinator import models as coordinator_models
 from deeptutor.learning.coordinator.models import ActivityPlan, LearningDecision
 from deeptutor.learning.coordinator.service import LearningCoordinator
-from deeptutor.learning.models import EvidenceOutcome, LearningThread
+from deeptutor.learning.models import (
+    EvidenceOutcome,
+    KnowledgePoint,
+    KnowledgeType,
+    LearningModule,
+    LearningThread,
+)
+from deeptutor.learning.service import LearningService
 from deeptutor.learning.storage import LearningStore
 from deeptutor.services.session.turns import executor as turn_executor
 
@@ -73,6 +81,11 @@ def _valid_result(**updates: Any):
         **updates,
     }
     return coordinator_models.CapabilityLearningResult.model_validate(payload)
+
+
+def _audit_event_types(store: LearningStore) -> list[str]:
+    with sqlite3.connect(store.db_path) as conn:
+        return [row[0] for row in conn.execute("SELECT event_type FROM learning_audit_events")]
 
 
 @pytest.fixture
@@ -187,6 +200,73 @@ async def test_finish_is_idempotent_by_turn_and_objective(
     assert first is not None and second is not None
     assert first.evidence_id == second.evidence_id == "c1286eb1505726eb0145385ce3125510"
     assert len(store.list_evidence(thread_id=first.thread_id)) == 1
+    assert _audit_event_types(store) == [
+        "thread.created",
+        "evidence.appended",
+        "thread.next_activity",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_path_replay_skips_mastery_recalculation_and_next_activity_audit(
+    store: LearningStore, learning_service: RecordingLearningService
+) -> None:
+    LearningService(store).replace_modules_for_path(
+        "path-1",
+        [
+            LearningModule(
+                id="module-1",
+                name="Linear algebra",
+                order=0,
+                knowledge_points=[
+                    KnowledgePoint(
+                        id="objective-1",
+                        name="Eigenvectors",
+                        type=KnowledgeType.CONCEPT,
+                        module_id="module-1",
+                    )
+                ],
+            )
+        ],
+    )
+    store.create_learning_thread(
+        LearningThread(
+            thread_id="path-thread",
+            session_id="s",
+            scope="lesson",
+            goal="Understand eigenvectors",
+            status="active",
+            path_id="path-1",
+        )
+    )
+    coordinator = LearningCoordinator(store=store, learning_service=learning_service)
+    decision = _decision(thread_id="path-thread")
+    result = _valid_result()
+
+    first = await coordinator.finish(
+        decision,
+        result,
+        session_id="s",
+        turn_id="t",
+        learner_response="It keeps its direction.",
+        allowed_source_refs=set(),
+    )
+    second = await coordinator.finish(
+        decision,
+        result,
+        session_id="s",
+        turn_id="t",
+        learner_response="It keeps its direction.",
+        allowed_source_refs=set(),
+    )
+
+    assert first == second
+    assert learning_service.recalculations == [("path-1", "objective-1")]
+    assert _audit_event_types(store) == [
+        "thread.created",
+        "evidence.appended",
+        "thread.next_activity",
+    ]
 
 
 @pytest.mark.asyncio
@@ -208,12 +288,32 @@ async def test_long_response_keeps_durable_turn_reference(
 
 
 @pytest.mark.asyncio
-async def test_finish_drops_unverified_source_ids(
-    coordinator: LearningCoordinator, caplog: pytest.LogCaptureFixture
+async def test_long_regenerated_response_keeps_original_user_artifact_reference(
+    coordinator: LearningCoordinator,
 ) -> None:
     record = await coordinator.finish(
         _decision(),
-        _valid_result(source_refs=["attached-1", "invented-9"]),
+        coordinator_models.CapabilityLearningResult(),
+        session_id="s",
+        turn_id="regenerated-turn",
+        learner_response="x" * 8_001,
+        learner_response_ref="chat-message:42:user",
+        allowed_source_refs=set(),
+    )
+
+    assert record is not None
+    assert record.response_ref == "chat-message:42:user"
+    assert len(record.response) == 8_000
+
+
+@pytest.mark.asyncio
+async def test_finish_drops_unverified_source_ids(
+    coordinator: LearningCoordinator, caplog: pytest.LogCaptureFixture
+) -> None:
+    private_rejected_source = "private learner text disguised as a source id"
+    record = await coordinator.finish(
+        _decision(),
+        _valid_result(source_refs=["attached-1", private_rejected_source]),
         session_id="s",
         turn_id="t",
         learner_response="It keeps its direction. PRIVATE LEARNER TEXT",
@@ -222,7 +322,8 @@ async def test_finish_drops_unverified_source_ids(
 
     assert record is not None
     assert record.source_refs == ["attached-1"]
-    assert "invented-9" in caplog.text
+    assert "dropped_count=1" in caplog.text
+    assert private_rejected_source not in caplog.text
     assert "PRIVATE LEARNER TEXT" not in caplog.text
 
 
@@ -230,6 +331,24 @@ async def test_finish_drops_unverified_source_ids(
 async def test_finish_derives_labels_and_next_activity_server_side(
     store: LearningStore, learning_service: RecordingLearningService
 ) -> None:
+    LearningService(store).replace_modules_for_path(
+        "path-1",
+        [
+            LearningModule(
+                id="module-1",
+                name="Linear algebra",
+                order=0,
+                knowledge_points=[
+                    KnowledgePoint(
+                        id="objective-1",
+                        name="Eigenvectors",
+                        type=KnowledgeType.CONCEPT,
+                        module_id="module-1",
+                    )
+                ],
+            )
+        ],
+    )
     store.create_learning_thread(
         LearningThread(
             thread_id="path-thread",
@@ -277,7 +396,7 @@ async def test_finish_saves_next_activity_only_after_evidence_append(
     def fail_append(_record):
         raise RuntimeError("append failed")
 
-    monkeypatch.setattr(store, "append_evidence", fail_append)
+    monkeypatch.setattr(store, "append_evidence_if_absent", fail_append)
 
     with pytest.raises(RuntimeError, match="append failed"):
         await coordinator.finish(
@@ -293,6 +412,151 @@ async def test_finish_saves_next_activity_only_after_evidence_append(
     assert thread is not None
     assert thread.next_activity == {}
     assert learning_service.recalculations == []
+
+
+async def _assert_thread_rejected_before_mutation(
+    store: LearningStore,
+    learning_service: RecordingLearningService,
+    thread: LearningThread,
+    *,
+    error: str,
+) -> None:
+    store.create_learning_thread(thread)
+    coordinator = LearningCoordinator(store=store, learning_service=learning_service)
+
+    with pytest.raises(ValueError, match=error):
+        await coordinator.finish(
+            _decision(thread_id=thread.thread_id),
+            _valid_result(),
+            session_id="s",
+            turn_id="t",
+            learner_response="It keeps its direction.",
+            allowed_source_refs=set(),
+        )
+
+    assert store.list_evidence(thread_id=thread.thread_id) == []
+    assert store.get_learning_thread(thread.thread_id).next_activity == {}
+    assert learning_service.recalculations == []
+
+
+@pytest.mark.asyncio
+async def test_finish_rejects_thread_owned_by_another_session_before_mutation(
+    store: LearningStore, learning_service: RecordingLearningService
+) -> None:
+    await _assert_thread_rejected_before_mutation(
+        store,
+        learning_service,
+        LearningThread(
+            thread_id="thread-1",
+            session_id="other-session",
+            scope="lesson",
+            goal="Understand eigenvectors",
+            status="active",
+        ),
+        error="session",
+    )
+
+
+@pytest.mark.asyncio
+async def test_finish_rejects_thread_for_another_goal_before_mutation(
+    store: LearningStore, learning_service: RecordingLearningService
+) -> None:
+    await _assert_thread_rejected_before_mutation(
+        store,
+        learning_service,
+        LearningThread(
+            thread_id="thread-1",
+            session_id="s",
+            scope="lesson",
+            goal="Understand determinants",
+            status="active",
+        ),
+        error="goal",
+    )
+
+
+@pytest.mark.asyncio
+async def test_finish_rejects_non_active_thread_before_mutation(
+    store: LearningStore, learning_service: RecordingLearningService
+) -> None:
+    await _assert_thread_rejected_before_mutation(
+        store,
+        learning_service,
+        LearningThread(
+            thread_id="thread-1",
+            session_id="s",
+            scope="lesson",
+            goal="Understand eigenvectors",
+            status="completed",
+        ),
+        error="active",
+    )
+
+
+@pytest.mark.asyncio
+async def test_finish_rejects_non_lesson_thread_before_mutation(
+    store: LearningStore, learning_service: RecordingLearningService
+) -> None:
+    await _assert_thread_rejected_before_mutation(
+        store,
+        learning_service,
+        LearningThread(
+            thread_id="thread-1",
+            session_id="s",
+            scope="path",
+            goal="Understand eigenvectors",
+            status="active",
+        ),
+        error="lesson",
+    )
+
+
+@pytest.mark.asyncio
+async def test_finish_rejects_objective_not_bound_to_thread_path_before_append(
+    store: LearningStore,
+) -> None:
+    LearningService(store).replace_modules_for_path(
+        "path-1",
+        [
+            LearningModule(
+                id="module-1",
+                name="Linear algebra",
+                order=0,
+                knowledge_points=[
+                    KnowledgePoint(
+                        id="objective-1",
+                        name="Eigenvectors",
+                        type=KnowledgeType.CONCEPT,
+                        module_id="module-1",
+                    )
+                ],
+            )
+        ],
+    )
+    store.create_learning_thread(
+        LearningThread(
+            thread_id="path-thread",
+            session_id="s",
+            scope="lesson",
+            goal="Understand eigenvectors",
+            status="active",
+            path_id="path-1",
+        )
+    )
+    coordinator = LearningCoordinator(store=store)
+
+    with pytest.raises(ValueError, match="objective"):
+        await coordinator.finish(
+            _decision(thread_id="path-thread", objective_id="missing-objective"),
+            _valid_result(),
+            session_id="s",
+            turn_id="t",
+            learner_response="It keeps its direction.",
+            allowed_source_refs=set(),
+        )
+
+    assert store.list_evidence(thread_id="path-thread") == []
+    assert store.get_learning_thread("path-thread").next_activity == {}
 
 
 def test_trusted_source_ids_come_only_from_resolved_turn_state() -> None:
@@ -340,6 +604,7 @@ async def test_executor_finalization_uses_raw_message_and_preserves_done_on_fail
             turn_id: str,
             learner_response: str,
             allowed_source_refs: Collection[str],
+            learner_response_ref: str = "",
         ) -> None:
             captured.update(
                 learner_response=learner_response,
@@ -348,6 +613,7 @@ async def test_executor_finalization_uses_raw_message_and_preserves_done_on_fail
                 result=result,
                 session_id=session_id,
                 turn_id=turn_id,
+                learner_response_ref=learner_response_ref,
             )
             raise RuntimeError("finalization failed")
 

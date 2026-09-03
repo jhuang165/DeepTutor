@@ -82,6 +82,12 @@ def _configure_runtime(
                 content="ok",
                 metadata={"call_kind": "llm_final_response"},
             )
+            if orchestrator_outcome == "learning_result":
+                context.extension("learning_coordinator")["result"] = {
+                    "artifact_ref": "",
+                    "assessment": None,
+                    "source_refs": [],
+                }
             if orchestrator_outcome == "no_done":
                 return
             yield StreamEvent(
@@ -101,6 +107,10 @@ def _configure_runtime(
             if coordinator_error is not None:
                 raise coordinator_error
             return _decision()
+
+        async def finish(self, *_args, **kwargs):
+            captured["finish_calls"] = captured.get("finish_calls", 0) + 1
+            captured.setdefault("finish_kwargs", []).append(dict(kwargs))
 
     selected_config = LLMConfig(model="learner-model", api_key="test-key")
 
@@ -173,9 +183,7 @@ async def _run_turn(
         while not captured.get("orchestrator_started"):
             await asyncio.sleep(0)
         assert await runtime.cancel_turn(turn["id"]) is True
-    events = [
-        event async for event in runtime.subscribe_turn(turn["id"], after_seq=0)
-    ]
+    events = [event async for event in runtime.subscribe_turn(turn["id"], after_seq=0)]
     captured["session_metadata"] = next(
         event["metadata"] for event in events if event["type"] == "session"
     )
@@ -364,6 +372,93 @@ async def test_coordinator_failure_keeps_chat_turn_successful(
 
 
 @pytest.mark.asyncio
+async def test_lost_terminal_lease_does_not_finalize_learning_evidence(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+    _configure_runtime(
+        monkeypatch,
+        captured,
+        mode="shadow",
+        orchestrator_outcome="learning_result",
+    )
+    runtime = TurnRuntimeManager(SQLiteSessionStore(tmp_path / "lost-lease.db"))
+
+    async def lose_terminal_lease(*_args, **_kwargs) -> bool:
+        captured["terminal_transition_calls"] = 1
+        return False
+
+    monkeypatch.setattr(runtime, "_transition_execution", lose_terminal_lease)
+    _session, turn = await runtime.start_turn(
+        {
+            "content": "Help me understand eigenvectors",
+            "capability": "chat",
+            "tools": [],
+            "knowledge_bases": [],
+            "attachments": [],
+            "language": "en",
+            "config": {},
+        }
+    )
+
+    events = [event async for event in runtime.subscribe_turn(turn["id"], after_seq=0)]
+
+    assert captured["terminal_transition_calls"] == 1
+    assert captured.get("finish_calls", 0) == 0
+    assert not any(event["type"] == "done" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_regeneration_finalization_references_original_persisted_user(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+    _configure_runtime(
+        monkeypatch,
+        captured,
+        mode="shadow",
+        orchestrator_outcome="learning_result",
+    )
+    store = SQLiteSessionStore(tmp_path / "regenerated-evidence.db")
+    runtime = TurnRuntimeManager(store)
+    session = await store.create_session()
+    learner_response = "x" * 8_001
+    original_user_id = await store.add_message(
+        session["id"],
+        role="user",
+        content=learner_response,
+        capability="chat",
+    )
+
+    _session, turn = await runtime.start_turn(
+        {
+            "session_id": session["id"],
+            "content": learner_response,
+            "capability": "chat",
+            "tools": [],
+            "knowledge_bases": [],
+            "attachments": [],
+            "language": "en",
+            "config": {},
+            "persist_user_message": False,
+            "regenerate": True,
+            "regenerated_from_message_id": original_user_id,
+        }
+    )
+    events = [event async for event in runtime.subscribe_turn(turn["id"], after_seq=0)]
+
+    assert any(event["type"] == "done" for event in events)
+    assert captured["finish_kwargs"][-1]["learner_response"] == learner_response
+    assert captured["finish_kwargs"][-1]["learner_response_ref"] == (
+        f"chat-message:{original_user_id}:user"
+    )
+    messages = await store.get_messages(session["id"])
+    assert [message["id"] for message in messages if message["role"] == "user"] == [
+        original_user_id
+    ]
+
+
+@pytest.mark.asyncio
 async def test_explicit_quiz_auto_route_keeps_precedence_in_shadow(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -435,9 +530,7 @@ async def test_non_admin_coordinator_uses_resolved_assigned_model(
         "deeptutor.services.model_selection.apply_llm_selection_to_catalog",
         lambda _catalog, _selection: None,
     )
-    monkeypatch.setattr(
-        "deeptutor.multi_user.tool_access.allowed_optional_tools", lambda: None
-    )
+    monkeypatch.setattr("deeptutor.multi_user.tool_access.allowed_optional_tools", lambda: None)
     monkeypatch.setattr(
         "deeptutor.multi_user.learning_access.apply_learning_policy", lambda payload: payload
     )

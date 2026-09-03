@@ -1070,9 +1070,7 @@ class LearningStore:
             params.append(str(session_id))
         if status is not None:
             clauses.append("status = ?")
-            params.append(
-                status.value if isinstance(status, LearningThreadStatus) else str(status)
-            )
+            params.append(status.value if isinstance(status, LearningThreadStatus) else str(status))
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._connect() as conn:
             rows = conn.execute(
@@ -1149,6 +1147,12 @@ class LearningStore:
         return self._evidence_from_row(row)
 
     def append_evidence(self, record: EvidenceRecord) -> EvidenceRecord:
+        stored, _inserted = self.append_evidence_if_absent(record)
+        return stored
+
+    def append_evidence_if_absent(self, record: EvidenceRecord) -> tuple[EvidenceRecord, bool]:
+        """Append evidence and report whether this transaction inserted it."""
+
         with self._transaction() as conn:
             thread_row = conn.execute(
                 "SELECT path_id FROM learning_threads WHERE thread_id = ?", (record.thread_id,)
@@ -1181,10 +1185,11 @@ class LearningStore:
                     session_id=record.session_id,
                     turn_id=record.turn_id,
                 )
+            inserted = cursor.rowcount == 1
         stored = self.get_evidence(record.evidence_id)
         if stored is None:  # pragma: no cover - committed insert guarantees this row
             raise LearningStoreError(f"Failed to persist evidence: {record.evidence_id}")
-        return stored
+        return stored, inserted
 
     def list_evidence(
         self,

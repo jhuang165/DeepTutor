@@ -109,6 +109,7 @@ async def _finalize_learning_evidence(
     source_index: Mapping[str, object],
     attachment_records: Collection[Mapping[str, object]],
     done_metadata: dict[str, Any],
+    learner_response_ref: str = "",
 ) -> None:
     """Finalize optional learning evidence without failing a completed answer."""
 
@@ -138,6 +139,7 @@ async def _finalize_learning_evidence(
                 attachment_records,
                 context.capability_output.event_metadata,
             ),
+            learner_response_ref=learner_response_ref,
         )
     except Exception as exc:
         logger.warning(
@@ -1005,16 +1007,6 @@ class TurnExecutor:
             }
             if persisted_ids:
                 pending_done_event.metadata = {**pending_done_event.metadata, **persisted_ids}
-            if turn_status == "completed":
-                await _finalize_learning_evidence(
-                    context,
-                    session_id=session_id,
-                    turn_id=turn_id,
-                    raw_user_content=raw_user_content,
-                    source_index=source_index,
-                    attachment_records=attachment_records,
-                    done_metadata=pending_done_event.metadata,
-                )
             # Commit all non-terminal events and the terminal row before DONE
             # becomes visible. The DONE envelope itself is then appended and
             # synchronously flushed, so a reconnect can never observe a
@@ -1024,6 +1016,24 @@ class TurnExecutor:
             if not transitioned:
                 execution.lease_lost = True
                 raise asyncio.CancelledError
+            if turn_status == "completed":
+                regenerated_user_message_id = _nonempty_id(
+                    payload.get("regenerated_from_message_id")
+                )
+                await _finalize_learning_evidence(
+                    context,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    raw_user_content=raw_user_content,
+                    source_index=source_index,
+                    attachment_records=attachment_records,
+                    done_metadata=pending_done_event.metadata,
+                    learner_response_ref=(
+                        f"chat-message:{regenerated_user_message_id}:user"
+                        if is_regenerate and regenerated_user_message_id
+                        else ""
+                    ),
+                )
             await self._publish_live_event(
                 execution,
                 _decorate_done_event(pending_done_event, payload),

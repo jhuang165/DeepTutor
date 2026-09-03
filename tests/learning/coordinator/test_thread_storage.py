@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import sqlite3
 
 import pytest
@@ -47,7 +48,9 @@ def _audit_event_types(store: LearningStore) -> list[str]:
         return [row[0] for row in conn.execute("SELECT event_type FROM learning_audit_events")]
 
 
-def test_learning_thread_round_trip_and_lifecycle(store: LearningStore, thread: LearningThread) -> None:
+def test_learning_thread_round_trip_and_lifecycle(
+    store: LearningStore, thread: LearningThread
+) -> None:
     created = store.create_learning_thread(thread)
 
     assert created == thread
@@ -74,7 +77,9 @@ def test_append_evidence_requires_an_existing_thread(store: LearningStore) -> No
         store.append_evidence(_record())
 
 
-def test_append_evidence_requires_the_thread_path_to_match(store: LearningStore, thread: LearningThread) -> None:
+def test_append_evidence_requires_the_thread_path_to_match(
+    store: LearningStore, thread: LearningThread
+) -> None:
     store.create_learning_thread(thread)
     mismatched = _record().model_copy(update={"path_id": "path-2"})
 
@@ -100,3 +105,19 @@ def test_evidence_replay_and_removal_are_idempotent(
     assert store.list_evidence(path_id="path-1", objective_id="objective-1") == []
     assert store.list_evidence(thread_id="thread-1", include_removed=True) == [removed]
     assert _audit_event_types(store) == ["thread.created", "evidence.appended", "evidence.removed"]
+
+
+def test_concurrent_evidence_append_reports_only_one_insertion(
+    store: LearningStore, thread: LearningThread
+) -> None:
+    store.create_learning_thread(thread)
+    record = _record()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(lambda _index: store.append_evidence_if_absent(record), range(2))
+        )
+
+    assert [stored for stored, _inserted in results] == [record, record]
+    assert sorted(inserted for _stored, inserted in results) == [False, True]
+    assert _audit_event_types(store) == ["thread.created", "evidence.appended"]

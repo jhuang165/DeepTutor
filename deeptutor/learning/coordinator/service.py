@@ -134,6 +134,7 @@ class LearningCoordinator:
         turn_id: str,
         learner_response: str,
         allowed_source_refs: Collection[str],
+        learner_response_ref: str = "",
     ) -> EvidenceRecord | None:
         """Persist server-derived evidence after a successful teaching turn."""
 
@@ -150,12 +151,12 @@ class LearningCoordinator:
             self._learning_service = LearningService(self._store)
 
         source_refs = sorted(set(result.source_refs) & set(allowed_source_refs))
-        dropped_source_refs = sorted(set(result.source_refs) - set(source_refs))
-        if dropped_source_refs:
+        dropped_source_count = len(set(result.source_refs) - set(source_refs))
+        if dropped_source_count:
             logger.warning(
-                "Dropped unverified learning source refs turn=%s source_refs=%s",
+                "Dropped unverified learning source refs turn=%s dropped_count=%d",
                 turn_id,
-                dropped_source_refs,
+                dropped_source_count,
             )
 
         thread_id = (
@@ -164,6 +165,8 @@ class LearningCoordinator:
         )
         thread = self._store.get_learning_thread(thread_id)
         if thread is None:
+            if decision.thread_id:
+                raise ValueError("Supplied learning thread does not exist")
             thread = self._store.create_learning_thread(
                 LearningThread(
                     thread_id=thread_id,
@@ -173,6 +176,12 @@ class LearningCoordinator:
                     status=LearningThreadStatus.ACTIVE,
                     source_refs=source_refs,
                 )
+            )
+        else:
+            self._validate_lesson_thread(
+                thread,
+                decision=decision,
+                session_id=session_id,
             )
 
         validated = validate_open_assessment(result.assessment, learner_response)
@@ -199,7 +208,11 @@ class LearningCoordinator:
             recipe_id=decision.activity.recipe_id,
             recipe_version=decision.activity.recipe_version,
             response=learner_response[:8_000],
-            response_ref=(f"chat-turn:{turn_id}:user" if len(learner_response) > 8_000 else ""),
+            response_ref=(
+                (learner_response_ref or f"chat-turn:{turn_id}:user")
+                if len(learner_response) > 8_000
+                else ""
+            ),
             artifact_ref=result.artifact_ref,
             outcome=outcome,
             help_level=decision.activity.help_level,
@@ -216,7 +229,9 @@ class LearningCoordinator:
             session_id=session_id,
             turn_id=turn_id,
         )
-        stored = self._store.append_evidence(record)
+        stored, inserted = self._store.append_evidence_if_absent(record)
+        if not inserted:
+            return stored
         if validated is not None and thread.path_id and decision.objective_id:
             self._learning_service.recalculate_evidence_mastery(
                 thread.path_id, decision.objective_id
@@ -226,6 +241,37 @@ class LearningCoordinator:
             thread_id, next_activity.model_dump(mode="json")
         )
         return stored
+
+    def _validate_lesson_thread(
+        self,
+        thread: LearningThread,
+        *,
+        decision: LearningDecision,
+        session_id: str,
+    ) -> None:
+        if thread.session_id != session_id:
+            raise ValueError("Learning thread belongs to another session")
+        if thread.goal != decision.goal:
+            raise ValueError("Learning thread goal does not match the decision")
+        if thread.scope != "lesson":
+            raise ValueError("Learning thread scope is not lesson")
+        if thread.status is not LearningThreadStatus.ACTIVE:
+            raise ValueError("Learning thread is not active")
+        if not thread.path_id:
+            return
+        if not decision.objective_id:
+            raise ValueError("Path-bound learning thread requires an objective")
+
+        from deeptutor.learning.policy import find_knowledge_point
+
+        progress = self._store.load(thread.path_id) if self._store is not None else None
+        objective = (
+            find_knowledge_point(progress, decision.objective_id)[0]
+            if progress is not None
+            else None
+        )
+        if objective is None:
+            raise ValueError("Learning objective is not bound to the thread path")
 
 
 __all__ = ["LearningCoordinator", "decision_payload", "learning_request_from_payload"]
