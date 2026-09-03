@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+import copy
 from dataclasses import dataclass, field
 import json
 import logging
@@ -149,11 +150,12 @@ async def dispatch_tool_calls(
     for tool_index, (_tcid, tool_name, exec_args) in enumerate(prepared):
         if tool_index in suppress_ui_indices:
             continue
-        # Strip server-injected private kwargs (``_sandbox_mounts`` & co.)
-        # from the event payload: they are execution plumbing, not display
-        # args, and may not be JSON-serializable (a Mount dataclass in the
-        # event killed both the WS push and turn persistence).
-        display_args = {k: v for k, v in exec_args.items() if not k.startswith("_")}
+        display_args = _display_tool_call_args(
+            registry=registry,
+            tool_name=tool_name,
+            model_args=raw_args[tool_index],
+            exec_args=exec_args,
+        )
         await stream.tool_call(
             tool_name=tool_name,
             args=display_args,
@@ -222,7 +224,11 @@ async def dispatch_tool_calls(
             if duplicate_of.get(index) is not None:
                 continue
             call_id, name, _stale = prepared[index]
-            prepared[index] = (call_id, name, kwarg_augmenter(name, raw_args[index], context))
+            prepared[index] = (
+                call_id,
+                name,
+                kwarg_augmenter(name, copy.deepcopy(raw_args[index]), context),
+            )
 
     # Three ordered stages around one concurrent middle. Every call in a round
     # has its args bound before any of them runs, so a tool that *changes what
@@ -379,13 +385,13 @@ async def _reject_if_args_missing(
     if unexpected:
         message = unexpected_args_message(tool_name, unexpected)
         logger.warning(
-            "Rejected %s before dispatch: unexpected args %s",
+            "Rejected %s before dispatch: unexpected argument count=%d",
             tool_name,
-            unexpected,
+            len(unexpected),
         )
         if trace_meta is not None:
             await stream.progress(
-                f"{tool_name} not dispatched: unexpected {', '.join(unexpected)}",
+                f"{tool_name} not dispatched: unsupported model arguments",
                 source=source,
                 stage=stage,
                 metadata=derive_trace_metadata(
@@ -479,14 +485,39 @@ def _prepare_tool_args(
         )
         if not isinstance(tool_args, dict):
             tool_args = {}
+        model_args = copy.deepcopy(tool_args)
         exec_args = (
-            kwarg_augmenter(tool_name, tool_args, context)
+            kwarg_augmenter(tool_name, copy.deepcopy(tool_args), context)
             if kwarg_augmenter is not None
             else dict(tool_args)
         )
         prepared.append((tool_call_id, tool_name, exec_args))
-        raw_args.append(dict(tool_args))
+        raw_args.append(model_args)
     return prepared, raw_args
+
+
+def _display_tool_call_args(
+    *,
+    registry: ToolLookup,
+    tool_name: str,
+    model_args: dict[str, Any],
+    exec_args: dict[str, Any],
+) -> dict[str, Any]:
+    """Render model-owned arguments without exposing augmentation or closed-schema extras."""
+
+    fallback = {key: value for key, value in exec_args.items() if not key.startswith("_")}
+    try:
+        tool = registry.get(tool_name)
+        definition = tool.get_definition() if tool is not None else None
+    except Exception:  # pragma: no cover - a call trace must survive registry failure
+        return fallback
+    raw = definition.raw_parameters if definition is not None else None
+    if not isinstance(raw, dict) or raw.get("additionalProperties") is not False:
+        return fallback
+    properties = raw.get("properties")
+    if not isinstance(properties, dict):
+        return {}
+    return {name: model_args[name] for name in properties if name in model_args}
 
 
 def _build_per_tool_trace_meta(

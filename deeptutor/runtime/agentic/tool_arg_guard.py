@@ -170,10 +170,10 @@ def unexpected_args(definition: ToolDefinition, args: dict[str, Any]) -> list[st
 def unexpected_args_message(tool_name: str, unexpected: list[str]) -> str:
     """Corrective response for model keys outside a closed tool schema."""
 
-    names = ", ".join(f"`{name}`" for name in unexpected)
+    del unexpected
     return (
-        f"`{tool_name}` was called with unexpected argument(s): {names}. "
-        "Remove them and re-emit the call using only the declared schema."
+        f"`{tool_name}` could not be dispatched because it contains unsupported model arguments. "
+        "Re-emit using only the declared schema fields."
     )
 
 

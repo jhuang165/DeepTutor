@@ -15,7 +15,13 @@ from deeptutor.capabilities.learning_coordinator.tools import (
     LearningPathDraftTool,
     LearningReportAssessmentTool,
 )
+from deeptutor.capabilities.partner_authoring.capability import PartnerAuthoringCapability
+from deeptutor.capabilities.partner_authoring.tools import ProposePartnerTool
+from deeptutor.capabilities.partner_group.capability import PartnerGroupCapability
+from deeptutor.capabilities.partner_group.tools import InvokeOtherTool
 from deeptutor.core.context import UnifiedContext
+from deeptutor.core.stream import StreamEventType
+from deeptutor.core.tool_protocol import BaseTool, ToolResult
 from deeptutor.learning.coordinator.models import (
     ActivityKind,
     ActivityPlan,
@@ -28,6 +34,22 @@ from deeptutor.learning.storage import LearningStore
 from deeptutor.runtime.agentic.tool_dispatch import dispatch_tool_calls
 from deeptutor.runtime.registry.tool_registry import ToolRegistry
 from deeptutor.runtime.stream_bus import StreamBus
+
+
+class _DefinitionCapturingRegistry:
+    """Execute a real tool schema without unrelated durable side effects."""
+
+    def __init__(self, tool: BaseTool) -> None:
+        self.tool = tool
+        self.executed: dict[str, Any] | None = None
+
+    def get(self, name: str) -> BaseTool | None:
+        return self.tool if name == self.tool.name else None
+
+    async def execute(self, tool_name: str, **kwargs: Any) -> ToolResult:
+        assert tool_name == self.tool.name
+        self.executed = kwargs
+        return ToolResult(content="executed")
 
 
 def _decision(
@@ -269,7 +291,126 @@ async def test_dispatcher_rejects_unknown_assessment_arguments_before_execution(
     )
 
     assert outcome.tool_messages[0]["content"] == (
-        "`learning_report_assessment` was called with unexpected argument(s): `mastery`. "
-        "Remove them and re-emit the call using only the declared schema."
+        "`learning_report_assessment` could not be dispatched because it contains "
+        "unsupported model arguments. Re-emit using only the declared schema fields."
     )
     assert "result" not in context.extension("learning_coordinator")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("capability", "context", "tool", "arguments", "private_key"),
+    [
+        (
+            PartnerAuthoringCapability(),
+            UnifiedContext(active_capability="partner_authoring", user_message="Create a tutor"),
+            ProposePartnerTool(),
+            {
+                "name": "Ada",
+                "description": "A precise tutor.",
+                "soul": "Teach with examples.",
+                "language": "en",
+                "emoji": "📐",
+                "color": "#112233",
+            },
+            "_partner_authoring_context",
+        ),
+        (
+            PartnerGroupCapability(),
+            UnifiedContext(
+                metadata={
+                    "partner_group": {
+                        "allow_invoke_other": True,
+                        "self_id": "ada",
+                        "members": [{"partner_id": "ada"}, {"partner_id": "bob"}],
+                    }
+                }
+            ),
+            InvokeOtherTool(),
+            {"target_partner_id": "bob", "question": "What assumption needs checking?"},
+            "_partner_group_context",
+        ),
+    ],
+    ids=["partner-authoring", "partner-group"],
+)
+async def test_dispatcher_accepts_closed_partner_tools_after_private_augmentation(
+    capability: Any,
+    context: UnifiedContext,
+    tool: BaseTool,
+    arguments: dict[str, Any],
+    private_key: str,
+) -> None:
+    assert capability.is_active(context)
+    registry = _DefinitionCapturingRegistry(tool)
+
+    outcome = await dispatch_tool_calls(
+        tool_calls=[{"id": "call-1", "name": tool.name, "arguments": json.dumps(arguments)}],
+        context=context,
+        stream=StreamBus(),
+        source="chat",
+        stage="responding",
+        iteration_index=0,
+        registry=registry,
+        kwarg_augmenter=capability.augment_kwargs,
+    )
+
+    assert outcome.tool_messages[0]["content"] == "executed"
+    assert registry.executed is not None
+    assert registry.executed[private_key] is context
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_sanitizes_closed_schema_rejection_everywhere(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret_key = "UNTRUSTED_KEY_SECRET"
+    secret_value = "UNTRUSTED_VALUE_SECRET"
+    context = _context_with_decision()
+    stream = StreamBus()
+    registry = ToolRegistry()
+    registry.load_builtins()
+
+    with caplog.at_level(logging.WARNING, logger="deeptutor.runtime.agentic.tool_dispatch"):
+        outcome = await dispatch_tool_calls(
+            tool_calls=[
+                {
+                    "id": "call-1",
+                    "name": "learning_report_assessment",
+                    "arguments": json.dumps(
+                        {
+                            "outcome": "partial",
+                            "rubric": [{"id": "mechanism", "passed": True}],
+                            "cited_evidence": ["entropy changes"],
+                            "uncertainty": 0.2,
+                            secret_key: secret_value,
+                        }
+                    ),
+                }
+            ],
+            context=context,
+            stream=stream,
+            source="chat",
+            stage="responding",
+            iteration_index=0,
+            registry=registry,
+            kwarg_augmenter=LearningCoordinatorLoopCapability().augment_kwargs,
+        )
+
+    assert outcome.tool_messages[0]["content"] == (
+        "`learning_report_assessment` could not be dispatched because it contains "
+        "unsupported model arguments. Re-emit using only the declared schema fields."
+    )
+    assert outcome.tool_metadata_by_id["call-1"] == {"error": "unexpected_arguments"}
+    assert secret_key not in caplog.text
+    assert secret_value not in caplog.text
+    emitted = [event.to_dict() for event in stream._history]
+    rendered = json.dumps(emitted, default=str)
+    assert secret_key not in rendered
+    assert secret_value not in rendered
+    call_event = next(event for event in stream._history if event.type is StreamEventType.TOOL_CALL)
+    assert set((call_event.metadata or {}).get("args") or {}) == {
+        "outcome",
+        "rubric",
+        "cited_evidence",
+        "uncertainty",
+    }
