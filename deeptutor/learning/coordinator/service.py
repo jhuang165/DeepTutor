@@ -180,6 +180,19 @@ class LearningCoordinator:
         ).hexdigest()[:32]
         existing_evidence = self._store.get_evidence(evidence_id)
         thread = self._store.get_learning_thread(thread_id)
+        if existing_evidence is not None:
+            if thread is None:
+                raise ValueError(
+                    "The persisted evidence recipe or binding refers to an unavailable thread"
+                )
+            self._validate_evidence_replay(
+                existing_evidence,
+                thread_id=thread_id,
+                thread_path_id=thread.path_id,
+                decision=decision,
+                session_id=session_id,
+                turn_id=turn_id,
+            )
         if thread is None:
             if decision.thread_id:
                 raise ValueError("Supplied learning thread does not exist")
@@ -243,17 +256,14 @@ class LearningCoordinator:
             turn_id=turn_id,
         )
         stored, _inserted = self._store.append_evidence_if_absent(record)
-        if (
-            stored.thread_id != thread_id
-            or stored.path_id != thread.path_id
-            or stored.objective_id != decision.objective_id
-            or stored.activity_kind != decision.activity.kind.value
-            or stored.recipe_id != decision.activity.recipe_id
-            or stored.recipe_version != decision.activity.recipe_version
-            or stored.session_id != session_id
-            or stored.turn_id != turn_id
-        ):
-            raise ValueError("The persisted evidence recipe or binding does not match the replay")
+        self._validate_evidence_replay(
+            stored,
+            thread_id=thread_id,
+            thread_path_id=thread.path_id,
+            decision=decision,
+            session_id=session_id,
+            turn_id=turn_id,
+        )
         mastery_passed: bool | None = None
         if (
             stored.removed_at is None
@@ -280,6 +290,28 @@ class LearningCoordinator:
             thread_id, next_activity.model_dump(mode="json")
         )
         return stored
+
+    @staticmethod
+    def _validate_evidence_replay(
+        stored: EvidenceRecord,
+        *,
+        thread_id: str,
+        thread_path_id: str,
+        decision: LearningDecision,
+        session_id: str,
+        turn_id: str,
+    ) -> None:
+        if (
+            stored.thread_id != thread_id
+            or stored.path_id != thread_path_id
+            or stored.objective_id != decision.objective_id
+            or stored.activity_kind != decision.activity.kind.value
+            or stored.recipe_id != decision.activity.recipe_id
+            or stored.recipe_version != decision.activity.recipe_version
+            or stored.session_id != session_id
+            or stored.turn_id != turn_id
+        ):
+            raise ValueError("The persisted evidence recipe or binding does not match the replay")
 
     def _validate_lesson_thread(
         self,

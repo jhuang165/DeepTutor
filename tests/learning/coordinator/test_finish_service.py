@@ -36,6 +36,7 @@ class RecordingLearningService:
 
 def _decision(
     *,
+    goal: str = "Understand eigenvectors",
     scope: str = "lesson",
     thread_id: str = "",
     objective_id: str = "objective-1",
@@ -52,7 +53,7 @@ def _decision(
     return LearningDecision(
         scope=scope,
         route="chat",
-        goal="Understand eigenvectors",
+        goal=goal,
         thread_id=thread_id,
         objective_id=objective_id,
         activity=ActivityPlan(
@@ -610,6 +611,51 @@ async def test_replay_cannot_finalize_evidence_with_a_different_recipe(
 
     thread = store.get_learning_thread("6cd8958a660475d4bbece77f455215cd")
     assert thread is not None and thread.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_colliding_replay_is_rejected_before_creating_a_thread(
+    coordinator: LearningCoordinator, store: LearningStore
+) -> None:
+    await coordinator.finish(
+        _decision(
+            goal="Original goal",
+            kind="guided_attempt",
+            recipe_step=3,
+            transfer_required=True,
+            assessment_method="transfer_application",
+        ),
+        _valid_result(),
+        session_id="s",
+        turn_id="same-turn",
+        learner_response="It keeps its direction.",
+        allowed_source_refs=set(),
+    )
+    before_threads = store.list_learning_threads()
+    before_active = store.list_learning_threads(status="active")
+    before_created_audits = _audit_event_types(store).count("thread.created")
+
+    with pytest.raises(ValueError, match="persisted evidence recipe"):
+        await coordinator.finish(
+            _decision(
+                goal="Colliding goal",
+                kind="guided_attempt",
+                recipe_step=3,
+                knowledge_type=KnowledgeType.PROCEDURE,
+                recipe_id="procedure-fading",
+                transfer_required=True,
+                assessment_method="transfer_variation",
+            ),
+            _valid_result(),
+            session_id="s",
+            turn_id="same-turn",
+            learner_response="It keeps its direction.",
+            allowed_source_refs=set(),
+        )
+
+    assert store.list_learning_threads() == before_threads
+    assert store.list_learning_threads(status="active") == before_active
+    assert _audit_event_types(store).count("thread.created") == before_created_audits
 
 
 @pytest.mark.asyncio
