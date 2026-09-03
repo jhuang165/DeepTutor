@@ -60,6 +60,31 @@ def test_procedure_gate_uses_same_quantitative_bar():
     assert policy.is_mastered(progress, kp) is False
 
 
+def test_old_progress_without_evidence_mastery_keeps_legacy_policy_results():
+    kp1, kp2 = _kp("kp1", KnowledgeType.MEMORY), _kp("kp2", KnowledgeType.CONCEPT)
+    progress = LearningProgress.model_validate(
+        {
+            "book_id": "b1",
+            "modules": [
+                {
+                    "id": "m1",
+                    "name": "M1",
+                    "order": 0,
+                    "knowledge_points": [kp1.model_dump(), kp2.model_dump()],
+                }
+            ],
+            "current_module_id": "m1",
+            "knowledge_types": {"kp1": "memory", "kp2": "concept"},
+            "mastery_levels": {"kp1": 0.9},
+        }
+    )
+
+    assert progress.evidence_mastery == {}
+    assert policy.objective_status(progress, kp1) == "mastered"
+    assert policy.display_mastery(progress, kp1) == 0.9
+    assert policy.next_objective(progress).knowledge_point_id == "kp2"
+
+
 def test_concept_gate_is_qualitative_not_quantitative():
     """A high accuracy score must NOT unlock a concept — only the qualitative
     flag does (a concept is gated by an explanation, not string matching)."""

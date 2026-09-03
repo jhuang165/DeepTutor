@@ -84,9 +84,10 @@ def is_assessed_mastered(progress: LearningProgress, kp: KnowledgePoint) -> bool
     * MEMORY / PROCEDURE: recency-weighted accuracy ≥ the type's threshold.
     * CONCEPT / DESIGN: a recorded qualitative pass (``mastery_assess``).
     """
+    evidence_pass = bool(progress.evidence_mastery.get(kp.id, False))
     if kp.type in QUALITATIVE_TYPES:
-        return bool(progress.qualitative_mastery.get(kp.id, False))
-    return progress.mastery_levels.get(kp.id, 0.0) >= gate_threshold(kp.type)
+        return evidence_pass or bool(progress.qualitative_mastery.get(kp.id, False))
+    return evidence_pass or progress.mastery_levels.get(kp.id, 0.0) >= gate_threshold(kp.type)
 
 
 def mastery_source(progress: LearningProgress, kp: KnowledgePoint) -> str:
@@ -113,6 +114,8 @@ def is_mastered(progress: LearningProgress, kp: KnowledgePoint) -> bool:
 def display_mastery(progress: LearningProgress, kp: KnowledgePoint) -> float:
     """A 0..1 number for the map UI. Qualitatively-mastered points show full;
     otherwise the recency-weighted accuracy stands in."""
+    if progress.evidence_mastery.get(kp.id, False):
+        return 1.0
     if kp.type in QUALITATIVE_TYPES and progress.qualitative_mastery.get(kp.id):
         return _QUALITATIVE_PASS_DISPLAY
     return float(progress.mastery_levels.get(kp.id, 0.0))

@@ -5,6 +5,7 @@ import time
 from typing import TYPE_CHECKING
 import uuid
 
+from deeptutor.learning.evidence import evidence_gate
 from deeptutor.learning.grading import classify_error, grade_answer
 from deeptutor.learning.mastery import compute_mastery
 from deeptutor.learning.models import (
@@ -65,6 +66,28 @@ class LearningService:
         # cannot both manufacture revision 1 and race to overwrite one another.
         with self._store.transaction(book_id, create=True) as tx:
             return tx.progress
+
+    def recalculate_evidence_mastery(self, path_id: str, objective_id: str) -> bool:
+        """Recompute one objective's coordinator-evidence gate transactionally."""
+
+        from deeptutor.learning.policy import find_knowledge_point
+        from deeptutor.learning.scheduler import SpacedRepetitionScheduler
+
+        with self._store.transaction(path_id) as tx:
+            kp, _, _ = find_knowledge_point(tx.progress, objective_id)
+            if kp is None:
+                raise MasteryInteractionError(f"Unknown objective {objective_id!r}")
+            records = self._store.list_evidence(path_id=path_id, objective_id=objective_id)
+            passed = evidence_gate(kp.type, records)
+            changed = tx.progress.evidence_mastery.get(objective_id) != passed
+            tx.progress.evidence_mastery[objective_id] = passed
+            if changed:
+                tx.progress.review_queue = SpacedRepetitionScheduler().build_review_queue(tx.progress)
+            tx.emit(
+                "mastery.evidence_recalculated",
+                {"objective_id": objective_id, "passed": passed},
+            )
+            return passed
 
     def init_modules(self, progress: LearningProgress, modules: list[LearningModule]) -> None:
         """Initialize the runnable module set (replace semantics)."""
