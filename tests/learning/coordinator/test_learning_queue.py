@@ -11,6 +11,7 @@ from deeptutor.learning.models import (
     KnowledgePoint,
     KnowledgeType,
     LearningModule,
+    LearningProgress,
     LearningThread,
     MasteryInteraction,
     PendingQuestion,
@@ -409,6 +410,132 @@ def test_queue_read_only_apis_skip_malformed_progress_rows_without_source_change
     assert store.list_paths_for_session_read_only("s") == []
     assert store.get_active_interaction_read_only("malformed") is None
     assert service.list_items() == []
+    assert _storage_snapshot(tmp_path) == before
+
+
+def test_queue_read_only_apis_reject_progress_whose_payload_identity_differs_from_row(
+    service: LearningQueueService, store: LearningStore, tmp_path
+) -> None:
+    for path in tmp_path.glob("mastery.sqlite3*"):
+        path.unlink()
+    payload = LearningProgress(book_id="payload-id", name="Foreign payload")
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE mastery_paths (
+                path_id TEXT PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO mastery_paths (path_id, state_json, revision, created_at, updated_at)
+            VALUES ('row-id', ?, 1, 0.0, 0.0)
+            """,
+            (json.dumps(payload.model_dump(mode="json")),),
+        )
+    before = _storage_snapshot(tmp_path)
+
+    assert store.load_read_only("row-id") is None
+    assert store.list_all_read_only() == []
+    assert store.list_learning_threads_read_only() == []
+    assert store.list_paths_for_session_read_only("s") == []
+    assert store.get_active_interaction_read_only("row-id") is None
+    assert service.list_items() == []
+    assert _storage_snapshot(tmp_path) == before
+
+
+def test_queue_rejects_a_copied_main_database_that_differs_from_the_stable_source(
+    service: LearningQueueService,
+    store: LearningStore,
+    learning_service: LearningService,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    _seed_path(learning_service, "substituted-path")
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    older_main = tmp_path / "older-valid.sqlite3"
+    original_copyfile = storage_module.shutil.copyfile
+    original_copyfile(store.db_path, older_main)
+
+    progress = store.load("substituted-path")
+    assert progress is not None
+    progress.name = "Current source"
+    store.save(progress)
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    before = _storage_snapshot(tmp_path)
+
+    def copyfile_with_older_main(source, destination, *args, **kwargs):
+        copied_source = older_main if source == store.db_path else source
+        return original_copyfile(copied_source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(storage_module.shutil, "copyfile", copyfile_with_older_main)
+
+    assert store.load_read_only("substituted-path") is None
+    assert service.list_items() == []
+    assert _storage_snapshot(tmp_path) == before
+
+
+def test_queue_retries_when_source_changes_during_a_component_copy(
+    service: LearningQueueService,
+    store: LearningStore,
+    learning_service: LearningService,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    _seed_path(learning_service, "transition-path")
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    original_copyfile = storage_module.shutil.copyfile
+    older_main = tmp_path / "transition-older.sqlite3"
+    original_copyfile(store.db_path, older_main)
+
+    progress = store.load("transition-path")
+    assert progress is not None
+    progress.name = "Current after transition"
+    store.save(progress)
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    current_main = tmp_path / "transition-current.sqlite3"
+    original_copyfile(store.db_path, current_main)
+    transitioned = False
+    transient_wal = store.db_path.with_name(f"{store.db_path.name}-wal")
+    original_wal = transient_wal.read_bytes() if transient_wal.exists() else None
+    before = _storage_snapshot(tmp_path)
+
+    def copyfile_during_source_transition(source, destination, *args, **kwargs):
+        nonlocal transitioned
+        if not transitioned and source == store.db_path:
+            transitioned = True
+            transient_wal.write_bytes(b"transient sidecar")
+            original_copyfile(older_main, store.db_path)
+            try:
+                return original_copyfile(source, destination, *args, **kwargs)
+            finally:
+                original_copyfile(current_main, store.db_path)
+                if original_wal is None:
+                    transient_wal.unlink()
+                else:
+                    transient_wal.write_bytes(original_wal)
+        return original_copyfile(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(storage_module.shutil, "copyfile", copyfile_during_source_transition)
+
+    loaded = store.load_read_only("transition-path")
+    items = service.list_items()
+
+    assert transitioned is True
+    assert loaded is not None
+    assert loaded.name == "Current after transition"
+    assert [(item.path_id, item.activity["name"]) for item in items] == [
+        ("transition-path", "Current after transition")
+    ]
     assert _storage_snapshot(tmp_path) == before
 
 

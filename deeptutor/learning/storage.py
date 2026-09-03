@@ -573,23 +573,36 @@ class LearningStore:
             finally:
                 conn.close()
 
-    def _read_only_snapshot_fingerprint(self) -> tuple[tuple[Path, str], ...] | None:
-        components = [self.db_path]
-        components.extend(
-            self.db_path.with_name(f"{self.db_path.name}{suffix}")
-            for suffix in ("-wal", "-shm")
-            if self.db_path.with_name(f"{self.db_path.name}{suffix}").exists()
-        )
-        fingerprint: list[tuple[Path, str]] = []
-        for component in components:
+    @staticmethod
+    def _read_only_component_names(database: Path) -> tuple[str, ...] | None:
+        expected = tuple(f"{database.name}{suffix}" for suffix in ("", "-wal", "-shm"))
+        try:
+            present = {entry.name for entry in database.parent.iterdir() if entry.name in expected}
+        except OSError:
+            return None
+        if database.name not in present:
+            return None
+        return tuple(name for name in expected if name in present)
+
+    def _read_only_snapshot_fingerprint(
+        self, database: Path | None = None
+    ) -> tuple[tuple[str, str], ...] | None:
+        database = database or self.db_path
+        component_names = self._read_only_component_names(database)
+        if component_names is None:
+            return None
+        fingerprint: list[tuple[str, str]] = []
+        for component_name in component_names:
             digest = hashlib.sha256()
             try:
-                with component.open("rb") as handle:
+                with database.with_name(component_name).open("rb") as handle:
                     for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                         digest.update(chunk)
             except OSError:
                 return None
-            fingerprint.append((component, digest.hexdigest()))
+            fingerprint.append((component_name, digest.hexdigest()))
+        if self._read_only_component_names(database) != component_names:
+            return None
         return tuple(fingerprint)
 
     def _copy_verified_read_only_snapshot(self, directory: Path) -> Path | None:
@@ -602,12 +615,16 @@ class LearningStore:
             attempt_dir = directory / str(attempt)
             attempt_dir.mkdir()
             try:
-                for source, _digest in before:
-                    shutil.copyfile(source, attempt_dir / source.name)
+                for component_name, _digest in before:
+                    shutil.copyfile(
+                        self.db_path.with_name(component_name), attempt_dir / component_name
+                    )
             except OSError:
                 shutil.rmtree(attempt_dir, ignore_errors=True)
                 continue
-            if self._read_only_snapshot_fingerprint() == before:
+            copied = self._read_only_snapshot_fingerprint(attempt_dir / self.db_path.name)
+            after = self._read_only_snapshot_fingerprint()
+            if before == copied == after:
                 return attempt_dir / self.db_path.name
             shutil.rmtree(attempt_dir, ignore_errors=True)
         return None
@@ -852,9 +869,10 @@ class LearningStore:
             row = None
         if row is not None:
             try:
-                return self._progress_from_row(row)
+                progress = self._progress_from_row(row)
             except _READ_ONLY_ROW_ERRORS:
                 return None
+            return progress if progress.book_id == path_id else None
         try:
             progress = LearningProgress.model_validate_json(self._path(path_id).read_text("utf-8"))
         except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError, ValidationError):
