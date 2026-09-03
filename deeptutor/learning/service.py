@@ -77,9 +77,18 @@ class LearningService:
             kp, _, _ = find_knowledge_point(tx.progress, objective_id)
             if kp is None:
                 raise MasteryInteractionError(f"Unknown objective {objective_id!r}")
-            records = self._store.list_evidence(path_id=path_id, objective_id=objective_id)
+            bound_thread_ids = {
+                thread.thread_id
+                for thread in self._store.list_learning_threads()
+                if thread.path_id == path_id
+            }
+            records = [
+                record
+                for record in self._store.list_evidence(path_id=path_id, objective_id=objective_id)
+                if record.thread_id in bound_thread_ids
+            ]
             passed = evidence_gate(kp.type, records)
-            changed = tx.progress.evidence_mastery.get(objective_id) != passed
+            changed = bool(tx.progress.evidence_mastery.get(objective_id, False)) != passed
             tx.progress.evidence_mastery[objective_id] = passed
             if changed:
                 tx.progress.review_queue = SpacedRepetitionScheduler().build_review_queue(tx.progress)

@@ -74,6 +74,14 @@ def test_append_evidence_requires_an_existing_thread(store: LearningStore) -> No
         store.append_evidence(_record())
 
 
+def test_append_evidence_requires_the_thread_path_to_match(store: LearningStore, thread: LearningThread) -> None:
+    store.create_learning_thread(thread)
+    mismatched = _record().model_copy(update={"path_id": "path-2"})
+
+    with pytest.raises(LearningStoreError, match="does not belong to path path-2"):
+        store.append_evidence(mismatched)
+
+
 def test_evidence_replay_and_removal_are_idempotent(
     store: LearningStore, thread: LearningThread
 ) -> None:

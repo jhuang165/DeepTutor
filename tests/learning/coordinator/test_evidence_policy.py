@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import sqlite3
+
 from deeptutor.learning.evidence import evidence_gate, validate_open_assessment
 from deeptutor.learning.models import (
     EvidenceOutcome,
@@ -9,6 +12,7 @@ from deeptutor.learning.models import (
     LearningModule,
     LearningThread,
     RepetitionState,
+    ReviewTask,
 )
 from deeptutor.learning.service import LearningService
 from deeptutor.learning.storage import LearningStore
@@ -27,11 +31,13 @@ def _evidence(
     artifact_ref: str = "",
     created_at: float = NOW,
     removed_at: float | None = None,
+    thread_id: str = "thread-1",
+    path_id: str = "path-1",
 ) -> EvidenceRecord:
     return EvidenceRecord(
         evidence_id=evidence_id,
-        thread_id="thread-1",
-        path_id="path-1",
+        thread_id=thread_id,
+        path_id=path_id,
         objective_id="objective-1",
         activity_kind=activity_kind,
         recipe_id="recipe",
@@ -153,3 +159,92 @@ def test_recalculate_evidence_mastery_changes_only_evidence_gate_and_records_eve
     assert progress.qualitative_mastery == {"objective-1": True}
     assert [task.knowledge_point_id for task in progress.review_queue] == ["objective-1"]
     assert store.list_events("path-1")[-1].event_type == "mastery.evidence_recalculated"
+
+
+def test_recalculate_ignores_evidence_from_a_thread_bound_to_another_path(tmp_path) -> None:
+    store = LearningStore(root=tmp_path)
+    service = LearningService(store)
+    objective = KnowledgePoint(
+        id="objective-1", name="Remember", type=KnowledgeType.MEMORY, module_id="module-1"
+    )
+    module = LearningModule(
+        id="module-1", name="Module", order=0, knowledge_points=[objective]
+    )
+    service.replace_modules_for_path("path-1", [module])
+    service.replace_modules_for_path("path-2", [module])
+    store.create_learning_thread(
+        LearningThread(
+            thread_id="thread-1",
+            session_id="session-1",
+            scope="lesson",
+            goal="Path one",
+            status="active",
+            path_id="path-1",
+        )
+    )
+    store.create_learning_thread(
+        LearningThread(
+            thread_id="thread-2",
+            session_id="session-2",
+            scope="lesson",
+            goal="Path two",
+            status="active",
+            path_id="path-2",
+        )
+    )
+    store.append_evidence(_evidence("wrong-now", thread_id="thread-2", path_id="path-2"))
+    store.append_evidence(
+        _evidence(
+            "wrong-delayed",
+            created_at=NOW - 20 * 60 * 60,
+            thread_id="thread-2",
+            path_id="path-2",
+        )
+    )
+
+    with sqlite3.connect(store.db_path) as conn:
+        rows = conn.execute("SELECT evidence_id, payload_json FROM learning_evidence").fetchall()
+        for evidence_id, payload_json in rows:
+            payload = json.loads(payload_json)
+            payload["path_id"] = "path-1"
+            conn.execute(
+                "UPDATE learning_evidence SET payload_json = ? WHERE evidence_id = ?",
+                (json.dumps(payload), evidence_id),
+            )
+        conn.commit()
+
+    assert service.recalculate_evidence_mastery("path-1", "objective-1") is False
+
+
+def test_recalculate_false_gate_preserves_an_existing_review_queue(tmp_path) -> None:
+    store = LearningStore(root=tmp_path)
+    service = LearningService(store)
+    objective = KnowledgePoint(
+        id="objective-1", name="Remember", type=KnowledgeType.MEMORY, module_id="module-1"
+    )
+    service.replace_modules_for_path(
+        "path-1",
+        [LearningModule(id="module-1", name="Module", order=0, knowledge_points=[objective])],
+    )
+    preserved_state = RepetitionState(next_review_at=NOW)
+
+    def seed_review_queue(tx) -> None:
+        tx.progress.review_queue = [
+            ReviewTask(
+                id="review_objective-1",
+                knowledge_point_id="objective-1",
+                knowledge_type=KnowledgeType.MEMORY,
+                due_at=NOW,
+                priority=2,
+                state=preserved_state,
+            )
+        ]
+        tx.touch()
+
+    store.mutate("path-1", seed_review_queue)
+
+    assert service.recalculate_evidence_mastery("path-1", "objective-1") is False
+    progress = store.load("path-1")
+    assert progress is not None
+    assert progress.evidence_mastery == {"objective-1": False}
+    assert progress.review_queue[0].id == "review_objective-1"

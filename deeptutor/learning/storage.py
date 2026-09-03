@@ -1150,10 +1150,15 @@ class LearningStore:
 
     def append_evidence(self, record: EvidenceRecord) -> EvidenceRecord:
         with self._transaction() as conn:
-            if conn.execute(
-                "SELECT 1 FROM learning_threads WHERE thread_id = ?", (record.thread_id,)
-            ).fetchone() is None:
+            thread_row = conn.execute(
+                "SELECT path_id FROM learning_threads WHERE thread_id = ?", (record.thread_id,)
+            ).fetchone()
+            if thread_row is None:
                 raise LearningStoreError(f"Unknown learning thread: {record.thread_id}")
+            if str(thread_row["path_id"] or "") != record.path_id:
+                raise LearningStoreError(
+                    f"Learning thread {record.thread_id} does not belong to path {record.path_id}"
+                )
             cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO learning_evidence (
