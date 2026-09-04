@@ -36,6 +36,8 @@ export type FollowupQuestionContext = {
 export type HistoryReferences = string[];
 export type KnowledgeBases = string[];
 export type Language = string | null;
+export type LearningCoordinator = boolean | null;
+export type LearningThreadId = string | null;
 export type ModelId = string;
 export type ProfileId = string;
 export type MasteryPathId = string | null;
@@ -273,6 +275,8 @@ export interface StartTurnCommand {
   history_references?: HistoryReferences;
   knowledge_bases?: KnowledgeBases;
   language?: Language;
+  learning_coordinator?: LearningCoordinator;
+  learning_thread_id?: LearningThreadId;
   llm_selection?: LLMSelection | null;
   mastery_path_id?: MasteryPathId;
   mastery_path_lease_managed?: MasteryPathLeaseManaged;

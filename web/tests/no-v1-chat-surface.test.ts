@@ -28,7 +28,7 @@ test("the frontend has no retired transport, URL, or compatibility surface", () 
   );
   const forbidden = [
     /\/api\/v1(?:\/|["'`])/,
-    /\/api\/(?:attachments|book|co_writer|knowledge|learning|notebook|outputs)(?:\/|["'`])/,
+    /\/api\/(?:attachments|book|co_writer|knowledge|notebook|outputs)(?:\/|["'`])/,
     /["'`]\/(?:book|home|knowledge|notebook|study)(?:[/?#"'`]|$)/,
     /\?session=/,
     /UnifiedWSClient/,
