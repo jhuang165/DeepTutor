@@ -62,10 +62,10 @@ export function LearningPathProposal({
   return (
     <section aria-labelledby="learning-path-title" className="min-w-0 max-w-full">
       <h2 id="learning-path-title" className="text-lg font-semibold">
-        {t('Learning path proposal')}
+        {t('Proposed learning path')}
       </h2>
       <label className="mt-3 block text-sm" htmlFor="learning-goal">
-        {t('Goal')}
+        {t('I want to be able to')}
       </label>
       <textarea
         id="learning-goal"

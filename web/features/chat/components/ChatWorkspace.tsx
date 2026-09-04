@@ -133,6 +133,25 @@ import {
   type SelectionTutorContext,
 } from "@/lib/selection-tutor";
 import { shouldReturnToChatAfterResearch } from "@/lib/deep-research-report";
+import { apiFetch, apiUrl } from "@/lib/api";
+import { LearningHome } from "@/features/learning/components/LearningHome";
+import { LearningPathProposal } from "@/features/learning/components/LearningPathProposal";
+import { LearningActivityPanel } from "@/features/learning/components/LearningActivityPanel";
+import { useLearningQueue } from "@/features/learning/hooks/useLearningQueue";
+import {
+  selectLearningDecision,
+  selectLearningPathProposal,
+} from "@/features/learning/model";
+import {
+  approveLearningPath,
+  fetchLearningEvidence,
+  fetchLearningThread,
+  setLearningHelpLevel,
+} from "@/lib/learning-coordinator-api";
+import type {
+  LearningEvidence,
+  LearningQueueItem,
+} from "@/features/learning/model";
 
 const NotebookRecordPicker = dynamic(
   () => import("@/components/notebook/NotebookRecordPicker"),
@@ -269,6 +288,28 @@ export default function ChatWorkspace() {
     isLoading: isCapabilityCatalogLoading,
   } = useCapabilityCatalog();
   const { setActiveSessionId, language: appLanguage } = useAppShell();
+
+  const [learningCoordinatorEnabled, setLearningCoordinatorEnabled] =
+    useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    void apiFetch(apiUrl("/api/settings/ui"), { skipAuthRedirect: true })
+      .then(async (response) => {
+        if (!response.ok) return;
+        const payload = (await response.json()) as {
+          learning_coordinator_enabled?: unknown;
+        };
+        if (!cancelled) {
+          setLearningCoordinatorEnabled(
+            payload.learning_coordinator_enabled === true,
+          );
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const {
     state,
@@ -717,6 +758,67 @@ export default function ChatWorkspace() {
   // "done" while nothing visibly changes.
   useSetupSync(state.messages);
   const hasMessages = state.messages.length > 0;
+  const learningQueue = useLearningQueue(state.sessionId ?? undefined);
+  const learningDecision = useMemo(() => {
+    for (let index = state.messages.length - 1; index >= 0; index -= 1) {
+      const decision = selectLearningDecision(state.messages[index]);
+      if (decision) return decision;
+    }
+    return null;
+  }, [state.messages]);
+  const learningPathDraft = useMemo(() => {
+    for (let index = state.messages.length - 1; index >= 0; index -= 1) {
+      const draft = selectLearningPathProposal(state.messages[index]);
+      if (draft) return draft;
+    }
+    return null;
+  }, [state.messages]);
+  const [learningEvidence, setLearningEvidence] = useState<LearningEvidence[]>(
+    [],
+  );
+  useEffect(() => {
+    const threadId =
+      learningDecision?.scope === "lesson" ? learningDecision.thread_id : null;
+    if (!threadId) {
+      setLearningEvidence([]);
+      return;
+    }
+    let cancelled = false;
+    void fetchLearningEvidence(threadId)
+      .then((records) => {
+        if (!cancelled) setLearningEvidence(records);
+      })
+      .catch(() => {
+        if (!cancelled) setLearningEvidence([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [learningDecision]);
+  const coordinatorHomeEnabled =
+    learningCoordinatorEnabled &&
+    !state.activeCapability &&
+    !state.courseId &&
+    !state.masteryPathId &&
+    !state.workspaceMode;
+  const continueLearning = useCallback(
+    (item: LearningQueueItem) => {
+      if (item.thread_id) {
+        void fetchLearningThread(item.thread_id)
+          .then((thread) => {
+            if (thread.session_id) {
+              router.push(`/chat/${encodeURIComponent(thread.session_id)}`);
+            }
+          })
+          .catch(() => undefined);
+        return;
+      }
+      if (item.path_id) {
+        router.push(`/mastery/${encodeURIComponent(item.path_id)}`);
+      }
+    },
+    [router],
+  );
   // A line the user might type next, written by the task model against the
   // conversation's own tail — general prediction, not a question to ask,
   // unlike the mastery/reading composers' hint. Empty conversations already
@@ -1584,6 +1686,70 @@ export default function ChatWorkspace() {
     handleChangeResearchConfig,
   ]);
 
+  const sendLearningContinuation = useCallback(
+    (content: string, threadId: string) => {
+      sendMessage(
+        content,
+        [],
+        { _course_id: courseId },
+        [],
+        [],
+        {
+          learningCoordinator: true,
+          learningThreadId: threadId,
+        },
+        [],
+        undefined,
+        [],
+      );
+      shouldAutoScrollRef.current = true;
+    },
+    [courseId, sendMessage, shouldAutoScrollRef],
+  );
+
+  const learningActivitySection = useMemo(() => {
+    if (learningDecision?.scope !== "lesson") return null;
+    const threadId = learningDecision.thread_id;
+    const adjust = (content: string) =>
+      sendLearningContinuation(content, threadId);
+    return (
+      <LearningActivityPanel
+        decision={learningDecision}
+        evidence={learningEvidence}
+        onHelp={(level) => {
+          void setLearningHelpLevel(threadId, level).then(() =>
+            adjust(
+              level === 4
+                ? t("Please explain the answer directly.")
+                : t("Give me the next hint."),
+            ),
+          );
+        }}
+        onVisualEmphasis={(emphasis) =>
+          adjust(
+            emphasis === "more"
+              ? t("Make the next activity more visual.")
+              : t("Make the next activity less visual."),
+          )
+        }
+        onRigor={(rigor) =>
+          adjust(
+            rigor === "more"
+              ? t("Make the next activity more rigorous.")
+              : t("Make the next activity less rigorous."),
+          )
+        }
+        onPacing={(pacing) =>
+          adjust(
+            pacing === "slower"
+              ? t("Slow down the next activity.")
+              : t("Speed up the next activity."),
+          )
+        }
+      />
+    );
+  }, [learningDecision, learningEvidence, sendLearningContinuation, t]);
+
   // Clicking an attachment (from the Activity home or from a chat message)
   // routes into the panel as a new file tab. It auto-opens and the
   // preference is persisted so a follow-up click feels instant.
@@ -1909,6 +2075,12 @@ export default function ChatWorkspace() {
         {
           bookReferences: bookReferencesPayload,
           readingReferences: readingReferencesPayload,
+          learningCoordinator:
+            coordinatorHomeEnabled || learningDecision?.scope === "lesson",
+          learningThreadId:
+            learningDecision?.scope === "lesson"
+              ? learningDecision.thread_id
+              : null,
         },
         questionNotebookReferencesPayload,
         undefined,
@@ -1928,12 +2100,14 @@ export default function ChatWorkspace() {
       attachments,
       bookReferencesPayload,
       courseId,
+      coordinatorHomeEnabled,
       readingReferencesPayload,
       historyReferencesPayload,
       isQuizMode,
       isResearchMode,
       isVisualizeMode,
       memoryReferencesPayload,
+      learningDecision,
       notebookReferencesPayload,
       questionNotebookReferencesPayload,
       quizConfig,
@@ -2328,6 +2502,28 @@ export default function ChatWorkspace() {
                     />
                   </div>
                 </div>
+              ) : learningDecision?.scope === "path" && learningPathDraft ? (
+                <div className="w-full flex-1 min-h-0 overflow-y-auto px-4 py-6 sm:px-6">
+                  <div className="mx-auto w-full min-w-0 max-w-[768px]">
+                    <LearningPathProposal
+                      threadId={learningDecision.thread_id}
+                      draft={learningPathDraft}
+                      approvePath={approveLearningPath}
+                      onApproved={(href) => router.push(href)}
+                    />
+                  </div>
+                </div>
+              ) : !hasMessages && coordinatorHomeEnabled ? (
+                <div className="flex w-full flex-1 min-h-0 items-end justify-center px-4 pb-8 animate-fade-in sm:px-6">
+                  <div className="w-full min-w-0 max-w-[768px]">
+                    <LearningHome
+                      items={learningQueue.items}
+                      loading={learningQueue.loading}
+                      error={learningQueue.error}
+                      onContinue={continueLearning}
+                    />
+                  </div>
+                </div>
               ) : !hasMessages ? (
                 <div className="flex w-full flex-1 min-h-0 items-end justify-center pb-14 animate-fade-in px-6">
                   <div className="w-full max-w-[960px] flex items-center justify-center gap-4">
@@ -2606,7 +2802,7 @@ export default function ChatWorkspace() {
               open={viewerPanelOpen && previewSource === null}
               sessionId={state.sessionId}
               activity={sessionActivity}
-              configSection={capabilityConfigSection}
+              configSection={learningActivitySection ?? capabilityConfigSection}
               onClose={() => setViewerOpen(false)}
               onAutoOpen={() => setViewerOpen(true)}
             />

@@ -104,6 +104,51 @@ test("optional routing fields preserve omitted versus explicit null", () => {
   assert.equal(explicit.capability, null);
 });
 
+test("learning coordinator routing uses dedicated turn fields without changing auto-route", () => {
+  // Break caught: coordinator opt-in or thread resumption is dropped or encoded through auto_route.
+  const input = {
+    content: "continue",
+    autoRoute: true,
+    learningCoordinator: true,
+    learningThreadId: "thread-1",
+  } as StartTurnInput & {
+    learningCoordinator: boolean;
+    learningThreadId: string;
+  };
+  const wire = buildStartTurnInput(input);
+
+  assert.equal(wire.auto_route, true);
+  assert.equal(wire.learning_coordinator, true);
+  assert.equal(wire.learning_thread_id, "thread-1");
+});
+
+test("learning runtime fields cannot leak through capability configuration", () => {
+  // Break caught: a caller bypasses typed coordinator routing by hiding runtime fields in config.
+  for (const key of ["learning_coordinator", "learning_thread_id"]) {
+    assert.throws(
+      () =>
+        buildStartTurnInput({
+          content: "bad",
+          capabilityConfig: { [key]: true },
+        }),
+      (error) =>
+        error instanceof ApiError && error.code === "invalid_turn_input",
+    );
+  }
+});
+
+test("learning thread identifiers respect the generated 128-character boundary", () => {
+  // Break caught: a browser sends an overlong thread identity that the generated turn contract rejects.
+  assert.throws(
+    () =>
+      buildStartTurnInput({
+        content: "continue",
+        learningThreadId: "x".repeat(129),
+      }),
+    (error) => error instanceof ApiError && error.code === "invalid_turn_input",
+  );
+});
+
 test("the positional compatibility adapter produces object-shaped input", () => {
   const input = legacySendMessageInput(
     { content: "legacy", config: { difficulty: "hard" } },

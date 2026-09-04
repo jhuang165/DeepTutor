@@ -135,6 +135,23 @@ test("settings-context: persistUiSettingsPatch can save theme without sending co
   });
 });
 
+test("settings-context: persists only the learning coordinator boolean", async () => {
+  // Break caught: the personal opt-in cannot be serialized as an atomic UI-settings patch.
+  let capturedInit: RequestInit | undefined;
+
+  await settingsContext.persistUiSettingsPatch(
+    { learning_coordinator_enabled: true },
+    async (_input: RequestInfo | URL, init?: RequestInit) => {
+      capturedInit = init;
+      return { ok: true } as Response;
+    },
+  );
+
+  assert.deepEqual(JSON.parse(String(capturedInit?.body)), {
+    learning_coordinator_enabled: true,
+  });
+});
+
 test("settings-context: boolean values survive reload cycle from localStorage", () => {
   const sync = (settingsContext as any).syncLoadedCodeBlockSettingsToAppShell;
 

@@ -33,6 +33,24 @@ test("appearance consumes only the UI preference slice", () => {
   assert.doesNotMatch(appearance, /useSettings\(\)/);
 });
 
+test("the UI preference slice exposes the learning opt-in without the catalog surface", () => {
+  // Break caught: the learning settings page must consume the full catalog store or cannot update its saved toggle.
+  const ui = read("features/settings/store/UiSettingsProvider.tsx");
+
+  for (const member of [
+    "learningCoordinatorEnabled",
+    "updateLearningCoordinatorEnabled",
+  ]) {
+    assert.match(ui, new RegExp(member));
+  }
+
+  const learning = read(
+    "features/settings/sections/LearningSettingsSection.tsx",
+  );
+  assert.match(learning, /useUiSettings\(\)/);
+  assert.doesNotMatch(learning, /useSettings\(\)/);
+});
+
 test("continuous settings imports feature sections, never route modules", () => {
   const page = read("app/(utility)/settings/page.tsx");
   assert.match(page, /features\/settings\/sections\/ModelsSettingsSection/);

@@ -11,12 +11,14 @@ type UiSettingsSlice = Pick<
   | "codeBlockTheme"
   | "codeBlockShowLineNumbers"
   | "codeBlockWrapLongLines"
+  | "learningCoordinatorEnabled"
   | "updateTheme"
   | "updateLanguage"
   | "updateResponseLanguage"
   | "updateCodeBlockTheme"
   | "updateCodeBlockShowLineNumbers"
   | "updateCodeBlockWrapLongLines"
+  | "updateLearningCoordinatorEnabled"
 >;
 
 const UiSettingsContext = createContext<UiSettingsSlice | null>(null);
@@ -31,12 +33,14 @@ export function UiSettingsProvider({ children }: { children: ReactNode }) {
       codeBlockTheme: source.codeBlockTheme,
       codeBlockShowLineNumbers: source.codeBlockShowLineNumbers,
       codeBlockWrapLongLines: source.codeBlockWrapLongLines,
+      learningCoordinatorEnabled: source.learningCoordinatorEnabled,
       updateTheme: source.updateTheme,
       updateLanguage: source.updateLanguage,
       updateResponseLanguage: source.updateResponseLanguage,
       updateCodeBlockTheme: source.updateCodeBlockTheme,
       updateCodeBlockShowLineNumbers: source.updateCodeBlockShowLineNumbers,
       updateCodeBlockWrapLongLines: source.updateCodeBlockWrapLongLines,
+      updateLearningCoordinatorEnabled: source.updateLearningCoordinatorEnabled,
     }),
     [
       source.theme,
@@ -45,12 +49,14 @@ export function UiSettingsProvider({ children }: { children: ReactNode }) {
       source.codeBlockTheme,
       source.codeBlockShowLineNumbers,
       source.codeBlockWrapLongLines,
+      source.learningCoordinatorEnabled,
       source.updateTheme,
       source.updateLanguage,
       source.updateResponseLanguage,
       source.updateCodeBlockTheme,
       source.updateCodeBlockShowLineNumbers,
       source.updateCodeBlockWrapLongLines,
+      source.updateLearningCoordinatorEnabled,
     ],
   );
   return (

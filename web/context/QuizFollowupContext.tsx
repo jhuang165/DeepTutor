@@ -431,6 +431,7 @@ export function QuizFollowupProvider({ children }: ProviderProps) {
         content,
         tools: [],
         capability: "chat",
+        learning_coordinator: false,
         knowledge_bases: input.knowledgeBases ?? [],
         session_id: current.sessionId,
         attachments: input.attachments,

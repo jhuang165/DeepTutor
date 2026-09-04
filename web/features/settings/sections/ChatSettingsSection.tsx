@@ -11,6 +11,10 @@ const VideoLearningSettingsPage = dynamic(
   () => import("./VideoLearningSettingsSection"),
   { loading },
 );
+const LearningSettingsPage = dynamic(
+  () => import("./LearningSettingsSection"),
+  { loading },
+);
 const ToolsSettingsPage = dynamic(() => import("./ToolsSettingsSection"), {
   loading,
 });
@@ -29,6 +33,7 @@ const AttachmentSettingsPage = dynamic(
 
 const CHAT_SECTIONS = [
   { key: "video-learning", Component: VideoLearningSettingsPage },
+  { key: "learning", Component: LearningSettingsPage },
   { key: "tools", Component: ToolsSettingsPage },
   { key: "capabilities", Component: CapabilitiesSettingsPage },
   { key: "starters", Component: StarterSettingsPage },

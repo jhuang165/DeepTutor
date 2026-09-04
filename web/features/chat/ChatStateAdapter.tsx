@@ -105,6 +105,8 @@ type MemoryReferencePayload = Array<"summary" | "profile">;
 export interface SendMessageOptions {
   displayUserMessage?: boolean;
   persistUserMessage?: boolean;
+  learningCoordinator?: boolean;
+  learningThreadId?: string | null;
   requestSnapshotOverride?: MessageRequestSnapshot;
   bookReferences?: BookReferencePayload[];
   readingReferences?: ReadingReferencePayload[];
@@ -1866,6 +1868,23 @@ export function ChatStateAdapterProvider({
           mime_type: a.mime_type,
         })) ?? msgAttachments;
       const effectiveConfig = config ?? replaySnapshot?.config;
+      const selectionTutorRequested = Boolean(
+        effectiveConfig?.selection_tutor_context &&
+        typeof effectiveConfig.selection_tutor_context === "object",
+      );
+      const explicitLearningRoute = Boolean(
+        (effectiveCapability && effectiveCapability !== "chat") ||
+        session.courseId.trim() ||
+        effectiveMasteryPathId ||
+        effectiveWorkspaceMode ||
+        selectionTutorRequested,
+      );
+      const learningCoordinator = explicitLearningRoute
+        ? false
+        : (options?.learningCoordinator ?? null);
+      const learningThreadId = explicitLearningRoute
+        ? null
+        : (options?.learningThreadId ?? null);
       const effectiveNotebookReferences =
         replaySnapshot?.notebookReferences ?? notebookReferences;
       const effectiveHistoryReferences =
@@ -2018,6 +2037,8 @@ export function ChatStateAdapterProvider({
             ? subagentConsultBudget
             : null,
         autoRoute: typeof autoRoute === "boolean" ? autoRoute : null,
+        learningCoordinator,
+        learningThreadId,
         attachments: effectiveAttachments,
         language: effectiveLanguage,
         notebookReferences: effectiveNotebookReferences,

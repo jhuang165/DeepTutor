@@ -191,6 +191,7 @@ export type UiSettings = {
   code_block_theme: string;
   code_block_show_line_numbers: boolean;
   code_block_wrap_long_lines: boolean;
+  learning_coordinator_enabled: boolean;
 };
 
 type CodeBlockUiSettings = Pick<
@@ -563,6 +564,7 @@ export type SettingsContextValue = {
   codeBlockTheme: UiSettings["code_block_theme"];
   codeBlockShowLineNumbers: UiSettings["code_block_show_line_numbers"];
   codeBlockWrapLongLines: UiSettings["code_block_wrap_long_lines"];
+  learningCoordinatorEnabled: UiSettings["learning_coordinator_enabled"];
   toast: string;
   setToast: (value: string) => void;
 
@@ -575,6 +577,7 @@ export type SettingsContextValue = {
   updateCodeBlockTheme: (next: CodeBlockThemeId) => Promise<void>;
   updateCodeBlockShowLineNumbers: (next: boolean) => Promise<void>;
   updateCodeBlockWrapLongLines: (next: boolean) => Promise<void>;
+  updateLearningCoordinatorEnabled: (next: boolean) => Promise<void>;
 
   // Catalog mutation
   mutateCatalog: (mutator: (next: Catalog) => void) => void;
@@ -727,6 +730,8 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
   const [language, setLanguage] = useState<UiSettings["language"]>("en");
   const [responseLanguage, setResponseLanguage] =
     useState<UiSettings["response_language"]>("en");
+  const [learningCoordinatorEnabled, setLearningCoordinatorEnabled] =
+    useState(false);
   const [catalog, setCatalog] = useState<Catalog>(defaultCatalog());
   const [draft, setDraft] = useState<Catalog>(defaultCatalog());
   const [catalogEditable, setCatalogEditable] = useState<boolean | null>(null);
@@ -847,6 +852,9 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       setTheme(payload.ui.theme);
       setLanguage(payload.ui.language);
       setResponseLanguage(payload.ui.response_language ?? payload.ui.language);
+      setLearningCoordinatorEnabled(
+        payload.ui.learning_coordinator_enabled === true,
+      );
       // Writes the backend-loaded values into app-shell storage and dispatches
       // the code-block settings event; AppShellContext (the single source) picks
       // them up, so no separate copy needs seeding here.
@@ -1001,6 +1009,20 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       await persistUiSettingsPatch({ code_block_wrap_long_lines: next });
     },
     [setAppShellCodeBlockWrapLongLines],
+  );
+
+  const updateLearningCoordinatorEnabled = useCallback(
+    async (next: boolean) => {
+      const previous = learningCoordinatorEnabled;
+      setLearningCoordinatorEnabled(next);
+      try {
+        await persistUiSettingsPatch({ learning_coordinator_enabled: next });
+      } catch (error) {
+        setLearningCoordinatorEnabled(previous);
+        throw error;
+      }
+    },
+    [learningCoordinatorEnabled],
   );
 
   // ── Catalog mutators ────────────────────────────────────────────────────
@@ -1907,6 +1929,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       codeBlockTheme,
       codeBlockShowLineNumbers,
       codeBlockWrapLongLines,
+      learningCoordinatorEnabled,
       toast,
       setToast,
       updateTheme,
@@ -1915,6 +1938,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       updateCodeBlockTheme,
       updateCodeBlockShowLineNumbers,
       updateCodeBlockWrapLongLines,
+      updateLearningCoordinatorEnabled,
       mutateCatalog,
       addProfile,
       removeActiveProfile,
@@ -1982,6 +2006,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       embeddingDefaultDim,
       hasUnsavedChanges,
       language,
+      learningCoordinatorEnabled,
       responseLanguage,
       llmContextDetection,
       logs,
@@ -2016,6 +2041,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       updateCodeBlockShowLineNumbers,
       updateCodeBlockTheme,
       updateCodeBlockWrapLongLines,
+      updateLearningCoordinatorEnabled,
       updateContextWindowField,
       updateReasoningEffort,
       updateModelCapability,

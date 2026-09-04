@@ -48,6 +48,8 @@ export interface StartTurnInput {
   selectionTutorContext?: Record<string, unknown> | null;
   subagentConsultBudget?: number | null;
   autoRoute?: boolean | null;
+  learningCoordinator?: boolean | null;
+  learningThreadId?: string | null;
 }
 
 export interface LegacySendMessageArguments {

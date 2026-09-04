@@ -15,6 +15,8 @@ const RUNTIME_ONLY_CONFIG_KEYS = new Set([
   "_superseded_turn_id",
   "auto_route",
   "followup_question_context",
+  "learning_coordinator",
+  "learning_thread_id",
   "selection_tutor_context",
   "subagent_consult_budget",
 ]);
@@ -50,6 +52,9 @@ export function buildStartTurnInput(input: StartTurnInput): StartTurnCommand {
   if (!input.content.trim()) invalid("Turn content must not be empty");
   if (input.subagentConsultBudget != null && input.subagentConsultBudget < 0) {
     invalid("Subagent consult budget must be non-negative");
+  }
+  if (input.learningThreadId != null && input.learningThreadId.length > 128) {
+    invalid("Learning thread ID must be at most 128 characters");
   }
   if (
     input.readingMaterialRevision != null &&
@@ -105,6 +110,8 @@ export function buildStartTurnInput(input: StartTurnInput): StartTurnCommand {
     selection_tutor_context: input.selectionTutorContext ?? null,
     subagent_consult_budget: input.subagentConsultBudget ?? null,
     auto_route: input.autoRoute ?? null,
+    learning_coordinator: input.learningCoordinator ?? null,
+    learning_thread_id: input.learningThreadId ?? null,
   });
 }
 

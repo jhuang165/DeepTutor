@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import {
   buildSelectionTutorConfig,
   extractTexAnnotationFromHtml,
@@ -43,6 +45,18 @@ test("builds selected text context with its containing message", () => {
         source_message_role: "assistant",
       },
     },
+  );
+});
+
+test("selection tutor turns explicitly opt out of the learning coordinator", () => {
+  const source = readFileSync(
+    path.resolve(process.cwd(), "context/QuizFollowupContext.tsx"),
+    "utf8",
+  );
+
+  assert.match(
+    source,
+    /capability: "chat",\s+learning_coordinator: false,\s+knowledge_bases:/,
   );
 });
 
