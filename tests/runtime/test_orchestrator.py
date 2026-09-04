@@ -205,6 +205,59 @@ class TestOrchestratorErrorHandling:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_mode", ["cancel", "close"])
+async def test_stopping_stream_joins_paused_capability(stop_mode: str) -> None:
+    # A stopped consumer must not leave its capability producer alive or its
+    # per-turn bus registered, even when the capability waits for learner input.
+    from deeptutor.runtime.stream_bus import get_bus
+
+    cleaned = asyncio.Event()
+    producer_tasks = []
+
+    class PausedCapability:
+        async def run(self, context, stream):
+            producer_tasks.append(asyncio.current_task())
+            try:
+                await stream.content("Which vector stays parallel?", source="paused")
+                await asyncio.Event().wait()
+            finally:
+                cleaned.set()
+
+    orch = _make_orchestrator({"paused": PausedCapability()})
+    context = UnifiedContext(
+        user_message="Teach me",
+        active_capability="paused",
+        metadata={"turn_id": "paused-cancellation-test"},
+    )
+    handle = orch.handle(context)
+    try:
+        assert (await anext(handle)).type == StreamEventType.SESSION
+        assert (await anext(handle)).type == StreamEventType.CONTENT
+        bus = get_bus("paused-cancellation-test")
+        assert bus is not None
+        if stop_mode == "cancel":
+            consumer = asyncio.create_task(anext(handle))
+            await asyncio.sleep(0)
+            consumer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await consumer
+        else:
+            await handle.aclose()
+        assert cleaned.is_set()
+        assert producer_tasks[0].done()
+        assert get_bus("paused-cancellation-test") is None
+        terminal = [event async for event in bus.subscribe() if event.type == StreamEventType.DONE]
+        assert [event.metadata["status"] for event in terminal] == ["cancelled"]
+    finally:
+        # Bounded test cleanup also keeps the RED run from leaking a task.
+        for task in producer_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*producer_tasks, return_exceptions=True)
+        await handle.aclose()
+
+
 class TestOrchestratorSessionId:
     @pytest.mark.asyncio
     async def test_assigns_session_id_if_missing(self) -> None:

@@ -133,6 +133,9 @@ class ChatOrchestrator:
             status = "completed"
             try:
                 await capability.run(context, bus)
+            except asyncio.CancelledError:
+                status = "cancelled"
+                raise
             except Exception as exc:
                 status = "failed"
                 logger.error("Capability %s failed: %s", cap_name, exc, exc_info=True)
@@ -169,10 +172,17 @@ class ChatOrchestrator:
         stream = bus.subscribe()
         task = asyncio.create_task(_run())
 
-        async for event in stream:
-            yield event
-
-        await task
+        try:
+            async for event in stream:
+                yield event
+            await task
+        finally:
+            # The producer belongs to this stream consumer. Closing or
+            # cancelling the consumer must also unwind a paused capability.
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await stream.aclose()
         await self._publish_completion(context, cap_name)
 
     async def _publish_completion(self, context: UnifiedContext, cap_name: str) -> None:

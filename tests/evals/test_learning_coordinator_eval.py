@@ -269,10 +269,13 @@ def test_local_runner_finishes_batch_after_real_runtime_waiting_input(
     ]
     from deeptutor.core.stream import StreamEvent, StreamEventType
     from deeptutor.learning.coordinator import LearningCoordinator
+    from deeptutor.runtime.registry.capability_registry import get_capability_registry
     from deeptutor.services.session.turn_runtime import TurnRuntimeManager
     from deeptutor.tools.builtin import AskUserTool
 
     runtimes = []
+    producer_tasks = []
+    producer_cleanup = []
     original_init = TurnRuntimeManager.__init__
 
     def capture_runtime(self, *args, **kwargs):
@@ -322,11 +325,40 @@ def test_local_runner_finishes_batch_after_real_runtime_waiting_input(
 
     monkeypatch.setattr(TurnRuntimeManager, "__init__", capture_runtime)
     monkeypatch.setattr(LearningCoordinator, "prepare_payload", controlled_prepare)
-    _patch_orchestrator(monkeypatch, controlled_handle)
+
+    # Keep the real orchestrator and its separate producer task. Replacing
+    # handle() hides orphan capability tasks after runtime cancellation.
+    async def controlled_run(context, stream):
+        producer_tasks.append(asyncio.current_task())
+        try:
+            async for event in controlled_handle(None, context):
+                await stream.emit(event)
+        finally:
+            producer_cleanup.append(context.active_capability)
+
+    registry = get_capability_registry()
+    original_get = registry.get
+
+    def controlled_capability(name):
+        capability = original_get(name)
+        if name in {"chat", "mastery_path"}:
+            capability.run = controlled_run
+        return capability
+
+    monkeypatch.setattr(registry, "get", controlled_capability)
+
+    async def ignore_completion(_event):
+        return None
+
+    monkeypatch.setattr(
+        "deeptutor.runtime.orchestrator.get_event_bus",
+        lambda: SimpleNamespace(publish=ignore_completion),
+    )
+    _patch_llm_config(monkeypatch)
     _patch_runtime_support(monkeypatch)
 
     async def evaluate():
-        return await asyncio.wait_for(
+        artifacts = await asyncio.wait_for(
             module.run_paired_evaluation(
                 cases,
                 runner=_local_runner(module, tmp_path),
@@ -338,6 +370,12 @@ def test_local_runner_finishes_batch_after_real_runtime_waiting_input(
             ),
             timeout=5,
         )
+        # Check before asyncio.run's automatic shutdown can hide a leaked task.
+        assert len(producer_tasks) == 4
+        assert all(task.done() for task in producer_tasks)
+        assert producer_cleanup.count("mastery_path") == 1
+        assert len(producer_cleanup) == 4
+        return artifacts
 
     artifacts = asyncio.run(evaluate())
     machine = artifacts["machine"]
