@@ -73,91 +73,96 @@ export function LearningPathProposal({
         onChange={event => setDraft({ ...draft, goal: event.target.value })}
         className="mt-1 w-full min-w-0 rounded border p-2"
       />
-      <label className="mt-3 block text-sm" htmlFor="learning-starting-point">
-        {t('Starting point')}
-      </label>
-      <textarea
-        id="learning-starting-point"
-        value={draft.starting_point}
-        onChange={event => setDraft({ ...draft, starting_point: event.target.value })}
-        className="mt-1 w-full min-w-0 rounded border p-2"
-      />
-      <label className="mt-3 block text-sm" htmlFor="learning-sources">
-        {t('Sources')}
-      </label>
-      <textarea
-        id="learning-sources"
-        value={draft.sources.map(source => source.label).join('\n')}
-        onChange={event =>
-          setDraft({
-            ...draft,
-            sources: event.target.value
-              .split('\n')
-              .filter(Boolean)
-              .map((label, index) => ({
-                ...(draft.sources[index] ?? {
-                  id: `source-${index}`,
-                  kind: 'note',
-                  source_id: '',
-                  excerpt: '',
-                  position: index,
-                  available: true,
-                  metadata: {},
-                }),
-                label,
-                position: index,
-              })),
-          })
-        }
-        className="mt-1 w-full min-w-0 rounded border p-2"
-      />
-      <label className="mt-3 block text-sm" htmlFor="learning-preferences">
-        {t('Teaching preferences')}
-      </label>
-      <textarea
-        id="learning-preferences"
-        value={draft.teaching_preferences}
-        onChange={event => setDraft({ ...draft, teaching_preferences: event.target.value })}
-        className="mt-1 w-full min-w-0 rounded border p-2"
-      />
-      <ol className="mt-4 space-y-3">
-        {draft.modules.map((module, index) => (
-          <li key={module.id} className="min-w-0 rounded border p-3">
-            <label className="block text-sm" htmlFor={`module-${module.id}`}>
-              {t('Module {{count}}', { count: index + 1 })}
-            </label>
-            <input
-              id={`module-${module.id}`}
-              value={module.name}
-              onChange={event => updateModule(index, { name: event.target.value })}
-              className="mt-1 w-full min-w-0 rounded border p-2"
-            />
-            <label className="mt-2 block text-sm" htmlFor={`objectives-${module.id}`}>
-              {t('Objectives')}
-            </label>
-            <textarea
-              id={`objectives-${module.id}`}
-              value={module.knowledge_points.map(point => point.name).join('\n')}
-              onChange={event =>
-                updateModule(index, {
-                  knowledge_points: event.target.value
-                    .split('\n')
-                    .filter(Boolean)
-                    .map((name, pointIndex) => ({
-                      ...(module.knowledge_points[pointIndex] ?? {
-                        id: `${module.id}-objective-${pointIndex}`,
-                        type: 'concept',
-                        module_id: module.id,
-                      }),
-                      name,
-                    })),
-                })
-              }
-              className="mt-1 w-full min-w-0 rounded border p-2"
-            />
-          </li>
-        ))}
-      </ol>
+      <details className="mt-4 min-w-0">
+        <summary className="cursor-pointer text-sm font-medium">{t('Path details')}</summary>
+        <div className="mt-2 min-w-0">
+          <label className="mt-3 block text-sm" htmlFor="learning-starting-point">
+            {t('Starting point')}
+          </label>
+          <textarea
+            id="learning-starting-point"
+            value={draft.starting_point}
+            onChange={event => setDraft({ ...draft, starting_point: event.target.value })}
+            className="mt-1 w-full min-w-0 rounded border p-2"
+          />
+          <label className="mt-3 block text-sm" htmlFor="learning-sources">
+            {t('Sources')}
+          </label>
+          <textarea
+            id="learning-sources"
+            value={draft.sources.map(source => source.label).join('\n')}
+            onChange={event =>
+              setDraft({
+                ...draft,
+                sources: event.target.value
+                  .split('\n')
+                  .filter(Boolean)
+                  .map((label, index) => ({
+                    ...(draft.sources[index] ?? {
+                      id: `source-${index}`,
+                      kind: 'note',
+                      source_id: '',
+                      excerpt: '',
+                      position: index,
+                      available: true,
+                      metadata: {},
+                    }),
+                    label,
+                    position: index,
+                  })),
+              })
+            }
+            className="mt-1 w-full min-w-0 rounded border p-2"
+          />
+          <label className="mt-3 block text-sm" htmlFor="learning-preferences">
+            {t('Teaching preferences')}
+          </label>
+          <textarea
+            id="learning-preferences"
+            value={draft.teaching_preferences}
+            onChange={event => setDraft({ ...draft, teaching_preferences: event.target.value })}
+            className="mt-1 w-full min-w-0 rounded border p-2"
+          />
+          <ol className="mt-4 space-y-3">
+            {draft.modules.map((module, index) => (
+              <li key={module.id} className="min-w-0 rounded border p-3">
+                <label className="block text-sm" htmlFor={`module-${module.id}`}>
+                  {t('Module {{count}}', { count: index + 1 })}
+                </label>
+                <input
+                  id={`module-${module.id}`}
+                  value={module.name}
+                  onChange={event => updateModule(index, { name: event.target.value })}
+                  className="mt-1 w-full min-w-0 rounded border p-2"
+                />
+                <label className="mt-2 block text-sm" htmlFor={`objectives-${module.id}`}>
+                  {t('Objectives')}
+                </label>
+                <textarea
+                  id={`objectives-${module.id}`}
+                  value={module.knowledge_points.map(point => point.name).join('\n')}
+                  onChange={event =>
+                    updateModule(index, {
+                      knowledge_points: event.target.value
+                        .split('\n')
+                        .filter(Boolean)
+                        .map((name, pointIndex) => ({
+                          ...(module.knowledge_points[pointIndex] ?? {
+                            id: `${module.id}-objective-${pointIndex}`,
+                            type: 'concept',
+                            module_id: module.id,
+                          }),
+                          name,
+                        })),
+                    })
+                  }
+                  className="mt-1 w-full min-w-0 rounded border p-2"
+                />
+              </li>
+            ))}
+          </ol>
+        </div>
+      </details>
       {error ? (
         <p role="alert" className="mt-3 text-sm">
           {error.message}

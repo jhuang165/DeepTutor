@@ -290,7 +290,7 @@ export default function ChatWorkspace() {
   const { setActiveSessionId, language: appLanguage } = useAppShell();
 
   const [learningCoordinatorEnabled, setLearningCoordinatorEnabled] =
-    useState(false);
+    useState<boolean | null>(null);
   useEffect(() => {
     let cancelled = false;
     void apiFetch(apiUrl("/api/settings/ui"), { skipAuthRedirect: true })
@@ -299,10 +299,11 @@ export default function ChatWorkspace() {
         const payload = (await response.json()) as {
           learning_coordinator_enabled?: unknown;
         };
-        if (!cancelled) {
-          setLearningCoordinatorEnabled(
-            payload.learning_coordinator_enabled === true,
-          );
+        if (
+          !cancelled &&
+          typeof payload.learning_coordinator_enabled === "boolean"
+        ) {
+          setLearningCoordinatorEnabled(payload.learning_coordinator_enabled);
         }
       })
       .catch(() => undefined);
@@ -759,48 +760,68 @@ export default function ChatWorkspace() {
   useSetupSync(state.messages);
   const hasMessages = state.messages.length > 0;
   const learningQueue = useLearningQueue(state.sessionId ?? undefined);
+  const coordinatorContextActive =
+    (!state.activeCapability || state.activeCapability === "chat") &&
+    !state.courseId &&
+    !state.masteryPathId &&
+    !state.workspaceMode;
   const learningDecision = useMemo(() => {
+    if (!coordinatorContextActive) return null;
     for (let index = state.messages.length - 1; index >= 0; index -= 1) {
       const decision = selectLearningDecision(state.messages[index]);
       if (decision) return decision;
     }
     return null;
-  }, [state.messages]);
+  }, [coordinatorContextActive, state.messages]);
   const learningPathDraft = useMemo(() => {
+    if (!coordinatorContextActive) return null;
     for (let index = state.messages.length - 1; index >= 0; index -= 1) {
       const draft = selectLearningPathProposal(state.messages[index]);
       if (draft) return draft;
     }
     return null;
-  }, [state.messages]);
+  }, [coordinatorContextActive, state.messages]);
   const [learningEvidence, setLearningEvidence] = useState<LearningEvidence[]>(
     [],
   );
+  const [learningEvidenceError, setLearningEvidenceError] =
+    useState<Error | null>(null);
   useEffect(() => {
     const threadId =
       learningDecision?.scope === "lesson" ? learningDecision.thread_id : null;
     if (!threadId) {
       setLearningEvidence([]);
+      setLearningEvidenceError(null);
       return;
     }
     let cancelled = false;
+    setLearningEvidence([]);
+    setLearningEvidenceError(null);
     void fetchLearningEvidence(threadId)
       .then((records) => {
-        if (!cancelled) setLearningEvidence(records);
+        if (!cancelled) {
+          setLearningEvidence(records);
+          setLearningEvidenceError(null);
+        }
       })
-      .catch(() => {
-        if (!cancelled) setLearningEvidence([]);
+      .catch((reason: unknown) => {
+        if (!cancelled) {
+          setLearningEvidenceError(
+            reason instanceof Error ? reason : new Error(String(reason)),
+          );
+        }
       });
     return () => {
       cancelled = true;
     };
   }, [learningDecision]);
   const coordinatorHomeEnabled =
-    learningCoordinatorEnabled &&
-    !state.activeCapability &&
-    !state.courseId &&
-    !state.masteryPathId &&
-    !state.workspaceMode;
+    learningCoordinatorEnabled === true && coordinatorContextActive;
+  const learningCoordinatorForTurn = !coordinatorContextActive
+    ? false
+    : learningDecision
+      ? true
+      : (learningCoordinatorEnabled ?? undefined);
   const continueLearning = useCallback(
     (item: LearningQueueItem) => {
       if (item.thread_id) {
@@ -1716,13 +1737,13 @@ export default function ChatWorkspace() {
       <LearningActivityPanel
         decision={learningDecision}
         evidence={learningEvidence}
-        onHelp={(level) => {
-          void setLearningHelpLevel(threadId, level).then(() =>
-            adjust(
-              level === 4
-                ? t("Please explain the answer directly.")
-                : t("Give me the next hint."),
-            ),
+        evidenceError={learningEvidenceError}
+        onHelp={async (level) => {
+          await setLearningHelpLevel(threadId, level);
+          adjust(
+            level === 4
+              ? t("Please explain the answer directly.")
+              : t("Give me the next hint."),
           );
         }}
         onVisualEmphasis={(emphasis) =>
@@ -1748,7 +1769,13 @@ export default function ChatWorkspace() {
         }
       />
     );
-  }, [learningDecision, learningEvidence, sendLearningContinuation, t]);
+  }, [
+    learningDecision,
+    learningEvidence,
+    learningEvidenceError,
+    sendLearningContinuation,
+    t,
+  ]);
 
   // Clicking an attachment (from the Activity home or from a chat message)
   // routes into the panel as a new file tab. It auto-opens and the
@@ -2075,8 +2102,7 @@ export default function ChatWorkspace() {
         {
           bookReferences: bookReferencesPayload,
           readingReferences: readingReferencesPayload,
-          learningCoordinator:
-            coordinatorHomeEnabled || learningDecision?.scope === "lesson",
+          learningCoordinator: learningCoordinatorForTurn,
           learningThreadId:
             learningDecision?.scope === "lesson"
               ? learningDecision.thread_id
@@ -2100,7 +2126,7 @@ export default function ChatWorkspace() {
       attachments,
       bookReferencesPayload,
       courseId,
-      coordinatorHomeEnabled,
+      learningCoordinatorForTurn,
       readingReferencesPayload,
       historyReferencesPayload,
       isQuizMode,

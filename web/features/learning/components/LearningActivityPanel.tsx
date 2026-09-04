@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import type { LearningDecision, LearningEvidence } from '../model'
@@ -8,7 +8,8 @@ import type { LearningDecision, LearningEvidence } from '../model'
 export interface LearningActivityPanelProps {
   decision: LearningDecision
   evidence: LearningEvidence[]
-  onHelp: (level: 0 | 1 | 2 | 3 | 4) => void
+  evidenceError?: Error | null
+  onHelp: (level: 0 | 1 | 2 | 3 | 4) => Promise<void>
   onVisualEmphasis: (emphasis: 'more' | 'less') => void
   onRigor: (rigor: 'more' | 'less') => void
   onPacing: (pacing: 'slower' | 'faster') => void
@@ -37,16 +38,31 @@ function EvidenceList({
 export function LearningActivityPanel({
   decision,
   evidence,
+  evidenceError = null,
   onHelp,
   onVisualEmphasis,
   onRigor,
   onPacing,
 }: LearningActivityPanelProps) {
   const { t } = useTranslation()
-  const [pendingHelpLevel, setPendingHelpLevel] = useState<number | null>(null)
-  const requestHelp = (level: 0 | 1 | 2 | 3 | 4) => {
+  const helpPendingRef = useRef(false)
+  const [pendingHelpLevel, setPendingHelpLevel] = useState<0 | 1 | 2 | 3 | 4 | null>(null)
+  const [directHelpConfirmed, setDirectHelpConfirmed] = useState(false)
+  const [helpError, setHelpError] = useState(false)
+  const requestHelp = async (level: 0 | 1 | 2 | 3 | 4) => {
+    if (helpPendingRef.current) return
+    helpPendingRef.current = true
     setPendingHelpLevel(level)
-    onHelp(level)
+    setHelpError(false)
+    try {
+      await onHelp(level)
+      if (level === 4) setDirectHelpConfirmed(true)
+    } catch {
+      setHelpError(true)
+    } finally {
+      helpPendingRef.current = false
+      setPendingHelpLevel(null)
+    }
   }
   return (
     <section aria-labelledby="learning-activity-title" className="min-w-0 max-w-full">
@@ -60,7 +76,11 @@ export function LearningActivityPanel({
       </details>
       <details className="mt-3">
         <summary>{t('Learning evidence')}</summary>
-        <EvidenceList records={evidence} emptyLabel={t('No learning evidence yet.')} />
+        {evidenceError ? (
+          <p role="alert">{t('Learning evidence is unavailable. Please try again.')}</p>
+        ) : (
+          <EvidenceList records={evidence} emptyLabel={t('No learning evidence yet.')} />
+        )}
       </details>
       <details className="mt-3">
         <summary>{t('Sources')}</summary>
@@ -77,13 +97,30 @@ export function LearningActivityPanel({
         )}
       </details>
       <div className="mt-4 flex flex-wrap gap-2">
-        <button onClick={() => requestHelp(1)}>{t('Hint')}</button>
-        <button onClick={() => requestHelp(4)}>{t('Explain directly')}</button>
+        <button
+          disabled={pendingHelpLevel !== null}
+          aria-busy={pendingHelpLevel === 1}
+          onClick={() => void requestHelp(1)}
+        >
+          {t('Hint')}
+        </button>
+        <button
+          disabled={pendingHelpLevel !== null}
+          aria-busy={pendingHelpLevel === 4}
+          onClick={() => void requestHelp(4)}
+        >
+          {t('Explain directly')}
+        </button>
         <button onClick={() => onVisualEmphasis('more')}>{t('More visual')}</button>
         <button onClick={() => onRigor('more')}>{t('More rigorous')}</button>
         <button onClick={() => onPacing('slower')}>{t('Slow down')}</button>
       </div>
-      {pendingHelpLevel === 4 ? (
+      {helpError ? (
+        <p role="alert" className="mt-3 text-sm">
+          {t('Help could not be requested. Please try again.')}
+        </p>
+      ) : null}
+      {directHelpConfirmed ? (
         <p role="status" className="mt-3 text-sm">
           {t('This attempt will not count as independent evidence.')}
         </p>

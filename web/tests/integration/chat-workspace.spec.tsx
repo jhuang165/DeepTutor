@@ -11,7 +11,10 @@ const workspace = vi.hoisted(() => {
   const fn = () => vi.fn();
   return {
     preference: true,
+    settingsResponse: null as Promise<Response> | null,
     queueFails: false,
+    helpFails: false,
+    evidenceFails: false,
     queueItems: [] as any[],
     apiCalls: [] as Array<{ url: string; init?: RequestInit }>,
     state: {
@@ -125,6 +128,9 @@ vi.mock("@/lib/api", () => ({
   apiFetch: vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     workspace.apiCalls.push({ url, init });
+    if (url === "/api/settings/ui" && workspace.settingsResponse) {
+      return workspace.settingsResponse;
+    }
     if (url.includes("/api/learning/queue")) {
       if (workspace.queueFails) throw new Error("offline");
       return {
@@ -139,9 +145,15 @@ vi.mock("@/lib/api", () => ({
       } as Response;
     }
     if (url.includes("/evidence")) {
+      if (workspace.evidenceFails) {
+        return { ok: false, status: 503, json: async () => ({}) } as Response;
+      }
       return { ok: true, json: async () => ({ evidence: [] }) } as Response;
     }
     if (url.includes("/help")) {
+      if (workspace.helpFails) {
+        return { ok: false, status: 503, json: async () => ({}) } as Response;
+      }
       return { ok: true, json: async () => ({ thread: {} }) } as Response;
     }
     if (url.includes("/approve-path")) {
@@ -263,7 +275,10 @@ describe("chat workspace composition", () => {
 describe("learning coordinator workspace", () => {
   beforeEach(() => {
     workspace.preference = true;
+    workspace.settingsResponse = null;
     workspace.queueFails = false;
+    workspace.helpFails = false;
+    workspace.evidenceFails = false;
     workspace.queueItems = [];
     workspace.apiCalls = [];
     workspace.state.sessionId = null;
@@ -339,6 +354,34 @@ describe("learning coordinator workspace", () => {
     );
   });
 
+  it("does not send an explicit opt-out before personal settings hydrate", async () => {
+    // Break caught: a fast default-chat submit turns the temporary false initial state into a backend opt-out.
+    let resolveSettings: (response: Response) => void = () => undefined;
+    workspace.settingsResponse = new Promise<Response>((resolve) => {
+      resolveSettings = resolve;
+    });
+    const user = userEvent.setup();
+    render(<ChatWorkspace />);
+
+    await user.type(screen.getByRole("textbox"), "Teach me Fourier transforms");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    const options = workspace.adapter.sendMessage.mock.calls[0]?.[5] as
+      | { learningCoordinator?: boolean }
+      | undefined;
+    expect(options?.learningCoordinator).toBeUndefined();
+
+    resolveSettings({
+      ok: true,
+      json: async () => ({ learning_coordinator_enabled: true }),
+    } as Response);
+    expect(
+      await screen.findByRole("heading", {
+        name: "What do you want to understand?",
+      }),
+    ).toBeVisible();
+  });
+
   it("opens the owning chat session for a queued lesson", async () => {
     // Break caught: Continue learning does nothing or starts the thread in an unrelated draft session.
     workspace.queueItems = [
@@ -387,6 +430,39 @@ describe("learning coordinator workspace", () => {
       undefined,
       expect.any(Array),
     );
+  });
+
+  it("hides historical learning activity after an explicit capability is selected", async () => {
+    // Break caught: an old lesson decision overrides the newly selected capability's Activity layout.
+    setActiveLesson();
+    workspace.state.activeCapability = "deep_solve";
+    const user = userEvent.setup();
+    render(<ChatWorkspace />);
+
+    await user.click(screen.getByRole("button", { name: "Activity" }));
+
+    expect(
+      screen.queryByRole("heading", {
+        name: "Relate frequency to a signal",
+      }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByTestId("message-list")).toBeVisible();
+  });
+
+  it("keeps learning activity for a persisted default-chat capability", async () => {
+    // Break caught: the context gate mistakes the stored "chat" capability for an explicit non-learning mode.
+    setActiveLesson();
+    workspace.state.activeCapability = "chat";
+    const user = userEvent.setup();
+    render(<ChatWorkspace />);
+
+    await user.click(screen.getByRole("button", { name: "Activity" }));
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Relate frequency to a signal",
+      }),
+    ).toBeVisible();
   });
 
   it("shows a path proposal for path-scope metadata", async () => {
@@ -553,6 +629,24 @@ describe("learning coordinator workspace", () => {
     );
   });
 
+  it("reports unavailable evidence without claiming the evidence list is empty", async () => {
+    // Break caught: an evidence request failure is flattened into the misleading no-evidence empty state.
+    setActiveLesson();
+    workspace.evidenceFails = true;
+    const user = userEvent.setup();
+    render(<ChatWorkspace />);
+
+    await user.click(screen.getByRole("button", { name: "Activity" }));
+    await user.click(await screen.findByText("Learning evidence"));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Learning evidence is unavailable. Please try again.",
+    );
+    expect(
+      screen.queryByText("No learning evidence yet."),
+    ).not.toBeInTheDocument();
+  });
+
   it("requests help level four before sending a direct-answer continuation", async () => {
     // Break caught: Explain directly is mislabeled as a hint or can count as independent evidence.
     setActiveLesson();
@@ -588,6 +682,28 @@ describe("learning coordinator workspace", () => {
         expect.any(Array),
       ),
     );
+  });
+
+  it("shows a help error without sending a continuation when persistence fails", async () => {
+    // Break caught: failed help persistence leaves a false success notice or an unhandled rejection and still sends chat.
+    setActiveLesson();
+    workspace.helpFails = true;
+    const user = userEvent.setup();
+    render(<ChatWorkspace />);
+
+    await user.click(screen.getByRole("button", { name: "Activity" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Explain directly" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Help could not be requested. Please try again.",
+    );
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(workspace.adapter.sendMessage).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", { name: "Explain directly" }),
+    ).toBeEnabled();
   });
 
   it("keeps teaching adjustments scoped to the active learning thread", async () => {

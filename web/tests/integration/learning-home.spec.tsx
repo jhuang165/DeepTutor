@@ -109,6 +109,7 @@ describe('LearningHome', () => {
         onApproved={onApproved}
       />
     )
+    await user.click(screen.getByText('Path details'))
     await user.clear(screen.getByRole('textbox', { name: 'Starting point' }))
     await user.type(screen.getByRole('textbox', { name: 'Starting point' }), 'I know calculus.')
     await user.clear(screen.getByRole('textbox', { name: 'Teaching preferences' }))
@@ -126,6 +127,31 @@ describe('LearningHome', () => {
     expect(approvePath).toHaveBeenCalledTimes(1)
     resolveApproval('path-1')
     await waitFor(() => expect(onApproved).toHaveBeenCalledWith('/mastery/path-1'))
+  })
+
+  it('keeps path details collapsed while the editable goal and approval stay primary', async () => {
+    // Break caught: starting point, sources, preferences, modules, and objectives crowd the primary approval view.
+    const user = userEvent.setup()
+    render(
+      <LearningPathProposal
+        threadId="thread-1"
+        draft={pathDraft}
+        approvePath={vi.fn(async () => 'path-1')}
+        onApproved={vi.fn()}
+      />
+    )
+
+    expect(screen.getByRole('textbox', { name: 'I want to be able to' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Approve path and begin' })).toBeVisible()
+    const disclosure = screen.getByText('Path details').closest('details')
+    expect(disclosure).not.toHaveAttribute('open')
+    expect(screen.getByRole('textbox', { name: 'Starting point' })).not.toBeVisible()
+
+    await user.click(screen.getByText('Path details'))
+    expect(screen.getByRole('textbox', { name: 'Starting point' })).toBeVisible()
+    expect(screen.getByRole('textbox', { name: 'Teaching preferences' })).toBeVisible()
+    expect(screen.getByRole('textbox', { name: 'Module {{count}}' })).toBeVisible()
+    expect(screen.getByRole('textbox', { name: 'Objectives' })).toBeVisible()
   })
 
   it('gates approval when an editable module has no objectives', () => {
@@ -156,6 +182,43 @@ describe('LearningHome', () => {
     )
     expect(screen.getByText('Why this next?').closest('details')).not.toHaveAttribute('open')
     await user.click(screen.getByRole('button', { name: 'Explain directly' }))
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'This attempt will not count as independent evidence.'
+    )
+  })
+
+  it('waits for persisted direct help and prevents concurrent help requests', async () => {
+    // Break caught: direct-help status appears before persistence and repeated clicks launch duplicate updates.
+    let resolveHelp: () => void = () => undefined
+    const onHelp = vi.fn(
+      () =>
+        new Promise<void>(resolve => {
+          resolveHelp = resolve
+        })
+    )
+    const user = userEvent.setup()
+    render(
+      <LearningActivityPanel
+        decision={learningDecision}
+        evidence={[]}
+        onHelp={onHelp}
+        onVisualEmphasis={vi.fn()}
+        onRigor={vi.fn()}
+        onPacing={vi.fn()}
+      />
+    )
+
+    const direct = screen.getByRole('button', { name: 'Explain directly' })
+    await user.click(direct)
+    await user.click(direct)
+
+    expect(onHelp).toHaveBeenCalledTimes(1)
+    expect(direct).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Hint' })).toBeDisabled()
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+
+    resolveHelp()
+    await waitFor(() => expect(direct).toBeEnabled())
     expect(screen.getByRole('status')).toHaveTextContent(
       'This attempt will not count as independent evidence.'
     )
