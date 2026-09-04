@@ -293,17 +293,17 @@ export default function ChatWorkspace() {
     useState<boolean | null>(null);
   useEffect(() => {
     let cancelled = false;
-    void apiFetch(apiUrl("/api/settings/ui"), { skipAuthRedirect: true })
+    void apiFetch(apiUrl("/api/settings"))
       .then(async (response) => {
         if (!response.ok) return;
         const payload = (await response.json()) as {
-          learning_coordinator_enabled?: unknown;
+          ui?: { learning_coordinator_enabled?: unknown };
         };
         if (
           !cancelled &&
-          typeof payload.learning_coordinator_enabled === "boolean"
+          typeof payload.ui?.learning_coordinator_enabled === "boolean"
         ) {
-          setLearningCoordinatorEnabled(payload.learning_coordinator_enabled);
+          setLearningCoordinatorEnabled(payload.ui.learning_coordinator_enabled);
         }
       })
       .catch(() => undefined);

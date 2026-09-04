@@ -4478,9 +4478,8 @@
           "reason": {
             "$ref": "#/components/schemas/LearningQueueReason"
           },
-          "reason_text": {
-            "title": "Reason Text",
-            "type": "string"
+          "reason_data": {
+            "$ref": "#/components/schemas/LearningQueueReasonData"
           },
           "thread_id": {
             "default": "",
@@ -4490,7 +4489,6 @@
         },
         "required": [
           "reason",
-          "reason_text",
           "priority"
         ],
         "title": "LearningQueueItem",
@@ -4506,6 +4504,38 @@
         ],
         "title": "LearningQueueReason",
         "type": "string"
+      },
+      "LearningQueueReasonData": {
+        "description": "Locale-neutral values interpolated by the authenticated client.",
+        "properties": {
+          "answer_state": {
+            "default": "",
+            "enum": [
+              "",
+              "pending_answer",
+              "pending_grading"
+            ],
+            "title": "Answer State",
+            "type": "string"
+          },
+          "goal": {
+            "default": "",
+            "title": "Goal",
+            "type": "string"
+          },
+          "objective": {
+            "default": "",
+            "title": "Objective",
+            "type": "string"
+          },
+          "path_name": {
+            "default": "",
+            "title": "Path Name",
+            "type": "string"
+          }
+        },
+        "title": "LearningQueueReasonData",
+        "type": "object"
       },
       "LearningQueueResponse": {
         "properties": {

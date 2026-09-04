@@ -170,6 +170,15 @@ def test_queue_response_has_typed_items_shape(
     assert set(payload) == {"items"}
     assert payload["items"][0]["thread_id"] == "thread-1"
     assert payload["items"][0]["reason"] == "resume_lesson"
+    # Production break caught: the authenticated queue API returns backend
+    # English instead of a stable reason code plus interpolation values.
+    assert payload["items"][0]["reason_data"] == {
+        "objective": "",
+        "goal": "Understand eigenvectors",
+        "path_name": "",
+        "answer_state": "",
+    }
+    assert "reason_text" not in payload["items"][0]
 
 
 def test_thread_not_found_returns_404(client: TestClient) -> None:

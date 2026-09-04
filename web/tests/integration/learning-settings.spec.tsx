@@ -36,4 +36,21 @@ describe("LearningSettingsSection", () => {
     await user.click(toggle);
     expect(settings.update).toHaveBeenCalledWith(false);
   });
+
+  it("announces a translated persistence failure without an unhandled rejection", async () => {
+    // Production break caught: the toggle discards the rejecting promise, so
+    // rollback is silent and the browser reports an unhandled rejection.
+    settings.update.mockRejectedValue(new Error("private transport detail"));
+    const user = userEvent.setup();
+    render(<LearningSettingsSection />);
+
+    await user.click(
+      screen.getByRole("switch", { name: "Use the Learning Coordinator" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Learning setting could not be saved. Please try again.",
+    );
+    expect(screen.queryByText(/private transport/)).not.toBeInTheDocument();
+  });
 });

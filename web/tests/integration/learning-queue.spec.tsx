@@ -16,7 +16,7 @@ const item = (threadId: string): LearningQueueItem => ({
   objective_id: 'objective-1',
   activity: {},
   reason: 'continue_path',
-  reason_text: 'Continue',
+  reason_data: { objective: '', goal: '', path_name: 'Path one', answer_state: '' },
   priority: 1,
   due_at: null,
 })

@@ -184,15 +184,33 @@ provider seed when the provider supports one:
 python scripts/eval_learning_coordinator.py --mode paired --output .artifacts/learning-coordinator-eval.json
 ```
 
-The command succeeds even when no model provider is configured. In that case every
-pair is recorded as `blocked` and none is counted as a deterministic pass. Inspect
-the generated report for contract failures, redacted raw-output references, latency,
-token usage, and randomized `A`/`B` review slots. Human reviewers must fill all six
-0–4 rubric dimensions; a model grader cannot fill those slots or certify release.
+The command writes two current-user-only (`0600`) artifacts. The requested output
+path is the reviewer copy: it contains only opaque randomized `A`/`B` raw-output
+material and null human-rubric slots. It deliberately contains no mode names,
+contract summaries, provider seed, or label mapping. The sibling
+`.artifacts/learning-coordinator-eval.machine.json` file contains the named
+baseline/coordinator contract results and the authoritative mapping. Keep that
+machine file sealed while review is in progress.
+
+The command succeeds even when no model provider is configured. In that case the
+sealed machine artifact records every pair as `blocked_provider`; this is not a
+deterministic pass. A human reviewer must fill all six 0–4 dimensions for both
+labels in the reviewer artifact and lock that file before an authorized evaluator
+opens the machine artifact. A model grader cannot fill those slots or certify
+release. After scores are locked, the authorized evaluator validates the artifacts
+and performs the exact round trip with:
+
+```bash
+python scripts/eval_learning_coordinator.py --mode unblind --output .artifacts/learning-coordinator-eval.json
+```
+
+This writes `.artifacts/learning-coordinator-eval.unblinded.json` and refuses to
+continue if any score remains null, a score is outside 0–4, a case is missing, or
+an `A`/`B` response does not match the sealed mapping.
 
 Do not change the coordinator rollout default from `off`, or an opt-in deployment
 from `active`, until deterministic checks pass and the blinded human review is
-complete. The `.artifacts/learning-coordinator-eval.json` report and its raw-output
+complete. Both reports, the authorized unblinded output, and the opaque raw-output
 directory are local evaluation evidence and should not be committed.
 
 ---

@@ -75,12 +75,20 @@ def _configure_runtime(
 
     class FakeOrchestrator:
         async def handle(self, context):
+            from deeptutor.capabilities.learning_coordinator.capability import (
+                LearningCoordinatorLoopCapability,
+            )
+
             learning_store = captured.get("learning_store")
             if learning_store is not None:
                 captured["threads_before_orchestration"] = learning_store.list_learning_threads()
             captured["active_capability"] = context.active_capability
             captured["enabled_tools"] = context.enabled_tools
+            captured["config_overrides"] = context.config_overrides
             captured["extension_state"] = context.extension_state
+            captured["learning_extension_active"] = (
+                LearningCoordinatorLoopCapability().is_active(context)
+            )
             captured["context_metadata"] = context.metadata
             captured["orchestrator_started"] = True
             if orchestrator_outcome == "exception":
@@ -258,9 +266,10 @@ async def test_shadow_records_decision_without_changing_chat_route(
 
     assert turn["capability"] == "chat"
     assert captured["active_capability"] == "chat"
-    assert captured["extension_state"]["learning_coordinator"]["decision"]["route"] == (
-        "mastery_path"
-    )
+    # Production break caught: audit-only shadow decisions activate the teaching
+    # extension and change the prompt/tool surface of an ordinary chat turn.
+    assert captured["extension_state"] == {}
+    assert captured["learning_extension_active"] is False
     assert captured["context_metadata"].get("learning_decision") is None
     assert captured["session_metadata"]["learning_decision"]["scope"] == "lesson"
     assert captured["done_metadata"]["learning_decision"]["scope"] == "lesson"
@@ -269,6 +278,27 @@ async def test_shadow_records_decision_without_changing_chat_route(
     assert session["preferences"]["capability"] == "chat"
     assert "learning_decision" not in session["preferences"]
     assert captured["coordinator_payload"]["learning_state"] == {}
+
+
+@pytest.mark.asyncio
+async def test_shadow_pipeline_never_finalizes_capability_learning_results(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Production break caught: a shadow turn can write durable learning evidence
+    # when a capability happens to populate the coordinator result namespace.
+    captured: dict[str, Any] = {}
+
+    await _run_turn(
+        tmp_path,
+        monkeypatch,
+        captured,
+        mode="shadow",
+        orchestrator_outcome="learning_result",
+    )
+
+    assert captured["learning_extension_active"] is False
+    assert captured.get("finish_calls", 0) == 0
+    assert captured["learning_store"].list_evidence() == []
 
 
 @pytest.mark.asyncio
@@ -851,6 +881,39 @@ async def test_coordinator_failure_keeps_chat_turn_successful(
 
 
 @pytest.mark.asyncio
+async def test_late_active_preparation_failure_restores_complete_chat_payload(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Production break caught: after route validation/refiltering succeeds, a
+    # thread-store failure restores only the chat name and leaks routed tools or
+    # config into the fallback execution.
+    captured: dict[str, Any] = {}
+    learning_store = LearningStore(root=tmp_path / "late-failure-learning-store")
+
+    def fail_thread_create(_thread: LearningThread) -> LearningThread:
+        raise RuntimeError("controlled late thread failure")
+
+    monkeypatch.setattr(learning_store, "create_learning_thread", fail_thread_create)
+
+    turn, _session = await _run_turn(
+        tmp_path,
+        monkeypatch,
+        captured,
+        mode="active",
+        saved_opt_in=True,
+        learning_store=learning_store,
+        tools=["web_search"],
+        config={},
+    )
+
+    assert turn["capability"] == "chat"
+    assert captured["active_capability"] == "chat"
+    assert captured["enabled_tools"] == ["web_search"]
+    assert captured["config_overrides"] == {}
+    assert captured["extension_state"] == {}
+
+
+@pytest.mark.asyncio
 async def test_lost_terminal_lease_does_not_finalize_learning_evidence(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -895,7 +958,8 @@ async def test_regeneration_finalization_references_original_persisted_user(
     _configure_runtime(
         monkeypatch,
         captured,
-        mode="shadow",
+        mode="active",
+        saved_opt_in=True,
         orchestrator_outcome="learning_provenance",
     )
     store = SQLiteSessionStore(tmp_path / "regenerated-evidence.db")
@@ -951,7 +1015,8 @@ async def test_completed_turn_finalization_resolves_streamed_source_and_artifact
         tmp_path,
         monkeypatch,
         captured,
-        mode="shadow",
+        mode="active",
+        saved_opt_in=True,
         orchestrator_outcome="learning_provenance",
     )
 

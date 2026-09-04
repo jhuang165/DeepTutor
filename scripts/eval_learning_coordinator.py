@@ -9,9 +9,11 @@ import base64
 from contextlib import ExitStack, contextmanager
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import secrets
+import sys
 import tempfile
 import time
 from typing import Any
@@ -58,6 +60,8 @@ SENSITIVE_QUERY_KEYS = frozenset(
 )
 DEFAULT_PROVIDER_SEED = 317
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 DEFAULT_CASES_PATH = ROOT / "evals" / "learning_coordinator" / "cases.jsonl"
 DEFAULT_RUBRIC_PATH = ROOT / "evals" / "learning_coordinator" / "rubric.yaml"
 
@@ -78,6 +82,8 @@ class EvalCase:
         self.attached_only = bool(payload.get("attached_only", False))
         self.missing_tools = tuple(str(item) for item in payload.get("missing_tools", []))
         self.interrupted = bool(payload.get("interrupted", False))
+        self.delayed_recall = bool(payload.get("delayed_recall", False))
+        self.follow_up_prompt = str(payload.get("follow_up_prompt", ""))
         self.sources = tuple(dict(item) for item in payload.get("sources", []))
         self.stored_turn_state = dict(payload.get("stored_turn_state", {}))
 
@@ -102,6 +108,11 @@ class EvalResult:
         assessment_valid: bool | None = None,
         mastery_before: dict[str, Any] | None = None,
         mastery_after: dict[str, Any] | None = None,
+        decision_persisted: bool = False,
+        thread_state: dict[str, Any] | None = None,
+        persisted_evidence_count: int = 0,
+        activity_consumed: bool = False,
+        review_material: str = "",
         raw_output_ref: str = "",
         blocked_reason: str = "",
         latency_ms: float | None = None,
@@ -121,6 +132,11 @@ class EvalResult:
         self.assessment_valid = assessment_valid
         self.mastery_before = dict(mastery_before or {})
         self.mastery_after = dict(mastery_after or {})
+        self.decision_persisted = decision_persisted
+        self.thread_state = dict(thread_state or {})
+        self.persisted_evidence_count = int(persisted_evidence_count)
+        self.activity_consumed = activity_consumed
+        self.review_material = review_material
         self.raw_output_ref = raw_output_ref
         self.blocked_reason = blocked_reason
         self.latency_ms = latency_ms
@@ -178,12 +194,11 @@ def _mastery_snapshot(store: Any) -> dict[str, Any]:
     return snapshot
 
 
-def _source_manifest(case: EvalCase) -> tuple[list[Any], str, dict[str, str]]:
-    from deeptutor.core.context import Attachment
+def _outgoing_attachments(case: EvalCase) -> tuple[list[dict[str, str]], dict[str, str]]:
+    """Build only client-authorized attachment fields plus a logical-name map."""
 
-    attachments: list[Attachment] = []
-    lines: list[str] = []
-    source_index: dict[str, str] = {}
+    attachments: list[dict[str, str]] = []
+    source_by_filename: dict[str, str] = {}
     for source in case.sources:
         source_id = str(source.get("id") or "").strip()
         text = str(source.get("text") or "")
@@ -191,19 +206,15 @@ def _source_manifest(case: EvalCase) -> tuple[list[Any], str, dict[str, str]]:
         if not source_id:
             continue
         attachments.append(
-            Attachment(
-                type="file",
-                filename=filename,
-                mime_type="text/plain",
-                id=source_id,
-                base64=base64.b64encode(text.encode("utf-8")).decode("ascii"),
-                extracted_text=text,
-            )
+            {
+                "type": "file",
+                "filename": filename,
+                "mime_type": "text/plain",
+                "base64": base64.b64encode(text.encode("utf-8")).decode("ascii"),
+            }
         )
-        source_index[source_id] = text
-        lines.append(f"- id={source_id} name={filename} type=file preview={text[:240]}")
-    manifest = "[Attached Sources]\n" + "\n".join(lines) if lines else ""
-    return attachments, manifest, source_index
+        source_by_filename[filename] = source_id
+    return attachments, source_by_filename
 
 
 def _citation_ids(value: Any) -> set[str]:
@@ -325,7 +336,7 @@ def _provider_seed(seed: int, *, supported: bool):
 
 
 class LocalDeepTutorRunner:
-    """Run isolated ordinary-chat and active-coordinator turns in process."""
+    """Run isolated arms through production turn preparation and finalization."""
 
     def __init__(
         self,
@@ -339,7 +350,7 @@ class LocalDeepTutorRunner:
         self._seed_supported = seed_supported
 
     @contextmanager
-    def _isolated_learning_store(self, store: Any):
+    def _isolated_runtime(self, store: Any, attachment_store: Any, coordinator_mode: str):
         modules = (
             "deeptutor.learning.coordinator.service",
             "deeptutor.learning.service",
@@ -362,6 +373,29 @@ class LocalDeepTutorRunner:
             stack.enter_context(
                 patch.object(storage, "LearningStore", lambda *_args, **_kwargs: store)
             )
+            storage_service = __import__(
+                "deeptutor.services.storage", fromlist=["get_attachment_store"]
+            )
+            stack.enter_context(
+                patch.object(storage_service, "get_attachment_store", lambda: attachment_store)
+            )
+            runtime_settings = __import__(
+                "deeptutor.services.config.runtime_settings",
+                fromlist=["load_system_settings"],
+            )
+            original_load_settings = runtime_settings.load_system_settings
+
+            def isolated_settings() -> dict[str, Any]:
+                return {
+                    **dict(original_load_settings()),
+                    "learning_coordinator_mode": (
+                        "active" if coordinator_mode == "active" else "off"
+                    ),
+                }
+
+            stack.enter_context(
+                patch.object(runtime_settings, "load_system_settings", isolated_settings)
+            )
             yield
 
     async def run(
@@ -371,100 +405,70 @@ class LocalDeepTutorRunner:
         fixture: dict[str, Any],
         resume_state: dict[str, Any] | None,
     ) -> EvalResult:
-        from deeptutor.core.context import TurnRuntimeContext, UnifiedContext
-        from deeptutor.learning.coordinator import LearningCoordinator, decision_payload
-        from deeptutor.learning.coordinator.models import CapabilityLearningResult
-        from deeptutor.learning.evidence import validate_open_assessment
+        from deeptutor.learning.coordinator.models import LearningDecision
+        from deeptutor.learning.models import EvidenceOutcome
         from deeptutor.learning.storage import LearningStore
-        from deeptutor.runtime.orchestrator import ChatOrchestrator
         from deeptutor.runtime.registry.capability_registry import get_capability_registry
         from deeptutor.runtime.registry.tool_registry import get_tool_registry
-        from deeptutor.services.llm.config import get_llm_config
+        from deeptutor.services.session import SQLiteSessionStore
+        from deeptutor.services.session.turn_runtime import TurnRuntimeManager
+        from deeptutor.services.storage import LocalDiskAttachmentStore
 
         started = time.perf_counter()
         arm_root = self._runtime_root / f"arm-{secrets.token_hex(16)}"
         store = LearningStore(root=arm_root / "learning")
-        attachments, source_manifest, source_index = _source_manifest(case)
+        session_store = SQLiteSessionStore(db_path=arm_root / "sessions.db")
+        attachment_store = LocalDiskAttachmentStore(root=arm_root / "attachments")
+        attachments, source_by_filename = _outgoing_attachments(case)
         registry = get_capability_registry()
         tool_registry = get_tool_registry()
-        session_id = (
-            "eval-"
-            + hashlib.sha256(case.id.encode("utf-8")).hexdigest()[:24]
-        )
-        turn_id = "eval-turn-" + hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:20]
+        session_id = "eval-" + hashlib.sha256(case.id.encode("utf-8")).hexdigest()[:24]
         loaded_resume = self._store_resume_fixture(
             store,
             case,
             session_id,
             resume_state,
         )
-        extension_state: dict[str, dict[str, Any]] = {}
-        active_capability = "chat"
-        decision = None
+        current_prompt = case.follow_up_prompt if case.delayed_recall else case.prompt
         payload = {
-            "content": case.prompt,
+            "content": current_prompt,
             "capability": "chat",
+            "session_id": session_id,
             "language": "en",
             "tools": [],
-            "attachments": [dict(source) for source in case.sources],
+            "attachments": attachments,
             "knowledge_bases": [],
-            "learning_state": {
-                "previous_help_level": int((loaded_resume or {}).get("help_level", 0)),
-                "last_outcome": str((loaded_resume or {}).get("last_outcome", "")),
-                "repeated_request": bool(loaded_resume),
-                "server_next_activity": None,
-            },
+            "learning_coordinator": coordinator_mode == "active",
         }
+        if loaded_resume:
+            payload["learning_thread_id"] = loaded_resume["thread_id"]
         before = _mastery_snapshot(store)
         events: list[dict[str, Any]] = []
-        context = None
         preparation_error: Exception | None = None
-        try:
-            if coordinator_mode == "active":
-                decision = await LearningCoordinator(store=store).prepare_payload(
-                    payload,
-                    set(registry.list_capabilities()),
-                    get_llm_config(),
-                )
-                decision = decision.model_copy(
-                    update={
-                        "thread_id": str((loaded_resume or {}).get("thread_id") or "")
-                        or "eval-thread-"
-                        + hashlib.sha256(case.id.encode("utf-8")).hexdigest()[:20]
-                    }
-                )
-                active_capability = (
-                    decision.route if registry.get(decision.route) is not None else "chat"
-                )
-                extension_state = {
-                    "learning_coordinator": {"decision": decision_payload(decision)}
-                }
+        runtime = TurnRuntimeManager(store=session_store)
 
-            context = UnifiedContext(
-                session_id=session_id,
-                user_message=case.prompt,
-                conversation_history=[],
-                enabled_tools=[],
-                allowed_builtin_tools=[],
-                active_capability=active_capability,
-                attachments=attachments,
-                source_manifest=source_manifest,
-                runtime=TurnRuntimeContext(turn_id=turn_id),
-                extension_state=extension_state,
-                metadata={
-                    "turn_id": turn_id,
-                    "source_index": source_index,
-                    "book_references": [],
-                    "mastery_path_id": "",
-                    "_mastery_nav_available": False,
-                },
-            )
+        async def skip_title_generation(**_kwargs: Any) -> None:
+            return None
+
+        runtime._maybe_generate_session_title = skip_title_generation
+        turn: dict[str, Any] = {}
+        messages: list[dict[str, Any]] = []
+        try:
             with (
-                self._isolated_learning_store(store),
+                self._isolated_runtime(store, attachment_store, coordinator_mode),
                 _provider_seed(int(fixture["provider_seed"]), supported=self._seed_supported),
             ):
-                async for event in ChatOrchestrator(registry).handle(context):
-                    events.append(event.to_dict())
+                await session_store.create_session(session_id=session_id)
+                await self._seed_session_history(
+                    session_store,
+                    session_id=session_id,
+                    resume_state=resume_state,
+                    goal=str((resume_state or {}).get("goal") or case.prompt),
+                )
+                _session, turn = await runtime.start_turn(payload)
+                async for event in runtime.subscribe_turn(turn["id"]):
+                    events.append(event)
+                messages = await session_store.get_messages(session_id)
         except Exception as exc:
             preparation_error = exc
             metadata: dict[str, Any] = {}
@@ -472,6 +476,53 @@ class LocalDeepTutorRunner:
             if isinstance(error_code, str) and error_code:
                 metadata["error_code"] = error_code
             events.append({"type": "error", "content": str(exc), "metadata": metadata})
+        finally:
+            await runtime.close(drain_timeout_seconds=1.0)
+
+        decision_raw = next(
+            (
+                dict((item.get("metadata") or {})["learning_decision"])
+                for item in events
+                if isinstance((item.get("metadata") or {}).get("learning_decision"), dict)
+            ),
+            None,
+        )
+        decision = None
+        if decision_raw is not None:
+            decision_raw.pop("requested_capability", None)
+            decision_raw.pop("active_capability", None)
+            decision = LearningDecision.model_validate(decision_raw)
+
+        actual_attachment_ids: dict[str, str] = {}
+        for message in messages:
+            for attachment in message.get("attachments") or []:
+                filename = str(attachment.get("filename") or "")
+                attachment_id = str(attachment.get("id") or "")
+                if filename in source_by_filename and attachment_id:
+                    actual_attachment_ids[attachment_id] = source_by_filename[filename]
+
+        evidence_records = store.list_evidence()
+        turn_id = str(turn.get("id") or "")
+        new_evidence = [record for record in evidence_records if record.turn_id == turn_id]
+        evidence_record = new_evidence[-1] if new_evidence else None
+        evidence = (
+            self._evidence_summary(evidence_record, actual_attachment_ids)
+            if evidence_record is not None
+            else None
+        )
+        assessment_valid = (
+            evidence_record.outcome is not EvidenceOutcome.UNASSESSED
+            if evidence_record is not None
+            else None
+        )
+        thread = (
+            store.get_learning_thread(decision.thread_id)
+            if decision is not None and decision.thread_id
+            else store.get_learning_thread(str((loaded_resume or {}).get("thread_id") or ""))
+            if loaded_resume
+            else None
+        )
+        thread_state = thread.model_dump(mode="json") if thread is not None else {}
         after = _mastery_snapshot(store)
         raw_ref = self._write_raw_output(events)
         done = next((item for item in reversed(events) if item.get("type") == "done"), {})
@@ -489,42 +540,29 @@ class LocalDeepTutorRunner:
             {},
         )
         cost_summary = result_metadata.get("metadata", {}).get("cost_summary", {})
-        coordinator_result = (
-            context.extension_state.get("learning_coordinator", {}).get("result")
-            if context is not None
-            else None
-        )
-        assessment_valid: bool | None = None
-        evidence = None
-        if isinstance(coordinator_result, dict):
-            parsed = CapabilityLearningResult.model_validate(coordinator_result)
-            if parsed.assessment is not None:
-                validated = validate_open_assessment(parsed.assessment, case.prompt)
-                assessment_valid = validated is not None
-                if validated is not None and decision is not None:
-                    evidence = {
-                        "objective_id": decision.objective_id or decision.thread_id,
-                        "activity_id": decision.activity.kind.value,
-                        "learner_response_ref": f"chat-turn:{turn_id}:user",
-                        "rubric": [item.model_dump(mode="json") for item in validated.rubric],
-                        "outcome": validated.outcome,
-                        "help_level": decision.activity.help_level,
-                        "source_refs": parsed.source_refs,
-                        "timestamp": time.time(),
-                        "confidence": 1.0 - validated.uncertainty,
-                        "independent": bool(decision.activity.independent_required),
-                    }
         citation_ids = set()
         for item in events:
             metadata = item.get("metadata") or {}
             citation_ids.update(_citation_ids(metadata.get("citations")))
             citation_ids.update(_citation_ids(metadata.get("citation_ids")))
+        logical_citation_ids = {
+            actual_attachment_ids.get(citation_id, citation_id) for citation_id in citation_ids
+        }
+        active_capability = str(turn.get("capability") or "chat")
         planned_route = decision.route if decision is not None else active_capability
         route_available = registry.get(planned_route) is not None and all(
             tool_registry.get(name) is not None for name in case.missing_tools
         )
         help_level = decision.activity.help_level if decision is not None else 0
-        response = str(result_metadata.get("response") or "")
+        persisted_response = next(
+            (
+                str(message.get("content") or "")
+                for message in reversed(messages)
+                if message.get("role") == "assistant"
+            ),
+            "",
+        )
+        response = str(result_metadata.get("response") or persisted_response)
         return EvalResult(
             status=status,
             scope=decision.scope.value if decision is not None else case.scope,
@@ -534,14 +572,19 @@ class LocalDeepTutorRunner:
             direct_answer_honored=(
                 _response_gives_direct_answer(response) if case.direct_answer else None
             ),
-            source_ids=sorted(citation_ids),
+            source_ids=sorted(logical_citation_ids),
             evidence=evidence,
             route=active_capability,
             route_available=route_available,
-            resumed_from_state=self._observed_resume_state(store, loaded_resume),
+            resumed_from_state=loaded_resume,
             assessment_valid=assessment_valid,
             mastery_before=before,
             mastery_after=after,
+            decision_persisted=decision_raw is not None,
+            thread_state=thread_state,
+            persisted_evidence_count=len(evidence_records),
+            activity_consumed=bool(new_evidence),
+            review_material=response,
             raw_output_ref=raw_ref,
             blocked_reason="; ".join(errors) if status == "blocked" else "",
             latency_ms=round((time.perf_counter() - started) * 1000, 3),
@@ -551,6 +594,56 @@ class LocalDeepTutorRunner:
                 "total_tokens": int(cost_summary.get("total_tokens") or 0),
             },
         )
+
+    @staticmethod
+    async def _seed_session_history(
+        session_store: Any,
+        *,
+        session_id: str,
+        resume_state: dict[str, Any] | None,
+        goal: str,
+    ) -> None:
+        if resume_state is None:
+            return
+        await session_store.ensure_session(session_id)
+        prior_messages = resume_state.get("prior_messages")
+        if not isinstance(prior_messages, list):
+            prior_messages = [
+                {"role": "user", "content": goal},
+                {"role": "assistant", "content": "A follow-up learning activity was scheduled."},
+            ]
+        for message in prior_messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip()
+            content = str(message.get("content") or "").strip()
+            if role not in {"user", "assistant"} or not content:
+                continue
+            await session_store.add_message(
+                session_id=session_id,
+                role=role,
+                content=content,
+                capability="chat",
+            )
+
+    @staticmethod
+    def _evidence_summary(record: Any, source_ids: dict[str, str]) -> dict[str, Any]:
+        return {
+            "objective_id": record.objective_id or record.thread_id,
+            "activity_id": record.activity_kind,
+            "learner_response_ref": record.response_ref or f"chat-turn:{record.turn_id}:user",
+            "response": record.response,
+            "rubric": list(record.rubric),
+            "outcome": record.outcome.value,
+            "help_level": record.help_level,
+            "source_refs": [source_ids.get(item, item) for item in record.source_refs],
+            "timestamp": record.created_at,
+            "confidence": 1.0 - record.uncertainty,
+            "independent": record.independent,
+            "transfer": record.transfer,
+            "recipe_id": record.recipe_id,
+            "recipe_version": record.recipe_version,
+        }
 
     @staticmethod
     def _provider_unavailable(
@@ -601,42 +694,42 @@ class LocalDeepTutorRunner:
     ) -> dict[str, Any] | None:
         if resume_state is None:
             return None
+        from deeptutor.learning.coordinator.models import ActivityPlan
         from deeptutor.learning.models import LearningThread, LearningThreadStatus
 
         thread_id = str(resume_state.get("thread_id") or "")
         if not thread_id:
             return None
-        next_activity = {
-            "activity_id": str(resume_state.get("next_activity_id") or ""),
-            "help_level": int(resume_state.get("help_level") or 0),
-        }
-        if resume_state.get("last_outcome"):
-            next_activity["last_outcome"] = str(resume_state["last_outcome"])
-        store.create_learning_thread(
+        goal = str(resume_state.get("goal") or case.prompt)
+        raw_next_activity = resume_state.get("next_activity")
+        if isinstance(raw_next_activity, dict):
+            next_activity = ActivityPlan.model_validate(raw_next_activity).model_dump(mode="json")
+        else:
+            next_activity = ActivityPlan(
+                kind="explanation",
+                objective=goal,
+                learner_action="Continue the persisted learning activity.",
+                help_level=int(resume_state.get("help_level") or 0),
+            ).model_dump(mode="json")
+        thread = store.create_learning_thread(
             LearningThread(
                 thread_id=thread_id,
                 session_id=session_id,
                 scope=case.scope if case.scope in {"lesson", "path"} else "lesson",
-                goal=case.prompt,
+                goal=goal,
                 status=LearningThreadStatus.ACTIVE,
                 next_activity=next_activity,
             )
         )
-        return self._observed_resume_state(store, {"thread_id": thread_id})
-
-    @staticmethod
-    def _observed_resume_state(
-        store: Any, loaded_resume: dict[str, Any] | None
-    ) -> dict[str, Any]:
-        if not loaded_resume:
-            return {}
-        thread = store.get_learning_thread(str(loaded_resume.get("thread_id") or ""))
-        if thread is None:
-            return {}
         return {
             "thread_id": thread.thread_id,
-            "next_activity_id": str(thread.next_activity.get("activity_id") or ""),
+            "next_activity_id": str(
+                resume_state.get("next_activity_id")
+                or thread.next_activity.get("kind")
+                or ""
+            ),
             "help_level": int(thread.next_activity.get("help_level") or 0),
+            "next_activity": dict(thread.next_activity),
         }
 
     def _write_raw_output(
@@ -662,6 +755,14 @@ def _result_summary(result: EvalResult, score: ContractScore) -> dict[str, Any]:
         "route": result.route,
         "route_available": result.route_available,
         "resumed_from_state": result.resumed_from_state,
+        "assessment_valid": result.assessment_valid,
+        "mastery_before": result.mastery_before,
+        "mastery_after": result.mastery_after,
+        "decision_persisted": result.decision_persisted,
+        "thread_state": result.thread_state,
+        "persisted_evidence_count": result.persisted_evidence_count,
+        "activity_consumed": result.activity_consumed,
+        "review_material": result.review_material,
         "blocked_reason": result.blocked_reason,
         "deterministic_passed": score.passed,
     }
@@ -683,7 +784,8 @@ async def run_paired_evaluation(
 ) -> dict[str, Any]:
     """Execute baseline/coordinator pairs against one immutable fixture per case."""
 
-    pairs: list[dict[str, Any]] = []
+    reviewer_pairs: list[dict[str, Any]] = []
+    machine_pairs: list[dict[str, Any]] = []
     any_blocked = False
     any_contract_failure = False
     dimensions = list(rubric["dimensions"])
@@ -695,28 +797,54 @@ async def run_paired_evaluation(
             "provider_seed": provider_seed,
             "seed_supported": seed_supported,
         }
-        resume_state = dict(case.stored_turn_state) if case.interrupted else None
+        resume_state = (
+            dict(case.stored_turn_state) if case.interrupted or case.delayed_recall else None
+        )
         baseline = await runner.run(case, "off", fixture, resume_state)
         coordinator = await runner.run(case, "active", fixture, resume_state)
         baseline_score = score_contracts(case, baseline)
-        coordinator_score = score_contracts(case, coordinator)
+        coordinator_score = score_contracts(case, coordinator, require_coordinator=True)
         any_blocked = any_blocked or "blocked" in {baseline.status, coordinator.status}
         any_contract_failure = any_contract_failure or not coordinator_score.passed
 
-        outputs = [
-            {
+        named_outputs = {
+            "baseline": {
                 "raw_output_ref": baseline.raw_output_ref,
                 "latency_ms": baseline.latency_ms,
                 "token_usage": baseline.token_usage,
             },
-            {
+            "coordinator": {
                 "raw_output_ref": coordinator.raw_output_ref,
                 "latency_ms": coordinator.latency_ms,
                 "token_usage": coordinator.token_usage,
             },
-        ]
-        secrets.SystemRandom().shuffle(outputs)
-        pairs.append(
+        }
+        randomized_modes = ["baseline", "coordinator"]
+        secrets.SystemRandom().shuffle(randomized_modes)
+        label_mapping = dict(zip(("A", "B"), randomized_modes, strict=True))
+        blinded_outputs = {
+            label: {
+                "content": (
+                    baseline.review_material
+                    if mode == "baseline"
+                    else coordinator.review_material
+                )
+            }
+            for label, mode in label_mapping.items()
+        }
+        reviewer_pairs.append(
+            {
+                "case_id": case.id,
+                "case_version": case.version,
+                "domain": case.domain,
+                "scope": case.scope,
+                "blinded_outputs": blinded_outputs,
+                "human_rubric": {
+                    label: {dimension: None for dimension in dimensions} for label in ("A", "B")
+                },
+            }
+        )
+        machine_pairs.append(
             {
                 "case_id": case.id,
                 "case_version": case.version,
@@ -726,18 +854,24 @@ async def run_paired_evaluation(
                     "model": model,
                     "settings": dict(settings),
                     "source_ids": _fixture_source_ids(case),
+                    "provider_seed": provider_seed,
                     "provider_seed_applied": seed_supported,
                 },
-                "baseline_result": _result_summary(baseline, baseline_score),
-                "coordinator_result": _result_summary(coordinator, coordinator_score),
+                "results": {
+                    "baseline": {
+                        **named_outputs["baseline"],
+                        **_result_summary(baseline, baseline_score),
+                    },
+                    "coordinator": {
+                        **named_outputs["coordinator"],
+                        **_result_summary(coordinator, coordinator_score),
+                    },
+                },
                 "contract_failures": {
                     "baseline": baseline_score.failures,
                     "coordinator": coordinator_score.failures,
                 },
-                "blinded_outputs": {"A": outputs[0], "B": outputs[1]},
-                "human_rubric": {
-                    label: {dimension: None for dimension in dimensions} for label in ("A", "B")
-                },
+                "label_mapping": label_mapping,
             }
         )
     release_gate = (
@@ -748,12 +882,21 @@ async def run_paired_evaluation(
         else "awaiting_human_review"
     )
     return {
-        "schema_version": 1,
-        "mode": "paired",
-        "release_gate": release_gate,
-        "human_review_required": True,
-        "model_grader_used": False,
-        "cases": pairs,
+        "reviewer": {
+            "schema_version": 2,
+            "human_review_required": True,
+            "model_grader_used": False,
+            "cases": reviewer_pairs,
+        },
+        "machine": {
+            "schema_version": 2,
+            "mode": "paired",
+            "release_gate": release_gate,
+            "human_review_required": True,
+            "model_grader_used": False,
+            "rubric_dimensions": dimensions,
+            "cases": machine_pairs,
+        },
     }
 
 
@@ -802,13 +945,124 @@ def _redacted(value: Any, *, key: str = "") -> Any:
 
 
 def write_redacted_report(path: Path, report: dict[str, Any]) -> None:
-    """Serialize a report after recursive credential and URL-query redaction."""
+    """Serialize a current-user-only report after recursive redaction."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(_redacted(report), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    serialized = json.dumps(_redacted(report), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            stream.write(serialized)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def machine_artifact_path(reviewer_path: Path) -> Path:
+    """Return the stable sealed companion path for a reviewer artifact."""
+
+    return reviewer_path.with_name(f"{reviewer_path.stem}.machine.json")
+
+
+def unblinded_artifact_path(reviewer_path: Path) -> Path:
+    """Return the stable authorized post-review output path."""
+
+    return reviewer_path.with_name(f"{reviewer_path.stem}.unblinded.json")
+
+
+def write_paired_artifacts(output: Path, artifacts: dict[str, Any]) -> tuple[Path, Path]:
+    """Write separate blind-review and sealed machine artifacts."""
+
+    reviewer_path = output
+    machine_path = machine_artifact_path(output)
+    write_redacted_report(reviewer_path, dict(artifacts["reviewer"]))
+    write_redacted_report(machine_path, dict(artifacts["machine"]))
+    return reviewer_path, machine_path
+
+
+def unblind_scored_review(reviewer_path: Path, machine_path: Path) -> dict[str, Any]:
+    """Join locked human scores to the authoritative sealed label mapping."""
+
+    reviewer = json.loads(reviewer_path.read_text(encoding="utf-8"))
+    machine = json.loads(machine_path.read_text(encoding="utf-8"))
+    reviewer_cases = reviewer.get("cases")
+    machine_cases = machine.get("cases")
+    if not isinstance(reviewer_cases, list) or not isinstance(machine_cases, list):
+        raise ValueError("reviewer and machine artifacts must contain case arrays")
+    machine_by_case = {
+        str(case.get("case_id") or ""): case
+        for case in machine_cases
+        if isinstance(case, dict)
+    }
+    if len(machine_by_case) != len(machine_cases) or len(reviewer_cases) != len(machine_cases):
+        raise ValueError("reviewer and machine artifacts do not contain the same cases")
+    rubric_dimensions = machine.get("rubric_dimensions")
+    if not isinstance(rubric_dimensions, list) or not rubric_dimensions:
+        raise ValueError("machine artifact does not define rubric dimensions")
+    expected_dimensions = {str(dimension) for dimension in rubric_dimensions}
+
+    joined_cases: list[dict[str, Any]] = []
+    for reviewer_case in reviewer_cases:
+        if not isinstance(reviewer_case, dict):
+            raise ValueError("reviewer case is invalid")
+        case_id = str(reviewer_case.get("case_id") or "")
+        machine_case = machine_by_case.get(case_id)
+        if machine_case is None:
+            raise ValueError(f"machine artifact is missing case {case_id!r}")
+        for field in ("case_version", "domain", "scope"):
+            if reviewer_case.get(field) != machine_case.get(field):
+                raise ValueError(f"case {case_id!r} does not match machine field {field!r}")
+        mapping = machine_case.get("label_mapping")
+        named_results = machine_case.get("results")
+        blinded_outputs = reviewer_case.get("blinded_outputs")
+        human_rubric = reviewer_case.get("human_rubric")
+        if not all(
+            isinstance(value, dict)
+            for value in (mapping, named_results, blinded_outputs, human_rubric)
+        ):
+            raise ValueError(f"case {case_id!r} has an invalid review contract")
+        if set(mapping) != {"A", "B"} or set(mapping.values()) != {
+            "baseline",
+            "coordinator",
+        }:
+            raise ValueError(f"case {case_id!r} has an invalid label mapping")
+
+        results: dict[str, Any] = {}
+        for label in ("A", "B"):
+            mode = str(mapping[label])
+            blinded = blinded_outputs.get(label)
+            named = named_results.get(mode)
+            scores = human_rubric.get(label)
+            if not all(isinstance(value, dict) for value in (blinded, named, scores)):
+                raise ValueError(f"case {case_id!r} label {label} is incomplete")
+            if blinded.get("content") != named.get("review_material"):
+                raise ValueError(f"case {case_id!r} label {label} does not round-trip")
+            if set(scores) != expected_dimensions or any(
+                isinstance(score, bool)
+                or not isinstance(score, (int, float))
+                or not 0 <= score <= 4
+                for score in scores.values()
+            ):
+                raise ValueError(f"case {case_id!r} label {label} scores are not locked")
+            results[mode] = {**named, "human_rubric": dict(scores)}
+        joined_cases.append(
+            {
+                "case_id": case_id,
+                "case_version": reviewer_case.get("case_version"),
+                "domain": reviewer_case.get("domain"),
+                "scope": reviewer_case.get("scope"),
+                "results": results,
+            }
+        )
+    return {
+        "schema_version": 2,
+        "mode": "unblinded",
+        "release_gate": machine.get("release_gate"),
+        "human_scores_locked": True,
+        "cases": joined_cases,
+    }
 
 
 def _validate_case(case: EvalCase, *, line_number: int) -> None:
@@ -830,6 +1084,18 @@ def _validate_case(case: EvalCase, *, line_number: int) -> None:
         raise ValueError(f"line {line_number}: expected scope must match fixture scope")
     if case.interrupted and not case.stored_turn_state:
         raise ValueError(f"line {line_number}: interrupted case needs stored_turn_state")
+    if case.delayed_recall:
+        if not case.follow_up_prompt.strip() or not case.stored_turn_state:
+            raise ValueError(
+                f"line {line_number}: delayed recall needs a follow-up prompt and stored state"
+            )
+        from deeptutor.learning.coordinator.models import ActivityPlan
+
+        activity = ActivityPlan.model_validate(case.stored_turn_state.get("next_activity"))
+        if activity.assessment_method != "delayed_retrieval" or not activity.independent_required:
+            raise ValueError(
+                f"line {line_number}: delayed recall needs an independent delayed-retrieval activity"
+            )
 
 
 def load_cases(path: Path) -> list[EvalCase]:
@@ -869,6 +1135,7 @@ def validate_scenario_matrix(cases: list[EvalCase]) -> None:
         "attached_only",
         "missing_tools",
         "interrupted",
+        "delayed_recall",
     )
     for domain in sorted(REQUIRED_DOMAINS):
         domain_cases = [case for case in cases if case.domain == domain]
@@ -931,7 +1198,12 @@ def _valid_evidence_schema(value: dict[str, Any]) -> bool:
     )
 
 
-def score_contracts(case: EvalCase, result: EvalResult) -> ContractScore:
+def score_contracts(
+    case: EvalCase,
+    result: EvalResult,
+    *,
+    require_coordinator: bool = False,
+) -> ContractScore:
     """Score runtime-owned learning contracts without an LLM judge."""
 
     failures: list[str] = []
@@ -959,6 +1231,12 @@ def score_contracts(case: EvalCase, result: EvalResult) -> ContractScore:
         failures.append("untrusted_source_ids")
     if result.evidence is not None and not _valid_evidence_schema(result.evidence):
         failures.append("invalid_evidence_schema")
+    if (
+        result.evidence is not None
+        and result.evidence.get("help_level") == 4
+        and result.evidence.get("independent") is True
+    ):
+        failures.append("complete_answer_marked_independent")
     minimum_help_level = case.expected.get("minimum_help_level")
     if minimum_help_level is not None and (
         result.final_help_level is None or result.final_help_level < int(minimum_help_level)
@@ -973,6 +1251,15 @@ def score_contracts(case: EvalCase, result: EvalResult) -> ContractScore:
         failures.append("resume_state_mismatch")
     if result.assessment_valid is False and result.mastery_before != result.mastery_after:
         failures.append("invalid_assessment_mutated_mastery")
+    if require_coordinator and result.status == "completed":
+        if not result.decision_persisted:
+            failures.append("coordinator_decision_not_persisted")
+        if case.scope in {"lesson", "path"} and not result.thread_state:
+            failures.append("learning_thread_not_persisted")
+        if (case.interrupted or case.delayed_recall) and not result.activity_consumed:
+            failures.append("resume_activity_not_consumed")
+        if case.delayed_recall and result.evidence is None:
+            failures.append("delayed_recall_not_observed")
     return ContractScore(failures)
 
 
@@ -999,7 +1286,7 @@ def _provider_details() -> tuple[str, dict[str, Any], bool]:
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("paired",), default="paired")
+    parser.add_argument("--mode", choices=("paired", "unblind"), default="paired")
     parser.add_argument("--cases", type=Path, default=DEFAULT_CASES_PATH)
     parser.add_argument("--rubric", type=Path, default=DEFAULT_RUBRIC_PATH)
     parser.add_argument("--output", type=Path, required=True)
@@ -1013,6 +1300,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 async def _run_cli(args: argparse.Namespace) -> dict[str, Any]:
+    if args.mode == "unblind":
+        machine_path = machine_artifact_path(args.output)
+        report = unblind_scored_review(args.output, machine_path)
+        target = unblinded_artifact_path(args.output)
+        write_redacted_report(target, report)
+        return {"unblinded": report, "output": str(target)}
+
     cases = load_cases(args.cases)
     validate_scenario_matrix(cases)
     rubric = load_rubric(args.rubric)
@@ -1048,7 +1342,7 @@ async def _run_cli(args: argparse.Namespace) -> dict[str, Any]:
                 seed_supported=seed_supported,
             )
         else:
-            raw_output_dir = args.output.parent / f"{args.output.stem}.raw"
+            raw_output_dir = args.output.parent / f".{secrets.token_hex(16)}.raw"
             with tempfile.TemporaryDirectory(prefix="deeptutor-learning-eval-") as temporary:
                 runner = LocalDeepTutorRunner(
                     runtime_root=Path(temporary),
@@ -1064,25 +1358,34 @@ async def _run_cli(args: argparse.Namespace) -> dict[str, Any]:
                     provider_seed=args.provider_seed,
                     seed_supported=seed_supported,
                 )
-    write_redacted_report(args.output, report)
+    write_paired_artifacts(args.output, report)
     return report
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     report = asyncio.run(_run_cli(args))
+    if args.mode == "unblind":
+        unblinded = report["unblinded"]
+        print(
+            f"wrote {len(unblinded['cases'])} unblinded cases to {report['output']} "
+            f"(release_gate={unblinded['release_gate']})"
+        )
+        return 0
+    machine = report["machine"]
     blocked = sum(
         1
-        for pair in report["cases"]
+        for pair in machine["cases"]
         if "blocked"
         in {
-            pair["baseline_result"]["status"],
-            pair["coordinator_result"]["status"],
+            pair["results"]["baseline"]["status"],
+            pair["results"]["coordinator"]["status"],
         }
     )
     print(
-        f"wrote {len(report['cases'])} paired cases to {args.output} "
-        f"(release_gate={report['release_gate']}, blocked={blocked})"
+        f"wrote {len(machine['cases'])} paired cases to {args.output} and "
+        f"{machine_artifact_path(args.output)} "
+        f"(release_gate={machine['release_gate']}, blocked={blocked})"
     )
     return 0
 

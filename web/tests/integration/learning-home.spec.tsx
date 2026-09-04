@@ -17,7 +17,12 @@ const queueItem: LearningQueueItem = {
   objective_id: 'objective-1',
   activity: { kind: 'retrieval', objective: 'Recall the definition' },
   reason: 'due_review',
-  reason_text: 'A review is due.',
+  reason_data: {
+    objective: 'objective-1',
+    goal: '',
+    path_name: '',
+    answer_state: '',
+  },
   priority: 1,
   due_at: 1,
 }
@@ -88,6 +93,7 @@ describe('LearningHome', () => {
     const user = userEvent.setup()
     render(<LearningHome items={[queueItem]} loading={false} onContinue={onContinue} />)
     expect(screen.getByText('1 review due')).toBeVisible()
+    expect(screen.getByText('Review {{objective}}; its spaced-repetition practice is due.')).toBeVisible()
     await user.click(screen.getByRole('button', { name: 'Continue learning' }))
     expect(onContinue).toHaveBeenCalledWith(queueItem)
   })
@@ -167,6 +173,148 @@ describe('LearningHome', () => {
     expect(screen.getByRole('button', { name: 'Approve path and begin' })).toBeDisabled()
   })
 
+  it('rejects whitespace-only proposal fields and submits trimmed values', async () => {
+    // Production break caught: whitespace-only objectives pass the approval
+    // gate, and surrounding whitespace reaches the server as durable path data.
+    const whitespaceObjective = {
+      ...pathDraft,
+      modules: [
+        {
+          ...pathDraft.modules[0],
+          knowledge_points: [{ ...pathDraft.modules[0].knowledge_points[0], name: '   ' }],
+        },
+      ],
+    }
+    const { unmount } = render(
+      <LearningPathProposal
+        threadId="thread-1"
+        draft={whitespaceObjective}
+        approvePath={vi.fn(async () => 'path-1')}
+        onApproved={vi.fn()}
+      />
+    )
+    expect(screen.getByRole('button', { name: 'Approve path and begin' })).toBeDisabled()
+    unmount()
+
+    const approvePath = vi.fn<
+      (threadId: string, draft: LearningPathDraft) => Promise<string>
+    >(async () => 'path-1')
+    const trimmedDraft: LearningPathDraft = {
+      ...pathDraft,
+      goal: '  Understand signals  ',
+      sources: [
+        {
+          id: 'source-a',
+          kind: 'note',
+          source_id: 'note-a',
+          label: '  Signal notes  ',
+          excerpt: 'kept',
+          position: 0,
+          available: true,
+          metadata: { provenance: 'kept' },
+        },
+      ],
+      modules: [
+        {
+          ...pathDraft.modules[0],
+          name: '  Foundation  ',
+          knowledge_points: [
+            { ...pathDraft.modules[0].knowledge_points[0], name: '  Frequency  ' },
+          ],
+        },
+      ],
+    }
+    render(
+      <LearningPathProposal
+        threadId="thread-1"
+        draft={trimmedDraft}
+        approvePath={approvePath}
+        onApproved={vi.fn()}
+      />
+    )
+    await userEvent.click(screen.getByRole('button', { name: 'Approve path and begin' }))
+    expect(approvePath).toHaveBeenCalledWith(
+      'thread-1',
+      expect.objectContaining({
+        goal: 'Understand signals',
+        sources: [expect.objectContaining({ id: 'source-a', label: 'Signal notes' })],
+        modules: [
+          expect.objectContaining({
+            name: 'Foundation',
+            knowledge_points: [expect.objectContaining({ name: 'Frequency' })],
+          }),
+        ],
+      })
+    )
+  })
+
+  it('edits sources by stable id across reorder and delete operations', async () => {
+    // Production break caught: deleting or moving the first source transfers a
+    // different source's stable id, excerpt, or provenance onto the visible label.
+    const approvePath = vi.fn<
+      (threadId: string, draft: LearningPathDraft) => Promise<string>
+    >(async () => 'path-1')
+    const sources = ['a', 'b', 'c'].map((id, position) => ({
+      id: `source-${id}`,
+      kind: 'note',
+      source_id: `note-${id}`,
+      label: `Source ${id.toUpperCase()}`,
+      excerpt: `Excerpt ${id}`,
+      position,
+      available: true,
+      metadata: { provenance: id },
+    }))
+    render(
+      <LearningPathProposal
+        threadId="thread-1"
+        draft={{ ...pathDraft, sources }}
+        approvePath={approvePath}
+        onApproved={vi.fn()}
+      />
+    )
+    const user = userEvent.setup()
+    await user.click(screen.getByText('Path details'))
+    await user.click(screen.getByRole('button', { name: 'Move source down 1' }))
+    await user.click(screen.getByRole('button', { name: 'Remove source 1' }))
+    await user.click(screen.getByRole('button', { name: 'Approve path and begin' }))
+
+    const submitted = approvePath.mock.calls[0][1]
+    expect(submitted.sources).toEqual([
+      expect.objectContaining({
+        id: 'source-a',
+        excerpt: 'Excerpt a',
+        metadata: { provenance: 'a' },
+        position: 0,
+      }),
+      expect.objectContaining({
+        id: 'source-c',
+        excerpt: 'Excerpt c',
+        metadata: { provenance: 'c' },
+        position: 1,
+      }),
+    ])
+  })
+
+  it('renders a localized generic approval failure instead of transport detail', async () => {
+    // Production break caught: backend or proxy error text is rendered verbatim
+    // into the learner-facing proposal.
+    render(
+      <LearningPathProposal
+        threadId="thread-1"
+        draft={pathDraft}
+        approvePath={vi.fn(async () => {
+          throw new Error('private upstream transport detail')
+        })}
+        onApproved={vi.fn()}
+      />
+    )
+    await userEvent.click(screen.getByRole('button', { name: 'Approve path and begin' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Path approval failed. Please try again.'
+    )
+    expect(screen.queryByText(/private upstream/)).not.toBeInTheDocument()
+  })
+
   it('marks direct explanations as non-independent evidence', async () => {
     // Break caught: direct answers are displayed as evidence-earning attempts.
     const user = userEvent.setup()
@@ -188,7 +336,8 @@ describe('LearningHome', () => {
   })
 
   it('waits for persisted direct help and prevents concurrent help requests', async () => {
-    // Break caught: direct-help status appears before persistence and repeated clicks launch duplicate updates.
+    // Break caught: direct-help status appears before persistence, repeated clicks launch duplicate
+    // updates, and a successfully consumed level-four answer can be requested again.
     let resolveHelp: () => void = () => undefined
     const onHelp = vi.fn(
       () =>
@@ -218,9 +367,83 @@ describe('LearningHome', () => {
     expect(screen.queryByRole('status')).not.toBeInTheDocument()
 
     resolveHelp()
-    await waitFor(() => expect(direct).toBeEnabled())
+    await waitFor(() => expect(direct).toHaveAttribute('aria-busy', 'false'))
+    expect(direct).toBeDisabled()
     expect(screen.getByRole('status')).toHaveTextContent(
       'This attempt will not count as independent evidence.'
     )
+  })
+
+  it('progresses hints through levels one, two, and three before direct answer four', async () => {
+    // Production break caught: every Hint click requests absolute level one,
+    // making the server reject the second click and levels two/three unreachable.
+    const onHelp = vi.fn<
+      (level: 0 | 1 | 2 | 3 | 4) => Promise<void>
+    >(async () => undefined)
+    render(
+      <LearningActivityPanel
+        decision={learningDecision}
+        evidence={[]}
+        onHelp={onHelp}
+        onVisualEmphasis={vi.fn()}
+        onRigor={vi.fn()}
+        onPacing={vi.fn()}
+      />
+    )
+    const user = userEvent.setup()
+    const hint = screen.getByRole('button', { name: 'Hint' })
+    await user.click(hint)
+    await user.click(hint)
+    await user.click(hint)
+    expect(onHelp.mock.calls.map(([level]) => level)).toEqual([1, 2, 3])
+    expect(hint).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: 'Explain directly' }))
+    expect(onHelp.mock.calls.map(([level]) => level)).toEqual([1, 2, 3, 4])
+    expect(screen.getByRole('button', { name: 'Explain directly' })).toBeDisabled()
+  })
+
+  it('does not advance the hint level when persistence fails', async () => {
+    // Production break caught: a failed level-one request advances local state,
+    // so retry skips to level two even though the server never accepted one.
+    const onHelp = vi
+      .fn<(level: 0 | 1 | 2 | 3 | 4) => Promise<void>>()
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce(undefined)
+    render(
+      <LearningActivityPanel
+        decision={learningDecision}
+        evidence={[]}
+        onHelp={onHelp}
+        onVisualEmphasis={vi.fn()}
+        onRigor={vi.fn()}
+        onPacing={vi.fn()}
+      />
+    )
+    const user = userEvent.setup()
+    const hint = screen.getByRole('button', { name: 'Hint' })
+    await user.click(hint)
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Help could not be requested. Please try again.'
+    )
+    await user.click(hint)
+    expect(onHelp.mock.calls.map(([level]) => level)).toEqual([1, 1])
+  })
+
+  it('marks every standalone learning action as a non-submit button', () => {
+    // Production break caught: embedding a learning panel in a form submits it
+    // when any standalone action omits an explicit button type.
+    render(
+      <LearningActivityPanel
+        decision={learningDecision}
+        evidence={[]}
+        onHelp={vi.fn()}
+        onVisualEmphasis={vi.fn()}
+        onRigor={vi.fn()}
+        onPacing={vi.fn()}
+      />
+    )
+    for (const button of screen.getAllByRole('button')) {
+      expect(button).toHaveAttribute('type', 'button')
+    }
   })
 })

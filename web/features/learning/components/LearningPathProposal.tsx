@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import type { LearningModule, LearningPathDraft } from '../model'
@@ -23,6 +23,29 @@ function copyDraft(draft: LearningPathDraft): LearningPathDraft {
   }
 }
 
+function normalizedDraft(draft: LearningPathDraft): LearningPathDraft {
+  return {
+    ...copyDraft(draft),
+    name: draft.name.trim(),
+    goal: draft.goal.trim(),
+    sources: draft.sources
+      .map(source => ({ ...source, label: source.label.trim() }))
+      .filter(source => source.label.length > 0)
+      .map((source, position) => ({ ...source, position })),
+    modules: draft.modules.map(module => ({
+      ...module,
+      name: module.name.trim(),
+      knowledge_points: module.knowledge_points
+        .map(point => ({ ...point, name: point.name.trim() }))
+        .filter(point => point.name.length > 0),
+    })),
+  }
+}
+
+function sourcesAtCurrentPositions(sources: LearningPathDraft['sources']) {
+  return sources.map((source, position) => ({ ...source, position }))
+}
+
 export function LearningPathProposal({
   threadId,
   draft: initialDraft,
@@ -32,9 +55,15 @@ export function LearningPathProposal({
   const { t } = useTranslation()
   const [draft, setDraft] = useState(() => copyDraft(initialDraft))
   const [approving, setApproving] = useState(false)
-  const [error, setError] = useState<Error | null>(null)
+  const [approvalFailed, setApprovalFailed] = useState(false)
+  const sourceCounter = useRef(0)
+  const submissionDraft = normalizedDraft(draft)
   const valid =
-    draft.modules.length > 0 && draft.modules.every(module => module.knowledge_points.length > 0)
+    Boolean(submissionDraft.name && submissionDraft.goal) &&
+    submissionDraft.modules.length > 0 &&
+    submissionDraft.modules.every(
+      module => Boolean(module.name) && module.knowledge_points.length > 0
+    )
 
   const updateModule = (index: number, update: Partial<LearningModule>) => {
     setDraft(current => ({
@@ -45,15 +74,72 @@ export function LearningPathProposal({
     }))
   }
 
+  const updateSourceLabel = (sourceId: string, label: string) => {
+    setDraft(current => ({
+      ...current,
+      sources: current.sources.map(source =>
+        source.id === sourceId ? { ...source, label } : source
+      ),
+    }))
+  }
+
+  const moveSource = (sourceId: string, offset: -1 | 1) => {
+    setDraft(current => {
+      const sources = [...current.sources]
+      const index = sources.findIndex(source => source.id === sourceId)
+      const nextIndex = index + offset
+      if (index < 0 || nextIndex < 0 || nextIndex >= sources.length) return current
+      const [source] = sources.splice(index, 1)
+      sources.splice(nextIndex, 0, source)
+      return { ...current, sources: sourcesAtCurrentPositions(sources) }
+    })
+  }
+
+  const removeSource = (sourceId: string) => {
+    setDraft(current => ({
+      ...current,
+      sources: sourcesAtCurrentPositions(
+        current.sources.filter(source => source.id !== sourceId)
+      ),
+    }))
+  }
+
+  const addSource = () => {
+    setDraft(current => {
+      const existing = new Set(current.sources.map(source => source.id))
+      let id = ''
+      do {
+        sourceCounter.current += 1
+        id = `new-source-${sourceCounter.current}`
+      } while (existing.has(id))
+      return {
+        ...current,
+        sources: [
+          ...current.sources,
+          {
+            id,
+            kind: 'note',
+            source_id: '',
+            label: '',
+            excerpt: '',
+            position: current.sources.length,
+            available: true,
+            metadata: {},
+          },
+        ],
+      }
+    })
+  }
+
   const approve = async () => {
     if (!valid || approving) return
     setApproving(true)
-    setError(null)
+    setApprovalFailed(false)
     try {
-      const pathId = await approvePath(threadId, draft)
+      const pathId = await approvePath(threadId, submissionDraft)
       onApproved(`/mastery/${pathId}`)
-    } catch (reason) {
-      setError(reason instanceof Error ? reason : new Error(String(reason)))
+    } catch {
+      setApprovalFailed(true)
     } finally {
       setApproving(false)
     }
@@ -85,35 +171,52 @@ export function LearningPathProposal({
             onChange={event => setDraft({ ...draft, starting_point: event.target.value })}
             className="mt-1 w-full min-w-0 rounded border p-2"
           />
-          <label className="mt-3 block text-sm" htmlFor="learning-sources">
-            {t('Sources')}
-          </label>
-          <textarea
-            id="learning-sources"
-            value={draft.sources.map(source => source.label).join('\n')}
-            onChange={event =>
-              setDraft({
-                ...draft,
-                sources: event.target.value
-                  .split('\n')
-                  .filter(Boolean)
-                  .map((label, index) => ({
-                    ...(draft.sources[index] ?? {
-                      id: `source-${index}`,
-                      kind: 'note',
-                      source_id: '',
-                      excerpt: '',
-                      position: index,
-                      available: true,
-                      metadata: {},
-                    }),
-                    label,
-                    position: index,
-                  })),
-              })
-            }
-            className="mt-1 w-full min-w-0 rounded border p-2"
-          />
+          <fieldset className="mt-3 min-w-0">
+            <legend className="block text-sm">{t('Sources')}</legend>
+            <div className="mt-1 space-y-2">
+              {draft.sources.map((source, index) => (
+                <div key={source.id} className="min-w-0 rounded border p-2">
+                  <label className="block text-sm" htmlFor={`learning-source-${index}`}>
+                    {t('Source')} {index + 1}
+                  </label>
+                  <input
+                    id={`learning-source-${index}`}
+                    value={source.label}
+                    onChange={event => updateSourceLabel(source.id, event.target.value)}
+                    className="mt-1 w-full min-w-0 rounded border p-2"
+                  />
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      aria-label={`${t('Move source up')} ${index + 1}`}
+                      disabled={index === 0}
+                      onClick={() => moveSource(source.id, -1)}
+                    >
+                      {t('Move up')}
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`${t('Move source down')} ${index + 1}`}
+                      disabled={index === draft.sources.length - 1}
+                      onClick={() => moveSource(source.id, 1)}
+                    >
+                      {t('Move down')}
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`${t('Remove source')} ${index + 1}`}
+                      onClick={() => removeSource(source.id)}
+                    >
+                      {t('Remove source')}
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <button type="button" className="mt-2" onClick={addSource}>
+              {t('Add source')}
+            </button>
+          </fieldset>
           <label className="mt-3 block text-sm" htmlFor="learning-preferences">
             {t('Teaching preferences')}
           </label>
@@ -163,12 +266,13 @@ export function LearningPathProposal({
           </ol>
         </div>
       </details>
-      {error ? (
+      {approvalFailed ? (
         <p role="alert" className="mt-3 text-sm">
-          {error.message}
+          {t('Path approval failed. Please try again.')}
         </p>
       ) : null}
       <button
+        type="button"
         disabled={!valid || approving}
         aria-busy={approving}
         className="mt-4 rounded bg-primary px-3 py-2 text-primary-foreground disabled:opacity-50"

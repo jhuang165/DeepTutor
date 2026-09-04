@@ -210,16 +210,13 @@ async function installTurnTransport(page: Page) {
   });
 }
 
-test("broad goal becomes an editable path and continues into a grounded activity", async ({
-  page,
-}) => {
+async function runLearningCoordinatorAudit(page: Page) {
   let approvedGoal = "";
   const helpLevels: number[] = [];
   const pageErrors: string[] = [];
 
   page.on("pageerror", (error) => pageErrors.push(error.message));
 
-  await page.setViewportSize({ width: 320, height: 760 });
   await installTurnTransport(page);
   await page.route("**/api/**", async (route) => {
     const request = route.request();
@@ -236,14 +233,19 @@ test("broad goal becomes an editable path and continues into a grounded activity
       });
     }
     if (path === "/api/settings/ui") {
-      return json({ language: "en", learning_coordinator_enabled: true });
+      return json({ language: "en" });
     }
     if (path === "/api/capabilities/registered") {
       return json({
         capabilities: [{ id: "chat", kind: "turn", available: true }],
       });
     }
-    if (path === "/api/settings") return json({ catalog: {} });
+    if (path === "/api/settings") {
+      return json({
+        catalog: {},
+        ui: { learning_coordinator_enabled: true },
+      });
+    }
     if (path === "/api/settings/llm-options") {
       return json({
         active: { profile_id: "profile", model_id: "model" },
@@ -524,4 +526,14 @@ test("broad goal becomes an editable path and continues into a grounded activity
     ),
   ).toBe(true);
   expect(pageErrors).toEqual([]);
+}
+
+test("broad learning flow at the configured desktop viewport", async ({ page }) => {
+  expect(page.viewportSize()?.width).toBeGreaterThan(320);
+  await runLearningCoordinatorAudit(page);
+});
+
+test("broad learning flow remains usable at 320 pixels", async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 760 });
+  await runLearningCoordinatorAudit(page);
 });

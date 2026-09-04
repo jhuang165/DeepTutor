@@ -1,6 +1,6 @@
 'use client'
 
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import type { LearningDecision, LearningEvidence } from '../model'
@@ -47,8 +47,14 @@ export function LearningActivityPanel({
   const { t } = useTranslation()
   const helpPendingRef = useRef(false)
   const [pendingHelpLevel, setPendingHelpLevel] = useState<0 | 1 | 2 | 3 | 4 | null>(null)
+  const [confirmedHelpLevel, setConfirmedHelpLevel] = useState<0 | 1 | 2 | 3 | 4>(
+    decision.activity.help_level
+  )
   const [directHelpConfirmed, setDirectHelpConfirmed] = useState(false)
   const [helpError, setHelpError] = useState(false)
+  useEffect(() => {
+    setConfirmedHelpLevel(decision.activity.help_level)
+  }, [decision.activity.help_level, decision.thread_id])
   const requestHelp = async (level: 0 | 1 | 2 | 3 | 4) => {
     if (helpPendingRef.current) return
     helpPendingRef.current = true
@@ -56,6 +62,7 @@ export function LearningActivityPanel({
     setHelpError(false)
     try {
       await onHelp(level)
+      setConfirmedHelpLevel(level)
       if (level === 4) setDirectHelpConfirmed(true)
     } catch {
       setHelpError(true)
@@ -64,6 +71,7 @@ export function LearningActivityPanel({
       setPendingHelpLevel(null)
     }
   }
+  const nextHintLevel = Math.min(confirmedHelpLevel + 1, 3) as 1 | 2 | 3
   return (
     <section aria-labelledby="learning-activity-title" className="min-w-0 max-w-full">
       <h2 id="learning-activity-title" className="text-lg font-semibold">
@@ -98,22 +106,30 @@ export function LearningActivityPanel({
       </details>
       <div className="mt-4 flex flex-wrap gap-2">
         <button
-          disabled={pendingHelpLevel !== null}
-          aria-busy={pendingHelpLevel === 1}
-          onClick={() => void requestHelp(1)}
+          type="button"
+          disabled={pendingHelpLevel !== null || confirmedHelpLevel >= 3}
+          aria-busy={pendingHelpLevel === nextHintLevel}
+          onClick={() => void requestHelp(nextHintLevel)}
         >
           {t('Hint')}
         </button>
         <button
-          disabled={pendingHelpLevel !== null}
+          type="button"
+          disabled={pendingHelpLevel !== null || confirmedHelpLevel >= 4}
           aria-busy={pendingHelpLevel === 4}
           onClick={() => void requestHelp(4)}
         >
           {t('Explain directly')}
         </button>
-        <button onClick={() => onVisualEmphasis('more')}>{t('More visual')}</button>
-        <button onClick={() => onRigor('more')}>{t('More rigorous')}</button>
-        <button onClick={() => onPacing('slower')}>{t('Slow down')}</button>
+        <button type="button" onClick={() => onVisualEmphasis('more')}>
+          {t('More visual')}
+        </button>
+        <button type="button" onClick={() => onRigor('more')}>
+          {t('More rigorous')}
+        </button>
+        <button type="button" onClick={() => onPacing('slower')}>
+          {t('Slow down')}
+        </button>
       </div>
       {helpError ? (
         <p role="alert" className="mt-3 text-sm">

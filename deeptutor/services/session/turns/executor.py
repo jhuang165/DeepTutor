@@ -865,7 +865,8 @@ class TurnExecutor:
                             )
                         }
                     }
-                    if isinstance(payload.get("learning_decision"), dict)
+                    if payload.get("_learning_coordinator_active") is True
+                    and isinstance(payload.get("learning_decision"), dict)
                     else {}
                 ),
                 metadata={

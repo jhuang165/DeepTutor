@@ -404,8 +404,17 @@ class TurnRequestPreparer:
             "llm_selection": llm_selection,
             "learning_state": {},
         }
+        # Preserve the complete, already validated ordinary-chat execution
+        # payload before an active coordinator may switch schemas and tools.
+        # Every later preparation failure must restore this snapshot together.
+        chat_fallback_payload = {
+            "capability": capability,
+            "config": dict(payload.get("config", {}) or {}),
+            "tools": list(payload.get("tools") or []),
+        }
         learning_decision = None
         learning_decision_status = None
+        learning_coordinator_active = False
         rollout_mode = (
             str(system_settings.get("learning_coordinator_mode") or "off").strip().lower()
         )
@@ -583,6 +592,7 @@ class TurnRequestPreparer:
                     "requested_capability": requested_capability,
                     "active_capability": capability,
                 }
+                learning_coordinator_active = coordinator_mode == "active"
             except Exception as exc:
                 # The coordinator is observational in Release 1. Do not
                 # include request content in this operational error surface.
@@ -593,13 +603,15 @@ class TurnRequestPreparer:
                 )
                 learning_decision_status = "failed"
                 learning_decision = None
+                learning_coordinator_active = False
                 if coordinator_mode == "active":
-                    capability = "chat"
-                    payload = {**payload, "capability": capability}
+                    capability = str(chat_fallback_payload["capability"])
+                    payload = {**payload, **chat_fallback_payload}
         payload = {
             **payload,
             "learning_decision": learning_decision,
             "learning_decision_status": learning_decision_status,
+            "_learning_coordinator_active": learning_coordinator_active,
         }
         lease = None
         if self.coordinator is not None:

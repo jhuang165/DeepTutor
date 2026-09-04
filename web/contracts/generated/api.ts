@@ -10718,8 +10718,7 @@ export interface components {
       /** Priority */
       readonly priority: number;
       readonly reason: components["schemas"]["LearningQueueReason"];
-      /** Reason Text */
-      readonly reason_text: string;
+      readonly reason_data?: components["schemas"]["LearningQueueReasonData"];
       /**
        * Thread Id
        * @default
@@ -10736,6 +10735,33 @@ export interface components {
       | "due_review"
       | "needs_transfer"
       | "continue_path";
+    /**
+     * LearningQueueReasonData
+     * @description Locale-neutral values interpolated by the authenticated client.
+     */
+    readonly LearningQueueReasonData: {
+      /**
+       * Answer State
+       * @default
+       * @enum {string}
+       */
+      readonly answer_state: "" | "pending_answer" | "pending_grading";
+      /**
+       * Goal
+       * @default
+       */
+      readonly goal: string;
+      /**
+       * Objective
+       * @default
+       */
+      readonly objective: string;
+      /**
+       * Path Name
+       * @default
+       */
+      readonly path_name: string;
+    };
     /** LearningQueueResponse */
     readonly LearningQueueResponse: {
       /** Items */
@@ -13573,6 +13599,8 @@ export type SchemaLearningQueueItem =
   components["schemas"]["LearningQueueItem"];
 export type SchemaLearningQueueReason =
   components["schemas"]["LearningQueueReason"];
+export type SchemaLearningQueueReasonData =
+  components["schemas"]["LearningQueueReasonData"];
 export type SchemaLearningQueueResponse =
   components["schemas"]["LearningQueueResponse"];
 export type SchemaLearningThread = components["schemas"]["LearningThread"];

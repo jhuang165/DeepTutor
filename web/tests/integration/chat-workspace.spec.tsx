@@ -128,7 +128,7 @@ vi.mock("@/lib/api", () => ({
   apiFetch: vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     workspace.apiCalls.push({ url, init });
-    if (url === "/api/settings/ui" && workspace.settingsResponse) {
+    if (url === "/api/settings" && workspace.settingsResponse) {
       return workspace.settingsResponse;
     }
     if (url.includes("/api/learning/queue")) {
@@ -165,7 +165,7 @@ vi.mock("@/lib/api", () => ({
     return {
       ok: true,
       json: async () => ({
-        learning_coordinator_enabled: workspace.preference,
+        ui: { learning_coordinator_enabled: workspace.preference },
       }),
     } as Response;
   }),
@@ -370,7 +370,8 @@ describe("learning coordinator workspace", () => {
   afterEach(() => cleanup());
 
   it("asks what the learner wants to understand on an opted-in empty chat", async () => {
-    // Break caught: a saved opt-in still receives the generic empty-chat home instead of LearningHome.
+    // Production break caught: chat reads the public pre-session UI projection,
+    // which intentionally cannot contain the authenticated coordinator opt-in.
     render(<ChatWorkspace />);
 
     expect(
@@ -379,6 +380,7 @@ describe("learning coordinator workspace", () => {
       }),
     ).toBeVisible();
     expect(screen.getAllByRole("textbox")).toHaveLength(1);
+    expect(workspace.apiCalls.some(({ url }) => url === "/api/settings")).toBe(true);
   });
 
   it("preserves the ordinary home when the learner has not opted in", async () => {
@@ -448,7 +450,7 @@ describe("learning coordinator workspace", () => {
 
     resolveSettings({
       ok: true,
-      json: async () => ({ learning_coordinator_enabled: true }),
+      json: async () => ({ ui: { learning_coordinator_enabled: true } }),
     } as Response);
     expect(
       await screen.findByRole("heading", {
@@ -466,7 +468,12 @@ describe("learning coordinator workspace", () => {
         objective_id: "objective-1",
         activity: { kind: "guided_attempt", objective: "Resume signals" },
         reason: "resume_lesson",
-        reason_text: "Resume the lesson.",
+        reason_data: {
+          objective: "",
+          goal: "Understand signals",
+          path_name: "",
+          answer_state: "",
+        },
         priority: 10,
         due_at: null,
       },
@@ -567,7 +574,7 @@ describe("learning coordinator workspace", () => {
     await act(async () => {
       resolveSettings({
         ok: true,
-        json: async () => ({ learning_coordinator_enabled: false }),
+        json: async () => ({ ui: { learning_coordinator_enabled: false } }),
       } as Response);
     });
 

@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import json
 from pathlib import Path
+import stat
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -124,7 +125,13 @@ def _complete_result(module, case, **overrides):
     return module.EvalResult(**values)
 
 
-def _learning_decision(*, scope: str, help_level: int = 1, route: str = "chat"):
+def _learning_decision(
+    *,
+    scope: str,
+    help_level: int = 1,
+    route: str = "chat",
+    goal: str = "Controlled evaluation goal",
+):
     from deeptutor.learning.coordinator.models import (
         ActivityKind,
         ActivityPlan,
@@ -135,7 +142,7 @@ def _learning_decision(*, scope: str, help_level: int = 1, route: str = "chat"):
     return LearningDecision(
         scope=LearningScope(scope),
         route=route,
-        goal="Controlled evaluation goal",
+        goal=goal,
         activity=ActivityPlan(
             kind=ActivityKind.EXPLANATION,
             objective="Observe the executed boundary",
@@ -201,11 +208,52 @@ def _patch_orchestrator(monkeypatch, handle) -> None:
     from deeptutor.runtime import orchestrator
 
     class ControlledOrchestrator:
-        def __init__(self, _registry) -> None:
-            pass
+        def __init__(self, _registry=None, **_kwargs) -> None:
+            del _registry
 
     ControlledOrchestrator.handle = handle
     monkeypatch.setattr(orchestrator, "ChatOrchestrator", ControlledOrchestrator)
+    _patch_llm_config(monkeypatch)
+
+
+def _patch_runtime_support(monkeypatch) -> None:
+    class ControlledContextBuilder:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def build(self, **_kwargs):
+            return SimpleNamespace(
+                conversation_history=[],
+                conversation_summary="",
+                context_text="",
+                token_count=0,
+                budget=0,
+            )
+
+    async def noop_async(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "deeptutor.services.session.context_builder.ContextBuilder",
+        ControlledContextBuilder,
+    )
+    monkeypatch.setattr(
+        "deeptutor.services.memory.get_memory_store",
+        lambda: SimpleNamespace(read_l3_concat=lambda: "", emit=noop_async),
+    )
+    monkeypatch.setattr(
+        "deeptutor.services.skill.get_skill_service",
+        lambda: SimpleNamespace(
+            summary_entries=lambda: [],
+            load_always_for_context=lambda: "",
+            load_for_context=lambda _skills: "",
+            list_skills=lambda: [],
+        ),
+    )
+    monkeypatch.setattr(
+        "deeptutor.services.persona.get_persona_service",
+        lambda: SimpleNamespace(load_for_context=lambda _name: ""),
+    )
 
 
 def test_local_runner_detects_path_created_during_coordinator_preparation(
@@ -217,8 +265,10 @@ def test_local_runner_detects_path_created_during_coordinator_preparation(
     from deeptutor.learning.models import LearningProgress
 
     async def creating_prepare(self, payload, available_capabilities, llm_config):
-        del payload, available_capabilities, llm_config
-        self._store.save(LearningProgress(book_id="created-during-prepare"))
+        del self, payload, available_capabilities, llm_config
+        from deeptutor.learning import storage
+
+        storage.LearningStore().save(LearningProgress(book_id="created-during-prepare"))
         return _learning_decision(scope="path")
 
     async def completed_handle(self, context):
@@ -493,11 +543,15 @@ def test_local_runner_resumes_from_a_persisted_learning_thread(tmp_path, monkeyp
 
     async def inspect_persisted_thread(self, context):
         del self
+        from deeptutor.learning.coordinator.models import ActivityPlan
+
         store = storage.LearningStore()
         thread = store.get_learning_thread("eval-math-thread")
         assert thread is not None
         assert thread.session_id == context.session_id
-        assert thread.next_activity["activity_id"] == "limits-transfer"
+        activity = ActivityPlan.model_validate(thread.next_activity)
+        assert activity.kind.value == "explanation"
+        assert activity.help_level == 2
         for event in _completed_events():
             yield event
 
@@ -513,11 +567,15 @@ def test_local_runner_resumes_from_a_persisted_learning_thread(tmp_path, monkeyp
     )
 
     assert result.status == "completed", _raw_events(tmp_path, result)
-    assert result.resumed_from_state == {
+    assert {
+        key: result.resumed_from_state[key]
+        for key in ("thread_id", "next_activity_id", "help_level")
+    } == {
         "thread_id": "eval-math-thread",
         "next_activity_id": "limits-transfer",
         "help_level": 2,
     }
+    assert result.resumed_from_state["next_activity"]["objective"] == case.prompt
 
 
 def test_local_runner_isolates_every_arm_and_case_store(tmp_path, monkeypatch) -> None:
@@ -611,7 +669,29 @@ def test_local_runner_contains_preparation_errors_and_classifies_explicitly(
         del self, payload, available_capabilities, llm_config
         raise exception_factory()
 
+    async def failed_handle(self, context):
+        del self, context
+        from deeptutor.core.stream import StreamEvent, StreamEventType
+
+        metadata = (
+            {"error_code": "provider_unavailable"}
+            if expected_status == "blocked"
+            else {}
+        )
+        yield StreamEvent(
+            type=StreamEventType.ERROR,
+            source="chat",
+            content=str(exception_factory()),
+            metadata=metadata,
+        )
+        yield StreamEvent(
+            type=StreamEventType.DONE,
+            source="chat",
+            metadata={"status": "failed"},
+        )
+
     monkeypatch.setattr(LearningCoordinator, "prepare_payload", failed_prepare)
+    _patch_orchestrator(monkeypatch, failed_handle)
     _patch_llm_config(monkeypatch)
 
     result = asyncio.run(_local_runner(module, tmp_path).run(case, "active", _fixture(), None))
@@ -774,11 +854,21 @@ def test_paired_report_reuses_fixture_resumes_state_and_stays_human_blinded() ->
                     if coordinator_mode == "off"
                     else "raw/c13d902b.txt"
                 ),
+                review_material=(
+                    "Ordinary response" if coordinator_mode == "off" else "Teaching response"
+                ),
                 latency_ms=12.5 if coordinator_mode == "off" else 14.0,
                 token_usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                decision_persisted=coordinator_mode == "active",
+                thread_state=(
+                    {"thread_id": "eval-math-thread"}
+                    if coordinator_mode == "active"
+                    else {}
+                ),
+                activity_consumed=coordinator_mode == "active",
             )
 
-    report = asyncio.run(
+    artifacts = asyncio.run(
         module.run_paired_evaluation(
             [case],
             runner=ContractCheckingRunner(),
@@ -790,40 +880,45 @@ def test_paired_report_reuses_fixture_resumes_state_and_stays_human_blinded() ->
         )
     )
 
-    assert report["schema_version"] == 1
-    assert report["mode"] == "paired"
-    assert report["release_gate"] == "awaiting_human_review"
-    assert len(report["cases"]) == 1
-    pair = report["cases"][0]
-    assert pair["case_id"] == "math-interrupted-009"
-    assert pair["domain"] == "mathematics"
-    assert pair["scope"] == "path"
-    assert pair["baseline_result"]["status"] == "completed"
-    assert pair["coordinator_result"]["status"] == "completed"
-    assert pair["contract_failures"] == {"baseline": [], "coordinator": []}
-    assert pair["execution_fixture"] == {
+    reviewer = artifacts["reviewer"]
+    machine = artifacts["machine"]
+    assert reviewer["schema_version"] == 2
+    assert "mode" not in reviewer
+    assert "release_gate" not in reviewer
+    assert machine["mode"] == "paired"
+    assert machine["release_gate"] == "awaiting_human_review"
+    assert len(reviewer["cases"]) == len(machine["cases"]) == 1
+    review_pair = reviewer["cases"][0]
+    machine_pair = machine["cases"][0]
+    assert review_pair["case_id"] == "math-interrupted-009"
+    assert review_pair["domain"] == "mathematics"
+    assert review_pair["scope"] == "path"
+    assert machine_pair["results"]["baseline"]["status"] == "completed"
+    assert machine_pair["results"]["coordinator"]["status"] == "completed"
+    assert machine_pair["contract_failures"] == {"baseline": [], "coordinator": []}
+    assert machine_pair["execution_fixture"] == {
         "model": "test-model",
         "settings": {"temperature": 0.2, "tools": []},
         "source_ids": [],
+        "provider_seed": 317,
         "provider_seed_applied": True,
     }
-    assert set(pair["blinded_outputs"]) == {"A", "B"}
-    assert {item["raw_output_ref"] for item in pair["blinded_outputs"].values()} == {
-        "raw/80ae3f4a.txt",
-        "raw/c13d902b.txt",
+    assert set(review_pair["blinded_outputs"]) == {"A", "B"}
+    assert {item["content"] for item in review_pair["blinded_outputs"].values()} == {
+        "Ordinary response",
+        "Teaching response",
     }
-    for output in pair["blinded_outputs"].values():
-        assert "mode" not in output
-        assert output["latency_ms"] in {12.5, 14.0}
-        assert output["token_usage"]["total_tokens"] == 15
+    for output in review_pair["blinded_outputs"].values():
+        assert set(output) == {"content"}
     assert all(
         score is None
-        for label_scores in pair["human_rubric"].values()
+        for label_scores in review_pair["human_rubric"].values()
         for score in label_scores.values()
     )
-    assert "latency_ms" not in pair
-    assert "token_usage" not in pair
-    assert '"provider_seed":' not in json.dumps(pair)
+    serialized_reviewer = json.dumps(reviewer)
+    assert "baseline" not in serialized_reviewer
+    assert "coordinator" not in serialized_reviewer
+    assert "provider_seed" not in serialized_reviewer
 
 
 def test_blinded_mapping_is_cryptographically_random_and_raw_refs_do_not_identify_modes() -> None:
@@ -844,13 +939,18 @@ def test_blinded_mapping_is_cryptographically_random_and_raw_refs_do_not_identif
                 raw_output_ref=(
                     "raw/80ae3f4a.json" if coordinator_mode == "off" else "raw/c13d902b.json"
                 ),
+                review_material=(
+                    "First opaque response"
+                    if coordinator_mode == "off"
+                    else "Second opaque response"
+                ),
                 latency_ms=1.0 if coordinator_mode == "off" else 2.0,
                 token_usage={"total_tokens": 1 if coordinator_mode == "off" else 2},
             )
 
     labels_for_baseline = set()
     for _ in range(32):
-        report = asyncio.run(
+        artifacts = asyncio.run(
             module.run_paired_evaluation(
                 [case],
                 runner=RawWritingRunner(),
@@ -861,12 +961,10 @@ def test_blinded_mapping_is_cryptographically_random_and_raw_refs_do_not_identif
                 seed_supported=True,
             )
         )
-        outputs = report["cases"][0]["blinded_outputs"]
-        labels_for_baseline.add(
-            next(label for label, value in outputs.items() if value["latency_ms"] == 1.0)
-        )
-        assert all("off" not in value["raw_output_ref"] for value in outputs.values())
-        assert all("active" not in value["raw_output_ref"] for value in outputs.values())
+        outputs = artifacts["reviewer"]["cases"][0]["blinded_outputs"]
+        mapping = artifacts["machine"]["cases"][0]["label_mapping"]
+        labels_for_baseline.add(next(label for label, mode in mapping.items() if mode == "baseline"))
+        assert all(set(value) == {"content"} for value in outputs.values())
 
     assert labels_for_baseline == {"A", "B"}
 
@@ -888,9 +986,10 @@ def test_baseline_contract_miss_is_reported_without_vetoing_coordinator_gate() -
                 source_ids=[],
                 route="chat",
                 route_available=True,
+                decision_persisted=coordinator_mode == "active",
             )
 
-    report = asyncio.run(
+    artifacts = asyncio.run(
         module.run_paired_evaluation(
             [case],
             runner=ComparativeRunner(),
@@ -902,11 +1001,12 @@ def test_baseline_contract_miss_is_reported_without_vetoing_coordinator_gate() -
         )
     )
 
-    assert report["cases"][0]["contract_failures"] == {
+    machine = artifacts["machine"]
+    assert machine["cases"][0]["contract_failures"] == {
         "baseline": ["direct_answer_not_honored"],
         "coordinator": [],
     }
-    assert report["release_gate"] == "awaiting_human_review"
+    assert machine["release_gate"] == "awaiting_human_review"
 
 
 def test_redacted_report_writer_removes_credentials_and_secret_query_values(tmp_path) -> None:
@@ -969,7 +1069,11 @@ def test_unavailable_provider_blocks_every_case_with_populated_contract_fields()
                 case,
                 "active",
                 fixture,
-                dict(case.stored_turn_state) if case.interrupted else None,
+                (
+                    dict(case.stored_turn_state)
+                    if case.interrupted or case.delayed_recall
+                    else None
+                ),
             )
             results.append((case, result, module.score_contracts(case, result)))
         return results
@@ -1011,15 +1115,305 @@ def test_cli_offline_paired_run_writes_blocked_nonpassing_report(tmp_path) -> No
     )
 
     assert completed.returncode == 0, completed.stderr
-    report = json.loads(output.read_text(encoding="utf-8"))
-    assert report["release_gate"] == "blocked_provider"
-    assert len(report["cases"]) >= 40
-    for pair in report["cases"]:
-        assert pair["baseline_result"]["status"] == "blocked"
-        assert pair["coordinator_result"]["status"] == "blocked"
-        assert pair["baseline_result"]["deterministic_passed"] is False
-        assert pair["coordinator_result"]["deterministic_passed"] is False
+    reviewer = json.loads(output.read_text(encoding="utf-8"))
+    machine_path = tmp_path / "paired.machine.json"
+    machine = json.loads(machine_path.read_text(encoding="utf-8"))
+    assert "release_gate" not in reviewer
+    assert "baseline" not in json.dumps(reviewer)
+    assert "coordinator" not in json.dumps(reviewer)
+    assert machine["release_gate"] == "blocked_provider"
+    assert len(reviewer["cases"]) == len(machine["cases"]) >= 40
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+    assert stat.S_IMODE(machine_path.stat().st_mode) == 0o600
+    for pair in machine["cases"]:
+        assert pair["results"]["baseline"]["status"] == "blocked"
+        assert pair["results"]["coordinator"]["status"] == "blocked"
+        assert pair["results"]["baseline"]["deterministic_passed"] is False
+        assert pair["results"]["coordinator"]["deterministic_passed"] is False
         assert pair["contract_failures"] == {
             "baseline": ["provider_unavailable"],
             "coordinator": ["provider_unavailable"],
         }
+
+
+def test_scenario_matrix_requires_real_delayed_recall_follow_up_cases() -> None:
+    # Production break caught: a matrix can satisfy every old state flag while
+    # never running a later recall request against server-owned prior activity.
+    module = _load_eval_module()
+    cases = module.load_cases(CASES_PATH)
+    delayed = [case for case in cases if case.delayed_recall]
+
+    assert len(delayed) >= 5
+    assert {case.domain for case in delayed} == module.REQUIRED_DOMAINS
+    for case in delayed:
+        assert case.follow_up_prompt.strip()
+        assert case.stored_turn_state["thread_id"]
+        activity = case.stored_turn_state["next_activity"]
+        assert activity["assessment_method"] == "delayed_retrieval"
+        assert activity["independent_required"] is True
+
+
+def test_level_four_evidence_can_never_certify_independence() -> None:
+    # Production break caught: a structurally valid evidence summary can mark a
+    # complete-answer attempt independent and still pass deterministic scoring.
+    module = _load_eval_module()
+    case = next(case for case in module.load_cases(CASES_PATH) if case.id == "math-direct-002")
+    evidence = {
+        "objective_id": "objective-1",
+        "activity_id": "activity-1",
+        "learner_response_ref": "chat-message:1:user",
+        "rubric": [{"id": "explain", "passed": True}],
+        "outcome": "correct",
+        "help_level": 4,
+        "source_refs": [],
+        "timestamp": 1.0,
+        "confidence": 0.9,
+        "independent": True,
+    }
+
+    score = module.score_contracts(
+        case,
+        _complete_result(module, case, final_help_level=4, evidence=evidence),
+    )
+
+    assert "complete_answer_marked_independent" in score.failures
+
+
+def test_local_runner_uses_production_finalization_and_persisted_evidence(
+    tmp_path, monkeypatch
+) -> None:
+    # Production break caught: the evaluator calls the orchestrator directly
+    # and manufactures an evidence-shaped dictionary without executor finish.
+    module = _load_eval_module()
+    case = next(case for case in module.load_cases(CASES_PATH) if case.id == "math-lesson-004")
+    from deeptutor.learning.coordinator import LearningCoordinator
+
+    async def controlled_prepare(self, payload, available_capabilities, llm_config):
+        del self, available_capabilities, llm_config
+        return _learning_decision(scope="lesson", goal=str(payload["content"]))
+
+    async def assessed_handle(self, context):
+        del self
+        context.extension("learning_coordinator")["result"] = {
+            "artifact_ref": "",
+            "source_refs": [],
+            "assessment": {
+                "outcome": "correct",
+                "rubric": [{"id": "explain", "passed": True}],
+                "cited_evidence": ["help me understand"],
+                "uncertainty": 0.1,
+            },
+        }
+        for event in _completed_events("The direct answer is an invariant direction."):
+            yield event
+
+    monkeypatch.setattr(LearningCoordinator, "prepare_payload", controlled_prepare)
+    _patch_orchestrator(monkeypatch, assessed_handle)
+    _patch_llm_config(monkeypatch)
+    _patch_runtime_support(monkeypatch)
+
+    result = asyncio.run(_local_runner(module, tmp_path).run(case, "active", _fixture(), None))
+
+    assert result.status == "completed", _raw_events(tmp_path, result)
+    assert result.decision_persisted is True
+    assert result.persisted_evidence_count == 1
+    assert result.evidence is not None
+    assert result.evidence["outcome"] == "correct"
+    assert result.evidence["response"].startswith("Help me understand")
+    assert result.thread_state["thread_id"]
+    assert result.activity_consumed is True
+
+
+def test_local_runner_observes_invalid_assessment_fail_closed_after_execution(
+    tmp_path, monkeypatch
+) -> None:
+    # Production break caught: invalid assessment handling is inferred from a
+    # synthetic validator call instead of the persisted production outcome.
+    module = _load_eval_module()
+    case = next(case for case in module.load_cases(CASES_PATH) if case.id == "math-lesson-004")
+    from deeptutor.learning.coordinator import LearningCoordinator
+
+    async def controlled_prepare(self, payload, available_capabilities, llm_config):
+        del self, available_capabilities, llm_config
+        return _learning_decision(scope="lesson", goal=str(payload["content"]))
+
+    async def invalid_assessment_handle(self, context):
+        del self
+        context.extension("learning_coordinator")["result"] = {
+            "artifact_ref": "",
+            "source_refs": [],
+            "assessment": {
+                "outcome": "correct",
+                "rubric": [{"id": "explain", "passed": True}],
+                "cited_evidence": ["not present in the learner response"],
+                "uncertainty": 0.1,
+            },
+        }
+        for event in _completed_events():
+            yield event
+
+    monkeypatch.setattr(LearningCoordinator, "prepare_payload", controlled_prepare)
+    _patch_orchestrator(monkeypatch, invalid_assessment_handle)
+    _patch_llm_config(monkeypatch)
+    _patch_runtime_support(monkeypatch)
+
+    result = asyncio.run(_local_runner(module, tmp_path).run(case, "active", _fixture(), None))
+
+    assert result.status == "completed", _raw_events(tmp_path, result)
+    assert result.assessment_valid is False
+    assert result.persisted_evidence_count == 1
+    assert result.evidence is not None and result.evidence["outcome"] == "unassessed"
+    assert result.mastery_before == result.mastery_after
+
+
+def test_local_runner_executes_the_server_owned_delayed_activity(
+    tmp_path, monkeypatch
+) -> None:
+    # Production break caught: resumed evaluation replaces the stored activity
+    # with server_next_activity=None and then credits the unchanged fixture.
+    module = _load_eval_module()
+    case = next(
+        case
+        for case in module.load_cases(CASES_PATH)
+        if case.id == "math-delayed-recall-010"
+    )
+    from deeptutor.learning.coordinator import LearningCoordinator
+    from deeptutor.learning.coordinator.models import ActivityPlan
+
+    observed: dict[str, object] = {}
+
+    async def resumed_prepare(self, payload, available_capabilities, llm_config):
+        del self, available_capabilities, llm_config
+        server_activity = payload["learning_state"]["server_next_activity"]
+        observed["server_next_activity"] = server_activity
+        return _learning_decision(
+            scope="lesson",
+            goal=str(payload["content"]),
+        ).model_copy(update={"activity": ActivityPlan.model_validate(server_activity)})
+
+    async def assessed_handle(self, context):
+        del self
+        context.extension("learning_coordinator")["result"] = {
+            "artifact_ref": "",
+            "source_refs": [],
+            "assessment": {
+                "outcome": "correct",
+                "rubric": [{"id": "recall", "passed": True}],
+                "cited_evidence": ["Without looking at notes"],
+                "uncertainty": 0.1,
+            },
+        }
+        for event in _completed_events("The recalled formula was assessed."):
+            yield event
+
+    monkeypatch.setattr(LearningCoordinator, "prepare_payload", resumed_prepare)
+    _patch_orchestrator(monkeypatch, assessed_handle)
+    _patch_llm_config(monkeypatch)
+    _patch_runtime_support(monkeypatch)
+
+    result = asyncio.run(
+        _local_runner(module, tmp_path).run(
+            case,
+            "active",
+            _fixture(),
+            dict(case.stored_turn_state),
+        )
+    )
+
+    assert observed["server_next_activity"] == case.stored_turn_state["next_activity"]
+    assert result.activity_consumed is True
+    assert result.persisted_evidence_count == 1
+    assert result.evidence is not None
+    assert result.evidence["recipe_id"] == "memory-retrieval"
+    assert result.evidence["independent"] is True
+    assert result.thread_state["status"] == "completed"
+
+
+def test_reviewer_and_machine_artifacts_are_blind_sealed_and_round_trip(
+    tmp_path,
+) -> None:
+    # Production break caught: one report exposes named contract summaries next
+    # to A/B rows and discards the authoritative unblinding map.
+    module = _load_eval_module()
+    rubric = module.load_rubric(RUBRIC_PATH)
+    case = next(case for case in module.load_cases(CASES_PATH) if case.id == "math-answer-001")
+
+    class ControlledRunner:
+        async def run(self, requested_case, coordinator_mode, fixture, resume_state):
+            del requested_case, fixture, resume_state
+            return module.EvalResult(
+                status="completed",
+                scope="answer",
+                route="chat",
+                route_available=True,
+                raw_output_ref=(
+                    "raw/80ae3f4a.json"
+                    if coordinator_mode == "off"
+                    else "raw/c13d902b.json"
+                ),
+                review_material=(
+                    "Opaque response one"
+                    if coordinator_mode == "off"
+                    else "Opaque response two"
+                ),
+                latency_ms=1.0 if coordinator_mode == "off" else 2.0,
+                token_usage={"total_tokens": 1 if coordinator_mode == "off" else 2},
+            )
+
+    artifacts = asyncio.run(
+        module.run_paired_evaluation(
+            [case],
+            runner=ControlledRunner(),
+            rubric=rubric,
+            model="test-model",
+            settings={"temperature": 0.0},
+            provider_seed=317,
+            seed_supported=True,
+        )
+    )
+    reviewer = artifacts["reviewer"]
+    machine = artifacts["machine"]
+    serialized_reviewer = json.dumps(reviewer, sort_keys=True)
+    for forbidden in (
+        "baseline",
+        "coordinator",
+        "contract_failures",
+        "deterministic_passed",
+        "route_available",
+        "final_help_level",
+        "provider_seed",
+    ):
+        assert forbidden not in serialized_reviewer
+    assert set(reviewer["cases"][0]["blinded_outputs"]) == {"A", "B"}
+    assert set(machine["cases"][0]["label_mapping"].values()) == {
+        "baseline",
+        "coordinator",
+    }
+
+    output = tmp_path / "paired.json"
+    module.write_paired_artifacts(output, artifacts)
+    machine_path = tmp_path / "paired.machine.json"
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+    assert stat.S_IMODE(machine_path.stat().st_mode) == 0o600
+    assert json.loads(output.read_text()) == reviewer
+    assert json.loads(machine_path.read_text()) == machine
+
+    with pytest.raises(ValueError, match="scores are not locked"):
+        module.unblind_scored_review(output, machine_path)
+
+    scored = json.loads(output.read_text())
+    for scores in scored["cases"][0]["human_rubric"].values():
+        for dimension in scores:
+            scores[dimension] = 3
+    output.write_text(json.dumps(scored), encoding="utf-8")
+    unblinded = module.unblind_scored_review(output, machine_path)
+    assert set(unblinded["cases"][0]["results"]) == {"baseline", "coordinator"}
+    for label, mode in machine["cases"][0]["label_mapping"].items():
+        assert (
+            unblinded["cases"][0]["results"][mode]["review_material"]
+            == reviewer["cases"][0]["blinded_outputs"][label]["content"]
+        )
+        assert (
+            unblinded["cases"][0]["results"][mode]["raw_output_ref"]
+            == machine["cases"][0]["results"][mode]["raw_output_ref"]
+        )

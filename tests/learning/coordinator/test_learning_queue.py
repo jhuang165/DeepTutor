@@ -183,16 +183,24 @@ def test_queue_contains_one_item_per_thread_or_path(
     assert len(identities) == len(set(identities))
 
 
-def test_queue_reason_is_learner_readable(
+def test_queue_reason_is_typed_and_contains_only_interpolation_data(
     service: LearningQueueService, store: LearningStore, learning_service: LearningService
 ) -> None:
+    # Production break caught: the backend sends English prose that bypasses
+    # the authenticated learner's selected UI language.
     _seed_path(learning_service, "path-1")
     _seed_active_interaction(store, "path-1")
 
     item = service.list_items(session_id="s")[0]
 
-    assert item.reason_text
-    assert "unknown" not in item.reason_text.lower()
+    assert item.reason is LearningQueueReason.UNFINISHED_ATTEMPT
+    assert item.reason_data.model_dump() == {
+        "objective": "objective-1",
+        "goal": "",
+        "path_name": "",
+        "answer_state": "pending_answer",
+    }
+    assert "reason_text" not in item.model_dump()
     assert item.activity["kind"] == "answer_pending"
     assert item.priority == 0
 
@@ -595,8 +603,8 @@ def test_queue_projects_answered_interactions_as_waiting_for_grading(
     assert item.reason is LearningQueueReason.UNFINISHED_ATTEMPT
     assert item.activity["kind"] == "grade_pending"
     assert item.priority == 0
-    assert "grading" in item.reason_text.lower()
-    assert "answer the outstanding" not in item.reason_text.lower()
+    assert item.reason_data.answer_state == "pending_grading"
+    assert item.reason_data.objective == "objective-1"
 
 
 def test_queue_preserves_equal_rank_first_candidate_and_clamps_nonpositive_limits(
@@ -606,7 +614,7 @@ def test_queue_preserves_equal_rank_first_candidate_and_clamps_nonpositive_limit
         path_id="path-1",
         activity={"id": "first"},
         reason=LearningQueueReason.CONTINUE_PATH,
-        reason_text="Continue.",
+        reason_data={"path_name": "Path one"},
         priority=40,
     )
     second = first.model_copy(update={"activity": {"id": "second"}})

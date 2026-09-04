@@ -73,11 +73,10 @@ class LearningQueueService:
                         "prompt": interaction.question.prompt,
                     },
                     reason=LearningQueueReason.UNFINISHED_ATTEMPT,
-                    reason_text=(
-                        f"Your answer for {objective} is waiting for grading."
-                        if answered
-                        else f"Answer the outstanding question for {objective}."
-                    ),
+                    reason_data={
+                        "objective": objective,
+                        "answer_state": "pending_grading" if answered else "pending_answer",
+                    },
                     priority=0,
                 )
             )
@@ -95,11 +94,6 @@ class LearningQueueService:
                 if transfer_required
                 else LearningQueueReason.RESUME_LESSON
             )
-            reason_text = (
-                f"Apply {thread.goal} to a new situation to show transfer."
-                if transfer_required
-                else f"Resume the lesson: {thread.goal}."
-            )
             items.append(
                 LearningQueueItem(
                     thread_id=thread.thread_id,
@@ -107,7 +101,7 @@ class LearningQueueService:
                     objective_id=objective_id,
                     activity=activity,
                     reason=reason,
-                    reason_text=reason_text,
+                    reason_data={"goal": thread.goal},
                     priority=30 if transfer_required else 10,
                 )
             )
@@ -135,10 +129,7 @@ class LearningQueueService:
                             "knowledge_type": review.knowledge_type.value,
                         },
                         reason=LearningQueueReason.DUE_REVIEW,
-                        reason_text=(
-                            f"Review {review.knowledge_point_id}; its spaced-repetition "
-                            "practice is due."
-                        ),
+                        reason_data={"objective": review.knowledge_point_id},
                         priority=20,
                         due_at=review.due_at,
                     )
@@ -183,7 +174,7 @@ class LearningQueueService:
                         "mastered": overview["mastered"],
                     },
                     reason=LearningQueueReason.CONTINUE_PATH,
-                    reason_text=f"Continue {name} with its next unmastered objective.",
+                    reason_data={"path_name": name},
                     priority=40,
                 )
             )

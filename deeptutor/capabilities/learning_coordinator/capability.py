@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from importlib import resources
 import logging
 from typing import Any
@@ -53,7 +54,10 @@ class LearningCoordinatorLoopCapability:
     owned_tools = LEARNING_COORDINATOR_TOOL_NAMES
 
     def _decision(self, context: UnifiedContext) -> LearningDecision | None:
-        raw = context.extension(self.name).get("decision")
+        state = context.extension_state.get(self.name)
+        if not isinstance(state, Mapping):
+            return None
+        raw = state.get("decision")
         if raw is None:
             return None
         try:

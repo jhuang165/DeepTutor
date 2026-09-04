@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { Toggle } from "@/components/settings/Toggle";
@@ -14,6 +15,16 @@ export default function LearningSettingsSection() {
   const { t } = useTranslation();
   const { learningCoordinatorEnabled, updateLearningCoordinatorEnabled } =
     useUiSettings();
+  const [saveFailed, setSaveFailed] = useState(false);
+
+  const persistLearningCoordinatorEnabled = async (enabled: boolean) => {
+    setSaveFailed(false);
+    try {
+      await updateLearningCoordinatorEnabled(enabled);
+    } catch {
+      setSaveFailed(true);
+    }
+  };
 
   return (
     <div>
@@ -38,10 +49,17 @@ export default function LearningSettingsSection() {
             <Toggle
               checked={learningCoordinatorEnabled}
               label={t("Use the Learning Coordinator")}
-              onChange={(next) => void updateLearningCoordinatorEnabled(next)}
+              onChange={(next) =>
+                void persistLearningCoordinatorEnabled(next)
+              }
             />
           }
         />
+        {saveFailed ? (
+          <p role="alert" className="pb-3.5 text-sm text-destructive">
+            {t("Learning setting could not be saved. Please try again.")}
+          </p>
+        ) : null}
         <p className="border-t border-[var(--border)]/50 py-3.5 text-[12px] leading-relaxed text-[var(--muted-foreground)]">
           {t(
             "Explicit capabilities, courses, Mastery, Reading, and the selection tutor still take precedence.",

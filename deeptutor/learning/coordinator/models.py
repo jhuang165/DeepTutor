@@ -24,13 +24,22 @@ class LearningQueueReason(str, Enum):
     CONTINUE_PATH = "continue_path"
 
 
+class LearningQueueReasonData(BaseModel):
+    """Locale-neutral values interpolated by the authenticated client."""
+
+    objective: str = ""
+    goal: str = ""
+    path_name: str = ""
+    answer_state: Literal["", "pending_answer", "pending_grading"] = ""
+
+
 class LearningQueueItem(BaseModel):
     thread_id: str = ""
     path_id: str = ""
     objective_id: str = ""
     activity: dict[str, Any] = Field(default_factory=dict)
     reason: LearningQueueReason
-    reason_text: str
+    reason_data: LearningQueueReasonData = Field(default_factory=LearningQueueReasonData)
     priority: int
     due_at: float | None = None
 
