@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import builtins
+import os
 from pathlib import Path
+import sys
+import time
 
 import pytest
 
@@ -410,6 +413,36 @@ def test_source_frontend_defaults_to_cached_production_build(
     assert builds == [(source, "/bin/npm", "http://localhost:8001", True)]
 
 
+def test_source_web_prefers_the_selected_package_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected = tmp_path / "selected"
+    runtime_home = tmp_path / "runtime-home"
+    for root in (selected, runtime_home):
+        web = root / "web"
+        web.mkdir(parents=True)
+        (web / "package.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(launcher, "PACKAGE_ROOT", selected)
+
+    assert launcher._source_web_dir(runtime_home) == selected / "web"
+
+
+def test_source_web_falls_back_to_the_runtime_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected = tmp_path / "selected"
+    runtime_home = tmp_path / "runtime-home"
+    selected.mkdir()
+    web = runtime_home / "web"
+    web.mkdir(parents=True)
+    (web / "package.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(launcher, "PACKAGE_ROOT", selected)
+
+    assert launcher._source_web_dir(runtime_home) == web
+
+
 def test_source_frontend_dev_mode_is_explicit_and_skips_production_build(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -506,6 +539,8 @@ def test_start_uses_ipv4_loopback_for_frontend_proxy(
         interface_json_path=settings_dir / "interface.json",
         system_json_path=settings_dir / "system.json",
     )
+    captured_commands: dict[str, list[str]] = {}
+    captured_cwds: dict[str, Path] = {}
     captured_envs: dict[str, dict[str, str]] = {}
 
     monkeypatch.setattr(launcher, "_relax_console_encoding", lambda: None)
@@ -542,8 +577,9 @@ def test_start_uses_ipv4_loopback_for_frontend_proxy(
     monkeypatch.setattr(launcher, "_wait_for_http", lambda **_kwargs: None)
     monkeypatch.setattr(launcher, "_terminate", lambda _process: None)
 
-    def _capture_spawn(_command, *, cwd, env, name):
-        assert cwd == tmp_path
+    def _capture_spawn(command, *, cwd, env, name):
+        captured_commands[name] = list(command)
+        captured_cwds[name] = Path(cwd)
         captured_envs[name] = dict(env)
         if name == "backend":
             return launcher.ManagedProcess("backend", object(), None)
@@ -557,6 +593,11 @@ def test_start_uses_ipv4_loopback_for_frontend_proxy(
 
     assert captured_envs["frontend"]["DEEPTUTOR_API_BASE_URL"] == (
         f"http://127.0.0.1:{resolved_backend_port}"
+    )
+    assert captured_commands["backend"][:4] == [sys.executable, "-P", "-m", "uvicorn"]
+    assert captured_cwds["backend"] == tmp_path
+    assert captured_envs["backend"]["PYTHONPATH"].split(os.pathsep)[0] == str(
+        launcher.PACKAGE_ROOT.resolve()
     )
     assert "DEEPTUTOR_NEXT_DIST_DIR" not in captured_envs["backend"]
     assert "DEEPTUTOR_NEXT_DIST_DIR" not in captured_envs["frontend"]
@@ -669,13 +710,57 @@ def test_launch_detached_uses_a_separate_windows_process_group(
     assert state["pid"] == 4242
     assert state["status"] == "starting"
     assert state["token"]
+    assert captured["command"][:3] == [sys.executable, "-P", "-m"]
     assert captured["command"][-2:] == ["--dev", "--no-browser"]
     kwargs = captured["kwargs"]
     assert isinstance(kwargs, dict)
     assert kwargs["creationflags"] == 0x208
+    assert kwargs["cwd"] == str(tmp_path)
     assert kwargs["env"][launcher.DETACHED_WORKER_ENV] == "1"
     assert kwargs["env"][launcher.DETACHED_TOKEN_ENV] == state["token"]
+    python_paths = kwargs["env"]["PYTHONPATH"].split(os.pathsep)
+    assert python_paths[0] == str(launcher.PACKAGE_ROOT.resolve())
+    assert python_paths.count(str(launcher.PACKAGE_ROOT.resolve())) == 1
     assert captured["log_name"] == str(paths.log)
+
+
+def test_detached_python_module_keeps_selected_package_with_conflicting_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected = tmp_path / "selected"
+    runtime_home = tmp_path / "runtime-home"
+    marker = tmp_path / "loaded-module.txt"
+    module_source = (
+        "import os\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['DEEPTUTOR_TEST_PROVENANCE']).write_text(\n"
+        "    __file__ + '\\n' + os.environ.get('PYTHONPATH', ''), encoding='utf-8'\n"
+        ")\n"
+    )
+    for root in (selected, runtime_home):
+        package = root / "deeptutor_cli"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / "main.py").write_text(module_source, encoding="utf-8")
+
+    monkeypatch.setattr(launcher, "PACKAGE_ROOT", selected)
+    monkeypatch.setattr(launcher, "_is_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(launcher, "_log", lambda _message: None)
+    monkeypatch.setenv("DEEPTUTOR_TEST_PROVENANCE", str(marker))
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        os.pathsep.join((str(selected), str(tmp_path / "preserved"), str(selected))),
+    )
+
+    launcher._launch_detached(runtime_home, dev=False, open_browser=False)
+
+    deadline = time.monotonic() + 5
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    provenance, pythonpath = marker.read_text(encoding="utf-8").splitlines()
+    assert provenance == str((selected / "deeptutor_cli" / "main.py").resolve())
+    assert pythonpath.split(os.pathsep) == [str(selected), str(tmp_path / "preserved")]
 
 
 def test_stop_requests_only_the_registered_detached_launcher(

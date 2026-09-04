@@ -59,6 +59,23 @@ def _apply_single_user_allocator_env(env: dict[str, str]) -> None:
     env.setdefault("MALLOC_TRIM_THRESHOLD_", "131072")
 
 
+def _prepend_package_root_to_pythonpath(env: dict[str, str]) -> None:
+    """Keep launcher-owned Python children on the selected source checkout."""
+
+    package_root = str(PACKAGE_ROOT.resolve())
+    entries = [package_root]
+    seen = {os.path.normcase(os.path.realpath(package_root))}
+    for entry in env.get("PYTHONPATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        key = os.path.normcase(os.path.realpath(entry))
+        if key in seen:
+            continue
+        entries.append(entry)
+        seen.add(key)
+    env["PYTHONPATH"] = os.pathsep.join(entries)
+
+
 # Mutable holder so module-level helpers can format messages in the active
 # UI language without threading the labels through every function.
 _ACTIVE_LABELS: dict[str, str] = labels_for("en")
@@ -617,7 +634,7 @@ def _patch_packaged_web_placeholders(
 
 
 def _source_web_dir(home: Path) -> Path | None:
-    candidates = [home / "web", PACKAGE_ROOT / "web"]
+    candidates = [PACKAGE_ROOT / "web", home / "web"]
     for path in candidates:
         if (path / "package.json").exists():
             return path
@@ -1033,6 +1050,7 @@ def _launch_detached(
     token = secrets.token_hex(16)
     command = [
         sys.executable,
+        "-P",
         "-m",
         "deeptutor_cli.main",
         "start",
@@ -1045,6 +1063,7 @@ def _launch_detached(
         command.append("--no-browser")
 
     env = os.environ.copy()
+    _prepend_package_root_to_pythonpath(env)
     env[DEEPTUTOR_HOME_ENV] = str(runtime_home.resolve())
     env[DETACHED_WORKER_ENV] = "1"
     env[DETACHED_TOKEN_ENV] = token
@@ -1354,6 +1373,7 @@ def start(
 
     backend_cmd = [
         sys.executable,
+        "-P",
         "-m",
         "uvicorn",
         "deeptutor.api.main:app",
@@ -1427,7 +1447,9 @@ def start(
 
     try:
         _log(_t("start.starting_backend"))
-        backend = _spawn(backend_cmd, cwd=runtime_home, env=common_env, name="backend")
+        backend_env = common_env.copy()
+        _prepend_package_root_to_pythonpath(backend_env)
+        backend = _spawn(backend_cmd, cwd=runtime_home, env=backend_env, name="backend")
         processes.append(backend)
         _wait_for_http(
             name=_t("start.backend"),
