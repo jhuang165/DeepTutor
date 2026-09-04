@@ -1,0 +1,66 @@
+{
+  "lesson": {
+    "learning_decision": {
+      "scope": "lesson",
+      "route": "mastery_path",
+      "goal": "Help me understand eigenvectors",
+      "language": "en",
+      "thread_id": "",
+      "objective_id": "",
+      "activity": {
+        "kind": "prediction",
+        "objective": "Help me understand eigenvectors",
+        "learner_action": "Make a prediction before seeing the explanation.",
+        "knowledge_type": "concept",
+        "recipe_id": "concept-transfer",
+        "recipe_version": 1,
+        "recipe_step": 0,
+        "help_level": 0,
+        "source_refs": [],
+        "assessment_method": "diagnostic",
+        "independent_required": false,
+        "transfer_required": false,
+        "next_action": "Compare the explanation with the prediction."
+      },
+      "reason": "explicit_teaching_request",
+      "confidence": 1.0,
+      "requires_approval": false,
+      "source_policy": "open",
+      "requested_capability": "chat",
+      "active_capability": "chat"
+    },
+    "learning_decision_status": "prepared"
+  },
+  "path": {
+    "learning_decision": {
+      "scope": "path",
+      "route": "chat",
+      "goal": "Teach me biology from scratch",
+      "language": "en",
+      "thread_id": "",
+      "objective_id": "",
+      "activity": {
+        "kind": "explanation",
+        "objective": "Teach me biology from scratch",
+        "learner_action": "Review and edit the proposed learning path.",
+        "knowledge_type": "concept",
+        "recipe_id": "concept-transfer",
+        "recipe_version": 1,
+        "recipe_step": 0,
+        "help_level": 0,
+        "source_refs": [],
+        "assessment_method": "path_proposal",
+        "independent_required": false,
+        "transfer_required": false,
+        "next_action": ""
+      },
+      "reason": "broad_learning_path",
+      "confidence": 1.0,
+      "requires_approval": true,
+      "source_policy": "open",
+      "requested_capability": "chat",
+      "active_capability": "chat"
+    },
+    "learning_decision_status": "prepared"
+  }
+}

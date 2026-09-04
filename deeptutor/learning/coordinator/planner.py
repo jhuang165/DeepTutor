@@ -107,7 +107,13 @@ class ActivityPlanner:
                 recipe,
                 step=step,
                 goal=goal,
-                help_level=_help_level(effective_request),
+                help_level=max(
+                    _help_level(effective_request),
+                    request.server_next_activity.help_level if saved_recipe is not None else 0,
+                ),
+                source_refs=(
+                    request.server_next_activity.source_refs if saved_recipe is not None else None
+                ),
             )
             if request.requested_capability != "chat":
                 route = request.requested_capability

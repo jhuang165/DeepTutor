@@ -1,6 +1,6 @@
 'use client'
 
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import type { LearningModule, LearningPathDraft } from '../model'
@@ -46,7 +46,13 @@ function sourcesAtCurrentPositions(sources: LearningPathDraft['sources']) {
   return sources.map((source, position) => ({ ...source, position }))
 }
 
-export function LearningPathProposal({
+export function LearningPathProposal(props: LearningPathProposalProps) {
+  return (
+    <LearningPathEditor key={JSON.stringify([props.threadId, props.draft.path_id])} {...props} />
+  )
+}
+
+function LearningPathEditor({
   threadId,
   draft: initialDraft,
   approvePath,
@@ -57,6 +63,13 @@ export function LearningPathProposal({
   const [approving, setApproving] = useState(false)
   const [approvalFailed, setApprovalFailed] = useState(false)
   const sourceCounter = useRef(0)
+  const mounted = useRef(true)
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+    }
+  }, [])
   const submissionDraft = normalizedDraft(draft)
   const valid =
     Boolean(submissionDraft.name && submissionDraft.goal) &&
@@ -137,11 +150,11 @@ export function LearningPathProposal({
     setApprovalFailed(false)
     try {
       const pathId = await approvePath(threadId, submissionDraft)
-      onApproved(`/mastery/${pathId}`)
+      if (mounted.current) onApproved(`/mastery/${pathId}`)
     } catch {
-      setApprovalFailed(true)
+      if (mounted.current) setApprovalFailed(true)
     } finally {
-      setApproving(false)
+      if (mounted.current) setApproving(false)
     }
   }
 

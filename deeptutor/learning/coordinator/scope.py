@@ -153,7 +153,9 @@ class ScopeDetector:
     ) -> None:
         self._classifier = classifier
 
-    async def detect(self, request: LearningRequest) -> ScopeResult:
+    async def detect(
+        self, request: LearningRequest, *, retained_scope: ScopeResult | None = None
+    ) -> ScopeResult:
         message = _normalized_message(request)
         goal = _goal(request)
 
@@ -163,7 +165,15 @@ class ScopeDetector:
         if request.course_id or request.mastery_path_id or request.workspace_mode:
             return self._result(LearningScope.LESSON, goal, reason="bound_learning_context")
 
-        if request.direct_answer_requested or _contains_any(message, _DIRECT_ANSWER_PHRASES):
+        direct_answer_requested = request.direct_answer_requested or _contains_any(
+            message, _DIRECT_ANSWER_PHRASES
+        )
+        if retained_scope is not None:
+            return retained_scope.model_copy(
+                update={"direct_answer_requested": direct_answer_requested}
+            )
+
+        if direct_answer_requested:
             return self._result(
                 LearningScope.ANSWER,
                 goal,

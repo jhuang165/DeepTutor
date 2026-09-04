@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -86,8 +88,8 @@ def _configure_runtime(
             captured["enabled_tools"] = context.enabled_tools
             captured["config_overrides"] = context.config_overrides
             captured["extension_state"] = context.extension_state
-            captured["learning_extension_active"] = (
-                LearningCoordinatorLoopCapability().is_active(context)
+            captured["learning_extension_active"] = LearningCoordinatorLoopCapability().is_active(
+                context
             )
             captured["context_metadata"] = context.metadata
             captured["orchestrator_started"] = True
@@ -122,7 +124,7 @@ def _configure_runtime(
                         if orchestrator_outcome == "learning_provenance"
                         else ""
                     ),
-                    "assessment": None,
+                    "assessment": captured.get("learning_assessment"),
                     "source_refs": (
                         ["citation-1"] if orchestrator_outcome == "learning_provenance" else []
                     ),
@@ -722,6 +724,13 @@ async def test_resumed_thread_supplies_server_owned_learning_state(
 
     state = captured["coordinator_payload"]["learning_state"]
     assert state == {
+        "server_scope": {
+            "scope": "lesson",
+            "goal": "Understand eigenvectors",
+            "knowledge_type": "concept",
+            "reason": "owned_learning_thread",
+            "confidence": 1.0,
+        },
         "previous_help_level": 2,
         "last_outcome": "incorrect",
         "server_next_activity": next_activity,
@@ -1133,3 +1142,216 @@ async def test_non_admin_coordinator_uses_resolved_assigned_model(
     assert captured["coordinator_payload"]["llm_selection"] == assigned
     assert captured["resolved_selections"] == [assigned]
     assert captured["coordinator_llm_config"].model == "learner-model"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response", "help_level", "independent"),
+    [
+        ("Please explain the answer directly.", 4, False),
+        ("The direction is unchanged by the transformation.", 0, True),
+        ("Just tell me the answer", 0, False),
+    ],
+)
+async def test_real_preparation_resumes_owned_lesson_identity_and_help(
+    tmp_path, monkeypatch, response, help_level, independent
+):
+    # Break caught: scope detection treats a response as a new goal, dropping
+    # the lesson or help selected through its real HTTP endpoint.
+    from deeptutor.api.routers.learning_coordinator import LearningHelpRequest, set_help_level
+    from deeptutor.learning.coordinator.service import LearningCoordinator
+
+    captured = {}
+    _configure_runtime(
+        monkeypatch,
+        captured,
+        mode="active",
+        saved_opt_in=True,
+        orchestrator_outcome="learning_result",
+    )
+    learning_store = LearningStore(root=tmp_path / "real-learning")
+    captured["learning_store"] = learning_store
+    for target in (
+        "deeptutor.learning.storage.LearningStore",
+        "deeptutor.learning.coordinator.service.LearningStore",
+        "deeptutor.api.routers.learning_coordinator.LearningStore",
+    ):
+        monkeypatch.setattr(target, lambda *args, **kwargs: learning_store)
+    monkeypatch.setattr("deeptutor.learning.coordinator.LearningCoordinator", LearningCoordinator)
+    runtime = TurnRuntimeManager(SQLiteSessionStore(tmp_path / "real-runtime.db"))
+    request = {
+        "content": "Help me understand eigenvectors",
+        "capability": "chat",
+        "tools": [],
+        "knowledge_bases": [],
+        "attachments": [],
+        "language": "en",
+        "config": {},
+    }
+    session, first = await runtime.start_turn(request)
+    first_events = [event async for event in runtime.subscribe_turn(first["id"], after_seq=0)]
+    first_decision = next(
+        e["metadata"]["learning_decision"] for e in first_events if e["type"] == "done"
+    )
+    assert first_decision["scope"] == "lesson"
+    thread_id = first_decision["thread_id"]
+    # Move through the real learner adjustment API to an independently assessed
+    # teach-back, then select direct help when requested.
+    await set_help_level(thread_id, LearningHelpRequest(help_level=0))
+    await set_help_level(thread_id, LearningHelpRequest(help_level=0))
+    if help_level:
+        await set_help_level(thread_id, LearningHelpRequest(help_level=help_level))
+    captured["learning_assessment"] = {
+        "outcome": "correct",
+        "rubric": [{"id": "direction", "passed": True}],
+        "cited_evidence": [response],
+        "uncertainty": 0.1,
+    }
+    _, second = await runtime.start_turn(
+        {
+            **request,
+            "session_id": session["id"],
+            "learning_thread_id": thread_id,
+            "content": response,
+        }
+    )
+    events = [event async for event in runtime.subscribe_turn(second["id"], after_seq=0)]
+    metadata = next(e["metadata"] for e in events if e["type"] == "done")
+    assert metadata["learning_decision_status"] == "prepared"
+    decision = metadata["learning_decision"]
+    assert decision["scope"] == "lesson"
+    assert decision["goal"] == first_decision["goal"]
+    assert decision["thread_id"] == thread_id
+    assert decision["activity"]["recipe_id"] == first_decision["activity"]["recipe_id"]
+    assert decision["activity"]["recipe_step"] == 2
+    assert decision["activity"]["help_level"] == (0 if independent else 4)
+    assert captured["learning_extension_active"] is True
+    records = learning_store.list_evidence(thread_id=thread_id)
+    record = next(r for r in records if r.turn_id == second["id"])
+    assert record.response == response
+    assert record.outcome.value == "correct"
+    assert record.independent is independent
+    assert len(learning_store.list_learning_threads()) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["lesson", "path"])
+@pytest.mark.parametrize("existing_thread", [False, True])
+async def test_real_shadow_protocol_has_no_actionable_identity_or_learning_writes(
+    tmp_path, monkeypatch, scope, existing_thread
+):
+    # Break caught: observational metadata enables controls, including when the
+    # caller supplies a real thread. This fixture is also rendered by React.
+    from deeptutor.learning.coordinator.service import LearningCoordinator
+
+    fixtures = json.loads(
+        (
+            Path(__file__).parents[3] / "web/tests/fixtures/learning-shadow-decisions.json"
+        ).read_text()
+    )
+    expected = fixtures[scope]
+    captured = {}
+    _configure_runtime(monkeypatch, captured, mode="shadow")
+    store = LearningStore(root=tmp_path / "learning")
+    captured["learning_store"] = store
+    monkeypatch.setattr("deeptutor.learning.storage.LearningStore", lambda *a, **kw: store)
+    monkeypatch.setattr("deeptutor.learning.coordinator.LearningCoordinator", LearningCoordinator)
+    runtime = TurnRuntimeManager(SQLiteSessionStore(tmp_path / "sessions.db"))
+    session = await runtime.store.create_session(session_id="shadow-session")
+    request = {
+        "session_id": session["id"],
+        "content": expected["learning_decision"]["goal"],
+        "capability": "chat",
+        "tools": [],
+        "knowledge_bases": [],
+        "attachments": [],
+        "language": "en",
+        "config": {},
+    }
+    if existing_thread:
+        store.create_learning_thread(
+            LearningThread(
+                thread_id="owned-thread",
+                session_id=session["id"],
+                scope=scope,
+                goal=expected["learning_decision"]["goal"],
+                status="active",
+                next_activity=expected["learning_decision"]["activity"],
+            )
+        )
+        request["learning_thread_id"] = "owned-thread"
+    before = store.list_learning_threads()
+    _, turn = await runtime.start_turn(request)
+    events = [e async for e in runtime.subscribe_turn(turn["id"], after_seq=0)]
+    for event_type in ("session", "done"):
+        metadata = next(e["metadata"] for e in events if e["type"] == event_type)
+        assert metadata["learning_decision_status"] == "prepared"
+        actual = metadata["learning_decision"]
+        assert actual["thread_id"] == ""
+        if not existing_thread:
+            assert actual == expected["learning_decision"]
+        else:
+            assert actual["goal"] == expected["learning_decision"]["goal"]
+            assert actual["scope"] == scope
+    assert captured["learning_extension_active"] is False
+    assert captured["extension_state"] == {}
+    assert captured["active_capability"] == "chat"
+    assert store.list_learning_threads() == before
+    assert store.list_evidence() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "opt_in", "capability"),
+    [
+        ("off", True, "chat"),
+        ("active", False, "chat"),
+        ("active", True, "deep_solve"),
+        ("shadow", False, "chat"),
+    ],
+)
+async def test_real_continuation_respects_rollout_opt_out_and_explicit_route(
+    tmp_path, monkeypatch, mode, opt_in, capability
+):
+    # Break caught: a supplied thread bypasses explicit route or rollout gates.
+    from deeptutor.learning.coordinator.service import LearningCoordinator
+
+    captured = {}
+    _configure_runtime(monkeypatch, captured, mode=mode)
+    store = LearningStore(root=tmp_path / "learning")
+    captured["learning_store"] = store
+    monkeypatch.setattr("deeptutor.learning.storage.LearningStore", lambda *a, **kw: store)
+    monkeypatch.setattr("deeptutor.learning.coordinator.LearningCoordinator", LearningCoordinator)
+    runtime = TurnRuntimeManager(SQLiteSessionStore(tmp_path / "sessions.db"))
+    session = await runtime.store.create_session(session_id="gated-session")
+    store.create_learning_thread(
+        LearningThread(
+            thread_id="owned",
+            session_id=session["id"],
+            scope="lesson",
+            goal="Original goal",
+            status="active",
+        )
+    )
+    before = store.list_learning_threads()
+    _, turn = await runtime.start_turn(
+        {
+            "session_id": session["id"],
+            "content": "Please explain the answer directly.",
+            "capability": capability,
+            "learning_thread_id": "owned",
+            "learning_coordinator": opt_in,
+            "tools": [],
+            "knowledge_bases": [],
+            "attachments": [],
+            "language": "en",
+            "config": {},
+        }
+    )
+    events = [e async for e in runtime.subscribe_turn(turn["id"], after_seq=0)]
+    metadata = next(e["metadata"] for e in events if e["type"] == "done")
+    assert metadata.get("learning_decision") is None
+    assert captured["learning_extension_active"] is False
+    assert captured["active_capability"] == capability
+    assert store.list_learning_threads() == before
+    assert store.list_evidence() == []

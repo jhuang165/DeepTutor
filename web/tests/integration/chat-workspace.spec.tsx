@@ -5,6 +5,9 @@ import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import shadowDecisions from "../fixtures/learning-shadow-decisions.json";
+import { parseLearningDecision } from "@/features/learning/model";
+
 import ChatWorkspace from "@/features/chat/components/ChatWorkspace";
 
 const workspace = vi.hoisted(() => {
@@ -348,6 +351,51 @@ describe("chat workspace composition", () => {
 });
 
 describe("learning coordinator workspace", () => {
+  it.each(['lesson', 'path'])(
+    'keeps shadow %s metadata observational through rerender and the next send',
+    async scope => {
+      // Actual runtime shadow decisions have no persisted thread identity, even
+      // when their hypothetical route/scope would have started a lesson/path.
+      workspace.preference = false
+      if (scope === 'path') setPathProposal()
+      else setActiveLesson()
+      const shadowEvents = workspace.state.messages[0].events
+      const metadata = shadowDecisions[scope as 'lesson' | 'path']
+      expect(parseLearningDecision(metadata.learning_decision)?.scope).toBe(scope)
+      const proposalEvent = scope === 'path' ? [shadowEvents[0]] : []
+      workspace.state.messages = []
+      const user = userEvent.setup()
+      const { rerender } = render(<ChatWorkspace />)
+      await waitFor(() =>
+        expect(workspace.apiCalls.some(({ url }) => url === '/api/settings')).toBe(true)
+      )
+      workspace.state.messages = [
+        {
+          id: 2,
+          role: 'assistant',
+          content: 'Ordinary chat answer',
+          events: [...proposalEvent, { type: 'done', metadata }],
+        },
+      ]
+      rerender(<ChatWorkspace />)
+      await user.click(screen.getByRole('button', { name: 'Activity' }))
+      expect(
+        screen.queryByRole('heading', { name: metadata.learning_decision.activity.objective })
+      ).not.toBeInTheDocument()
+      expect(
+        screen.queryByRole('heading', { name: /proposed learning path/i })
+      ).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Tell me directly' })).not.toBeInTheDocument()
+      expect(workspace.apiCalls.some(({ url }) => url.includes('/evidence'))).toBe(false)
+      await user.type(screen.getByRole('textbox'), 'Continue this explanation')
+      await user.click(screen.getByRole('button', { name: 'Send' }))
+      expect(workspace.adapter.sendMessage.mock.calls.at(-1)?.[5]).toEqual(
+        expect.objectContaining({ learningCoordinator: false })
+      )
+      expect(workspace.adapter.sendMessage.mock.calls.at(-1)?.[5]?.learningThreadId).toBeFalsy()
+    }
+  )
+
   beforeEach(() => {
     workspace.preference = true;
     workspace.settingsResponse = null;

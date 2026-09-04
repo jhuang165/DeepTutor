@@ -12,6 +12,7 @@ from deeptutor.learning.coordinator.models import (
     LearningDecision,
     LearningRequest,
     LearningScope,
+    ScopeResult,
 )
 from deeptutor.learning.coordinator.planner import ActivityPlanner
 from deeptutor.learning.coordinator.scope import LLMScopeClassifier, ScopeDetector
@@ -122,7 +123,14 @@ class LearningCoordinator:
         detector = self._detector or ScopeDetector(
             classifier=LLMScopeClassifier(request.language, config=llm_config)
         )
-        scope = await detector.detect(request)
+        # This state is supplied only after runtime-owned user/session lookup;
+        # public request validation rejects caller-supplied learning_state.
+        state = payload.get("learning_state") or {}
+        retained_scope = state.get("server_scope")
+        scope = await detector.detect(
+            request,
+            retained_scope=ScopeResult.model_validate(retained_scope) if retained_scope else None,
+        )
         return self._planner.plan(scope, request, available_capabilities)
 
     async def finish(

@@ -769,7 +769,9 @@ export default function ChatWorkspace() {
     if (!coordinatorContextActive) return null;
     for (let index = state.messages.length - 1; index >= 0; index -= 1) {
       const decision = selectLearningDecision(state.messages[index]);
-      if (decision) return decision;
+      // Only active preparation persists a thread. Shadow audit decisions
+      // deliberately carry no identity and cannot activate UI or opt-in.
+      if (decision?.thread_id) return decision;
     }
     return null;
   }, [coordinatorContextActive, state.messages]);

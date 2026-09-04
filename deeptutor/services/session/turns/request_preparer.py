@@ -471,6 +471,13 @@ class TurnRequestPreparer:
                 payload = {
                     **payload,
                     "learning_state": {
+                        "server_scope": {
+                            "scope": prior_learning_thread.scope,
+                            "goal": prior_learning_thread.goal,
+                            "knowledge_type": next_activity.get("knowledge_type", "concept"),
+                            "reason": "owned_learning_thread",
+                            "confidence": 1.0,
+                        },
                         "previous_help_level": max(0, min(4, previous_help_level)),
                         "last_outcome": evidence[-1].outcome.value if evidence else "",
                         "server_next_activity": next_activity or None,
@@ -587,6 +594,10 @@ class TurnRequestPreparer:
                                 activity_payload,
                             )
                         decision = decision.model_copy(update={"thread_id": thread_id})
+                if coordinator_mode == "shadow":
+                    # A thread identity authorizes learner controls. Shadow
+                    # decisions remain audit-only even when observing a resume.
+                    decision = decision.model_copy(update={"thread_id": ""})
                 learning_decision = {
                     **decision_payload(decision),
                     "requested_capability": requested_capability,

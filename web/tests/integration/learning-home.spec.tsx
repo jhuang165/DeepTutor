@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import { createInstance } from 'i18next'
@@ -482,4 +482,97 @@ describe('LearningHome', () => {
       expect(button).toHaveAttribute('type', 'button')
     }
   })
+})
+
+describe('proposal replacement identity', () => {
+  it('keeps edits within a proposal but replaces them for a new thread or draft', async () => {
+    // Break caught: approval associates stale draft content with replacement identity.
+    const approvePath = vi.fn().mockResolvedValue('approved')
+    const onApproved = vi.fn()
+    const user = userEvent.setup()
+    const { rerender } = render(
+      <LearningPathProposal
+        threadId="thread-A"
+        draft={pathDraft}
+        approvePath={approvePath}
+        onApproved={onApproved}
+      />
+    )
+    await user.clear(screen.getByLabelText('I want to be able to'))
+    await user.type(screen.getByLabelText('I want to be able to'), 'My edited goal')
+    rerender(
+      <LearningPathProposal
+        threadId="thread-A"
+        draft={{ ...pathDraft }}
+        approvePath={approvePath}
+        onApproved={onApproved}
+      />
+    )
+    expect(screen.getByLabelText('I want to be able to')).toHaveValue('My edited goal')
+    const biology = { ...pathDraft, path_id: 'draft-B', name: 'Biology', goal: 'Understand cells' }
+    rerender(
+      <LearningPathProposal
+        threadId="thread-B"
+        draft={biology}
+        approvePath={approvePath}
+        onApproved={onApproved}
+      />
+    )
+    expect(screen.getByLabelText('I want to be able to')).toHaveValue('Understand cells')
+    await user.click(screen.getByRole('button', { name: 'Approve path and begin' }))
+    expect(approvePath).toHaveBeenCalledWith(
+      'thread-B',
+      expect.objectContaining({ name: 'Biology', goal: 'Understand cells' })
+    )
+    rerender(
+      <LearningPathProposal
+        threadId="thread-B"
+        draft={{ ...biology, path_id: 'draft-C', goal: 'Understand genetics' }}
+        approvePath={approvePath}
+        onApproved={onApproved}
+      />
+    )
+    expect(screen.getByLabelText('I want to be able to')).toHaveValue('Understand genetics')
+  })
+
+  it.each(['resolve', 'reject'])(
+    'ignores an obsolete approval %s after replacement',
+    async outcome => {
+      // Break caught: an old proposal completion navigates away or mutates new error/busy state.
+      let resolve!: (value: string) => void
+      let reject!: (reason: Error) => void
+      const pending = new Promise<string>((yes, no) => {
+        resolve = yes
+        reject = no
+      })
+      const approvePath = vi.fn(() => pending)
+      const onApproved = vi.fn()
+      const user = userEvent.setup()
+      const { rerender } = render(
+        <LearningPathProposal
+          threadId="thread-A"
+          draft={pathDraft}
+          approvePath={approvePath}
+          onApproved={onApproved}
+        />
+      )
+      await user.click(screen.getByRole('button', { name: 'Approve path and begin' }))
+      rerender(
+        <LearningPathProposal
+          threadId="thread-B"
+          draft={{ ...pathDraft, path_id: 'draft-B' }}
+          approvePath={approvePath}
+          onApproved={onApproved}
+        />
+      )
+      await act(async () => {
+        if (outcome === 'resolve') resolve('old-path')
+        else reject(new Error('old-error'))
+        await Promise.resolve()
+      })
+      expect(onApproved).not.toHaveBeenCalled()
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Approve path and begin' })).toBeEnabled()
+    }
+  )
 })
