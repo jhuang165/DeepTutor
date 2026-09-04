@@ -224,18 +224,50 @@ def _citation_ids(value: Any) -> set[str]:
 
 
 def _response_gives_direct_answer(response: str) -> bool:
-    """Return whether the executed terminal response contains a declarative answer."""
+    """Conservatively require a substantive clause in the terminal response."""
 
     normalized = re.sub(r"[`*_>#]", " ", response).strip()
     if not normalized:
         return False
-    clauses = [item.strip() for item in re.split(r"(?<=[.!?])\s+|[\r\n]+", normalized)]
-    return any(
-        clause
-        and not clause.endswith("?")
-        and bool(re.search(r"[A-Za-z0-9\u4e00-\u9fff]", clause))
-        for clause in clauses
+    clauses = [
+        item.strip()
+        for item in re.findall(r"[^.!?。！？\r\n]+[.!?。！？]?", normalized)
+        if item.strip()
+    ]
+    explicit_answer = re.compile(
+        r"(?i)(?:\b(?:the\s+)?(?:answer|result|solution|conclusion)\s+(?:is|are)\b|"
+        r"(?:答案|结果|结论)\s*(?:是|为)|(?<![<>=!])=(?!=))"
     )
+    guidance = re.compile(
+        r"(?i)^(?:"
+        r"let(?:'s| us)\b|we (?:can|could|will|should|need to)\b|"
+        r"i (?:can|could|will|'ll)\b|"
+        r"try\b|start\b|begin\b|first\b|next\b|please\b|"
+        r"think\b|consider\b|look\b|work\b|take\b|use\b|"
+        r"tell me\b|show me\b|give it\b|have a go\b|here(?:'s| is) (?:a|one) hint\b|"
+        r"我们|咱们|让我|我来|请|试(?:一试|试看)?|先|想一想|考虑|"
+        r"告诉我|你(?:来|先)|这里有一个提示|给你一个提示)"
+    )
+    acknowledgement = re.compile(
+        r"(?i)^(?:sure|okay|ok|certainly|of course|好的|好|当然|可以)[.!。！]?$"
+    )
+    answer_clauses = [clause for clause in clauses if not clause.endswith(("?", "？"))]
+    substantive_clauses = [
+        clause
+        for clause in answer_clauses
+        if not guidance.search(clause) and not acknowledgement.fullmatch(clause)
+    ]
+    explicit_answer_present = any(
+        explicit_answer.search(clause) for clause in substantive_clauses
+    )
+    if any(clause.endswith(("?", "？")) for clause in clauses):
+        return explicit_answer_present
+    for clause in substantive_clauses:
+        if explicit_answer.search(clause):
+            return True
+        if re.search(r"[A-Za-z0-9\u4e00-\u9fff]", clause):
+            return True
+    return False
 
 
 @contextmanager

@@ -265,6 +265,109 @@ def test_local_runner_scores_direct_answer_from_terminal_output_not_planned_help
     assert "direct_answer_not_honored" in module.score_contracts(case, result).failures
 
 
+def test_local_runner_rejects_guidance_then_answer_solicitation_as_a_direct_answer(
+    tmp_path, monkeypatch
+) -> None:
+    module = _load_eval_module()
+    case = next(case for case in module.load_cases(CASES_PATH) if case.id == "math-direct-002")
+    from deeptutor.learning.coordinator import LearningCoordinator
+
+    async def direct_prepare(self, payload, available_capabilities, llm_config):
+        del self, payload, available_capabilities, llm_config
+        return _learning_decision(scope="answer", help_level=4)
+
+    async def guidance_only_handle(self, context):
+        del self, context
+        for event in _completed_events(
+            "Let's work through it together. What value do you think x should have?"
+        ):
+            yield event
+
+    monkeypatch.setattr(LearningCoordinator, "prepare_payload", direct_prepare)
+    _patch_orchestrator(monkeypatch, guidance_only_handle)
+    _patch_llm_config(monkeypatch)
+
+    result = asyncio.run(_local_runner(module, tmp_path).run(case, "active", _fixture(), None))
+
+    assert result.status == "completed", _raw_events(tmp_path, result)
+    assert result.direct_answer_honored is False
+    assert "direct_answer_not_honored" in module.score_contracts(case, result).failures
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        pytest.param(
+            "Try one more step, and I'll guide you from there.",
+            False,
+            id="english-attempt-solicitation",
+        ),
+        pytest.param(
+            "我们一起来分析。你觉得 x 应该是多少？",
+            False,
+            id="chinese-guidance-and-solicitation",
+        ),
+        pytest.param(
+            "A useful next move is to inspect the evidence. Which source would you choose?",
+            False,
+            id="english-unlisted-guidance-and-solicitation",
+        ),
+        pytest.param(
+            "下一步可以检查证据。你会选择哪个来源？",
+            False,
+            id="chinese-unlisted-guidance-and-solicitation",
+        ),
+        pytest.param(
+            "Try setting x = 5. Does that satisfy the equation?",
+            False,
+            id="english-guidance-with-trial-equation",
+        ),
+        pytest.param(
+            "试着令 x = 5。它满足方程吗？",
+            False,
+            id="chinese-guidance-with-trial-equation",
+        ),
+        pytest.param(
+            "The direct answer is x = 5. Can you explain why?",
+            True,
+            id="english-answer-with-follow-up",
+        ),
+        pytest.param(
+            "答案是 x = 5。你能解释原因吗？",
+            True,
+            id="chinese-answer-with-follow-up",
+        ),
+    ],
+)
+def test_local_runner_distinguishes_guidance_from_substantive_bilingual_answers(
+    tmp_path, monkeypatch, response, expected
+) -> None:
+    module = _load_eval_module()
+    case = next(case for case in module.load_cases(CASES_PATH) if case.id == "math-direct-002")
+    from deeptutor.learning.coordinator import LearningCoordinator
+
+    async def direct_prepare(self, payload, available_capabilities, llm_config):
+        del self, payload, available_capabilities, llm_config
+        return _learning_decision(scope="answer", help_level=4)
+
+    async def controlled_handle(self, context):
+        del self, context
+        for event in _completed_events(response):
+            yield event
+
+    monkeypatch.setattr(LearningCoordinator, "prepare_payload", direct_prepare)
+    _patch_orchestrator(monkeypatch, controlled_handle)
+    _patch_llm_config(monkeypatch)
+
+    result = asyncio.run(_local_runner(module, tmp_path).run(case, "active", _fixture(), None))
+
+    assert result.status == "completed", _raw_events(tmp_path, result)
+    assert result.direct_answer_honored is expected
+    assert ("direct_answer_not_honored" in module.score_contracts(case, result).failures) is (
+        not expected
+    )
+
+
 def test_local_runner_observes_actual_tool_route_availability(tmp_path, monkeypatch) -> None:
     module = _load_eval_module()
     case = next(
