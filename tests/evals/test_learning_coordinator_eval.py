@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -109,6 +110,7 @@ def _complete_result(module, case, **overrides):
         "scope": case.scope,
         "approval_requested": bool(case.expected["requires_approval"]),
         "final_help_level": case.expected.get("help_level", 1),
+        "direct_answer_honored": True if case.direct_answer else None,
         "source_ids": list(case.expected.get("allowed_source_ids", [])),
         "evidence": None,
         "route": "chat",
@@ -120,6 +122,313 @@ def _complete_result(module, case, **overrides):
     }
     values.update(overrides)
     return module.EvalResult(**values)
+
+
+def _learning_decision(*, scope: str, help_level: int = 1, route: str = "chat"):
+    from deeptutor.learning.coordinator.models import (
+        ActivityKind,
+        ActivityPlan,
+        LearningDecision,
+        LearningScope,
+    )
+
+    return LearningDecision(
+        scope=LearningScope(scope),
+        route=route,
+        goal="Controlled evaluation goal",
+        activity=ActivityPlan(
+            kind=ActivityKind.EXPLANATION,
+            objective="Observe the executed boundary",
+            learner_action="Respond",
+            help_level=help_level,
+        ),
+        reason="controlled test boundary",
+        confidence=1.0,
+        requires_approval=scope == "path",
+    )
+
+
+def _completed_events(response: str = "The direct answer is x = 5."):
+    from deeptutor.core.stream import StreamEvent, StreamEventType
+
+    return (
+        StreamEvent(
+            type=StreamEventType.RESULT,
+            source="chat",
+            metadata={"response": response, "metadata": {"cost_summary": {}}},
+        ),
+        StreamEvent(
+            type=StreamEventType.DONE,
+            source="chat",
+            metadata={"status": "completed"},
+        ),
+    )
+
+
+def _local_runner(module, tmp_path):
+    return module.LocalDeepTutorRunner(
+        runtime_root=tmp_path / "runtime",
+        raw_output_dir=tmp_path / "raw",
+        seed_supported=False,
+    )
+
+
+def _raw_events(tmp_path, result):
+    return json.loads((tmp_path / "raw" / Path(result.raw_output_ref).name).read_text())["events"]
+
+
+def _fixture():
+    return {
+        "model": "controlled-model",
+        "settings": {"temperature": 0.0},
+        "source_ids": [],
+        "provider_seed": 317,
+        "seed_supported": False,
+    }
+
+
+def _patch_llm_config(monkeypatch) -> None:
+    from deeptutor.services.llm import config
+
+    monkeypatch.setattr(
+        config,
+        "get_llm_config",
+        lambda: SimpleNamespace(provider_name="controlled", model="controlled-model"),
+    )
+
+
+def _patch_orchestrator(monkeypatch, handle) -> None:
+    from deeptutor.runtime import orchestrator
+
+    class ControlledOrchestrator:
+        def __init__(self, _registry) -> None:
+            pass
+
+    ControlledOrchestrator.handle = handle
+    monkeypatch.setattr(orchestrator, "ChatOrchestrator", ControlledOrchestrator)
+
+
+def test_local_runner_detects_path_created_during_coordinator_preparation(
+    tmp_path, monkeypatch
+) -> None:
+    module = _load_eval_module()
+    case = next(case for case in module.load_cases(CASES_PATH) if case.id == "math-path-007")
+    from deeptutor.learning.coordinator import LearningCoordinator
+    from deeptutor.learning.models import LearningProgress
+
+    async def creating_prepare(self, payload, available_capabilities, llm_config):
+        del payload, available_capabilities, llm_config
+        self._store.save(LearningProgress(book_id="created-during-prepare"))
+        return _learning_decision(scope="path")
+
+    async def completed_handle(self, context):
+        del self, context
+        for event in _completed_events():
+            yield event
+
+    monkeypatch.setattr(LearningCoordinator, "prepare_payload", creating_prepare)
+    _patch_orchestrator(monkeypatch, completed_handle)
+    _patch_llm_config(monkeypatch)
+
+    result = asyncio.run(_local_runner(module, tmp_path).run(case, "active", _fixture(), None))
+
+    assert result.status == "completed", _raw_events(tmp_path, result)
+    assert result.path_created_before_approval is True
+    assert "path_created_before_approval" in module.score_contracts(case, result).failures
+
+
+def test_local_runner_scores_direct_answer_from_terminal_output_not_planned_help(
+    tmp_path, monkeypatch
+) -> None:
+    module = _load_eval_module()
+    case = next(case for case in module.load_cases(CASES_PATH) if case.id == "math-direct-002")
+    from deeptutor.learning.coordinator import LearningCoordinator
+
+    async def direct_prepare(self, payload, available_capabilities, llm_config):
+        del self, payload, available_capabilities, llm_config
+        return _learning_decision(scope="answer", help_level=4)
+
+    async def question_only_handle(self, context):
+        del self, context
+        for event in _completed_events("What value do you think x should have?"):
+            yield event
+
+    monkeypatch.setattr(LearningCoordinator, "prepare_payload", direct_prepare)
+    _patch_orchestrator(monkeypatch, question_only_handle)
+    _patch_llm_config(monkeypatch)
+
+    result = asyncio.run(_local_runner(module, tmp_path).run(case, "active", _fixture(), None))
+
+    assert result.status == "completed", _raw_events(tmp_path, result)
+    assert result.final_help_level == 4
+    assert result.direct_answer_honored is False
+    assert "direct_answer_not_honored" in module.score_contracts(case, result).failures
+
+
+def test_local_runner_observes_actual_tool_route_availability(tmp_path, monkeypatch) -> None:
+    module = _load_eval_module()
+    case = next(
+        case for case in module.load_cases(CASES_PATH) if case.id == "math-missing-tool-008"
+    )
+    from deeptutor.runtime.registry import tool_registry
+
+    class AvailableToolRegistry:
+        def get(self, name):
+            return object() if name in case.missing_tools else None
+
+    async def completed_handle(self, context):
+        del self, context
+        for event in _completed_events():
+            yield event
+
+    monkeypatch.setattr(tool_registry, "get_tool_registry", lambda: AvailableToolRegistry())
+    _patch_orchestrator(monkeypatch, completed_handle)
+
+    result = asyncio.run(_local_runner(module, tmp_path).run(case, "off", _fixture(), None))
+
+    assert result.status == "completed", _raw_events(tmp_path, result)
+    assert result.route == "chat"
+    assert result.route_available is True
+    assert "route_availability_mismatch" in module.score_contracts(case, result).failures
+
+
+def test_local_runner_resumes_from_a_persisted_learning_thread(tmp_path, monkeypatch) -> None:
+    module = _load_eval_module()
+    case = next(
+        case for case in module.load_cases(CASES_PATH) if case.id == "math-interrupted-009"
+    )
+    from deeptutor.learning import storage
+
+    async def inspect_persisted_thread(self, context):
+        del self
+        store = storage.LearningStore()
+        thread = store.get_learning_thread("eval-math-thread")
+        assert thread is not None
+        assert thread.session_id == context.session_id
+        assert thread.next_activity["activity_id"] == "limits-transfer"
+        for event in _completed_events():
+            yield event
+
+    _patch_orchestrator(monkeypatch, inspect_persisted_thread)
+
+    result = asyncio.run(
+        _local_runner(module, tmp_path).run(
+            case,
+            "off",
+            _fixture(),
+            dict(case.stored_turn_state),
+        )
+    )
+
+    assert result.status == "completed", _raw_events(tmp_path, result)
+    assert result.resumed_from_state == {
+        "thread_id": "eval-math-thread",
+        "next_activity_id": "limits-transfer",
+        "help_level": 2,
+    }
+
+
+def test_local_runner_isolates_every_arm_and_case_store(tmp_path, monkeypatch) -> None:
+    module = _load_eval_module()
+    cases = module.load_cases(CASES_PATH)
+    first = next(case for case in cases if case.id == "math-interrupted-009")
+    second = next(case for case in cases if case.id == "science-answer-001")
+    from deeptutor.learning import storage
+    from deeptutor.learning.models import LearningProgress
+
+    observed_initial_paths = []
+    observed_initial_threads = []
+
+    async def mutate_store(self, context):
+        del self
+        store = storage.LearningStore()
+        observed_initial_paths.append(store.list_all())
+        observed_initial_threads.append(
+            [
+                {
+                    "thread_id": thread.thread_id,
+                    "session_id": thread.session_id,
+                    "scope": thread.scope,
+                    "goal": thread.goal,
+                    "status": thread.status.value,
+                    "next_activity": thread.next_activity,
+                }
+                for thread in store.list_learning_threads()
+            ]
+        )
+        store.save(LearningProgress(book_id=f"write-{context.session_id}"))
+        for event in _completed_events():
+            yield event
+
+    _patch_orchestrator(monkeypatch, mutate_store)
+    runner = _local_runner(module, tmp_path)
+
+    raw_refs = []
+    for case, mode in (
+        (first, "off"),
+        (first, "active"),
+        (second, "off"),
+        (first, "off"),
+    ):
+        if mode == "active":
+            from deeptutor.learning.coordinator import LearningCoordinator
+
+            async def prepare(self, payload, available_capabilities, llm_config):
+                del self, payload, available_capabilities, llm_config
+                return _learning_decision(scope="path")
+
+            monkeypatch.setattr(LearningCoordinator, "prepare_payload", prepare)
+            _patch_llm_config(monkeypatch)
+        resume_state = dict(case.stored_turn_state) if case.interrupted else None
+        result = asyncio.run(runner.run(case, mode, _fixture(), resume_state))
+        assert result.status == "completed", _raw_events(tmp_path, result)
+        raw_refs.append(result.raw_output_ref)
+
+    assert observed_initial_paths == [[], [], [], []]
+    assert observed_initial_threads[0] == observed_initial_threads[1]
+    assert observed_initial_threads[0] == observed_initial_threads[3]
+    assert observed_initial_threads[2] == []
+    assert len(set(raw_refs)) == len(raw_refs)
+
+
+@pytest.mark.parametrize(
+    ("exception_factory", "expected_status"),
+    [
+        pytest.param(
+            lambda: __import__(
+                "deeptutor.services.llm.exceptions", fromlist=["LLMConfigError"]
+            ).LLMConfigError("provider is not configured"),
+            "blocked",
+            id="explicit-provider-config-error-is-blocked",
+        ),
+        pytest.param(
+            lambda: RuntimeError("model invariant violated in implementation"),
+            "failed",
+            id="implementation-error-containing-model-is-failed",
+        ),
+    ],
+)
+def test_local_runner_contains_preparation_errors_and_classifies_explicitly(
+    tmp_path, monkeypatch, exception_factory, expected_status
+) -> None:
+    module = _load_eval_module()
+    case = next(case for case in module.load_cases(CASES_PATH) if case.id == "math-answer-001")
+    from deeptutor.learning.coordinator import LearningCoordinator
+
+    async def failed_prepare(self, payload, available_capabilities, llm_config):
+        del self, payload, available_capabilities, llm_config
+        raise exception_factory()
+
+    monkeypatch.setattr(LearningCoordinator, "prepare_payload", failed_prepare)
+    _patch_llm_config(monkeypatch)
+
+    result = asyncio.run(_local_runner(module, tmp_path).run(case, "active", _fixture(), None))
+
+    assert result.status == expected_status
+    if expected_status == "blocked":
+        assert result.blocked_reason
+    else:
+        assert result.blocked_reason == ""
 
 
 def test_contract_scoring_reports_every_required_deterministic_violation() -> None:
@@ -155,7 +464,7 @@ def test_contract_scoring_reports_every_required_deterministic_violation() -> No
         ),
         (
             cases["math-direct-002"],
-            {"final_help_level": 3},
+            {"direct_answer_honored": False},
             "direct_answer_not_honored",
         ),
         (
@@ -268,7 +577,11 @@ def test_paired_report_reuses_fixture_resumes_state_and_stays_human_blinded() ->
                     "thread_id": "eval-math-thread",
                     "next_activity_id": "limits-transfer",
                 },
-                raw_output_ref=f"raw/{requested_case.id}-{coordinator_mode}.txt",
+                raw_output_ref=(
+                    "raw/80ae3f4a.txt"
+                    if coordinator_mode == "off"
+                    else "raw/c13d902b.txt"
+                ),
                 latency_ms=12.5 if coordinator_mode == "off" else 14.0,
                 token_usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
             )
@@ -300,23 +613,70 @@ def test_paired_report_reuses_fixture_resumes_state_and_stays_human_blinded() ->
         "model": "test-model",
         "settings": {"temperature": 0.2, "tools": []},
         "source_ids": [],
-        "provider_seed": 317,
-        "seed_supported": True,
+        "provider_seed_applied": True,
     }
     assert set(pair["blinded_outputs"]) == {"A", "B"}
     assert {item["raw_output_ref"] for item in pair["blinded_outputs"].values()} == {
-        "raw/math-interrupted-009-off.txt",
-        "raw/math-interrupted-009-active.txt",
+        "raw/80ae3f4a.txt",
+        "raw/c13d902b.txt",
     }
-    assert "mode" not in pair["blinded_outputs"]["A"]
-    assert "mode" not in pair["blinded_outputs"]["B"]
+    for output in pair["blinded_outputs"].values():
+        assert "mode" not in output
+        assert output["latency_ms"] in {12.5, 14.0}
+        assert output["token_usage"]["total_tokens"] == 15
     assert all(
         score is None
         for label_scores in pair["human_rubric"].values()
         for score in label_scores.values()
     )
-    assert pair["latency_ms"] == {"baseline": 12.5, "coordinator": 14.0}
-    assert pair["token_usage"]["baseline"]["total_tokens"] == 15
+    assert "latency_ms" not in pair
+    assert "token_usage" not in pair
+    assert '"provider_seed":' not in json.dumps(pair)
+
+
+def test_blinded_mapping_is_cryptographically_random_and_raw_refs_do_not_identify_modes() -> None:
+    module = _load_eval_module()
+    rubric = module.load_rubric(RUBRIC_PATH)
+    case = next(case for case in module.load_cases(CASES_PATH) if case.id == "math-answer-001")
+
+    class RawWritingRunner:
+        async def run(self, requested_case, coordinator_mode, fixture, resume_state):
+            del requested_case, fixture, resume_state
+            return module.EvalResult(
+                status="completed",
+                scope="answer",
+                approval_requested=False,
+                direct_answer_honored=None,
+                route="chat",
+                route_available=True,
+                raw_output_ref=(
+                    "raw/80ae3f4a.json" if coordinator_mode == "off" else "raw/c13d902b.json"
+                ),
+                latency_ms=1.0 if coordinator_mode == "off" else 2.0,
+                token_usage={"total_tokens": 1 if coordinator_mode == "off" else 2},
+            )
+
+    labels_for_baseline = set()
+    for _ in range(32):
+        report = asyncio.run(
+            module.run_paired_evaluation(
+                [case],
+                runner=RawWritingRunner(),
+                rubric=rubric,
+                model="test-model",
+                settings={},
+                provider_seed=317,
+                seed_supported=True,
+            )
+        )
+        outputs = report["cases"][0]["blinded_outputs"]
+        labels_for_baseline.add(
+            next(label for label, value in outputs.items() if value["latency_ms"] == 1.0)
+        )
+        assert all("off" not in value["raw_output_ref"] for value in outputs.values())
+        assert all("active" not in value["raw_output_ref"] for value in outputs.values())
+
+    assert labels_for_baseline == {"A", "B"}
 
 
 def test_baseline_contract_miss_is_reported_without_vetoing_coordinator_gate() -> None:
@@ -332,6 +692,7 @@ def test_baseline_contract_miss_is_reported_without_vetoing_coordinator_gate() -
                 scope="answer",
                 approval_requested=False,
                 final_help_level=0 if coordinator_mode == "off" else 4,
+                direct_answer_honored=coordinator_mode == "active",
                 source_ids=[],
                 route="chat",
                 route_available=True,
@@ -361,11 +722,20 @@ def test_redacted_report_writer_removes_credentials_and_secret_query_values(tmp_
     output = tmp_path / "report.json"
     secret = "sk-secret-value-123456"
     opaque_secret = "opaquecredentialvalue0123456789abcdef"
+    auth_token = "opaque-auth-token-value"
+    id_token = "opaque-id-token-value"
+    credential = "opaque-service-credential"
     report = {
         "api_key": secret,
+        "auth_token": auth_token,
+        "id-token": id_token,
+        "service_credential": credential,
         "message": f"Authorization: Bearer {secret}",
         "provider_error": f"request failed, token: {opaque_secret}",
-        "raw_output_ref": f"https://example.test/raw?id=1&token={secret}",
+        "raw_output_ref": (
+            "https://example.test/raw?id=1"
+            f"&token={secret}&auth_token={auth_token}&id_token={id_token}"
+        ),
     }
 
     module.write_redacted_report(output, report)
@@ -374,10 +744,18 @@ def test_redacted_report_writer_removes_credentials_and_secret_query_values(tmp_
     parsed = json.loads(serialized)
     assert secret not in serialized
     assert opaque_secret not in serialized
+    assert auth_token not in serialized
+    assert id_token not in serialized
+    assert credential not in serialized
     assert parsed["api_key"] == "[REDACTED]"
+    assert parsed["auth_token"] == "[REDACTED]"
+    assert parsed["id-token"] == "[REDACTED]"
+    assert parsed["service_credential"] == "[REDACTED]"
     assert "Bearer [REDACTED]" in parsed["message"]
     assert "token: [REDACTED]" in parsed["provider_error"]
     assert "token=%5BREDACTED%5D" in parsed["raw_output_ref"]
+    assert "auth_token=%5BREDACTED%5D" in parsed["raw_output_ref"]
+    assert "id_token=%5BREDACTED%5D" in parsed["raw_output_ref"]
 
 
 def test_unavailable_provider_blocks_every_case_with_populated_contract_fields() -> None:

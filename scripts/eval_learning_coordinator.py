@@ -10,8 +10,8 @@ from contextlib import ExitStack, contextmanager
 import hashlib
 import json
 from pathlib import Path
-import random
 import re
+import secrets
 import tempfile
 import time
 from typing import Any
@@ -26,10 +26,35 @@ REQUIRED_DOMAINS = frozenset(
 REQUIRED_SCOPES = frozenset({"answer", "lesson", "path"})
 FORBIDDEN_ANSWER_KEYS = frozenset({"preferred_answer", "reference_answer", "expected_answer"})
 SENSITIVE_KEYS = frozenset(
-    {"api_key", "access_token", "refresh_token", "token", "secret", "password", "authorization"}
+    {
+        "api_key",
+        "access_token",
+        "refresh_token",
+        "auth_token",
+        "id_token",
+        "token",
+        "secret",
+        "password",
+        "authorization",
+        "credential",
+        "credentials",
+    }
 )
 SENSITIVE_QUERY_KEYS = frozenset(
-    {"api_key", "apikey", "access_token", "refresh_token", "token", "key", "secret", "password"}
+    {
+        "api_key",
+        "apikey",
+        "access_token",
+        "refresh_token",
+        "auth_token",
+        "id_token",
+        "token",
+        "key",
+        "secret",
+        "password",
+        "credential",
+        "credentials",
+    }
 )
 DEFAULT_PROVIDER_SEED = 317
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +93,7 @@ class EvalResult:
         approval_requested: bool = False,
         path_created_before_approval: bool = False,
         final_help_level: int | None = None,
+        direct_answer_honored: bool | None = None,
         source_ids: list[str] | None = None,
         evidence: dict[str, Any] | None = None,
         route: str = "",
@@ -86,6 +112,7 @@ class EvalResult:
         self.approval_requested = approval_requested
         self.path_created_before_approval = path_created_before_approval
         self.final_help_level = final_help_level
+        self.direct_answer_honored = direct_answer_honored
         self.source_ids = list(source_ids or [])
         self.evidence = dict(evidence) if evidence is not None else None
         self.route = route
@@ -128,6 +155,7 @@ class UnavailableProviderRunner:
             scope=case.scope,
             approval_requested=bool(case.expected["requires_approval"]),
             final_help_level=int(help_level),
+            direct_answer_honored=None,
             source_ids=list(case.expected.get("allowed_source_ids", [])),
             route="unavailable" if not case.expected["route_available"] else "chat",
             route_available=bool(case.expected["route_available"]),
@@ -195,6 +223,21 @@ def _citation_ids(value: Any) -> set[str]:
     return set()
 
 
+def _response_gives_direct_answer(response: str) -> bool:
+    """Return whether the executed terminal response contains a declarative answer."""
+
+    normalized = re.sub(r"[`*_>#]", " ", response).strip()
+    if not normalized:
+        return False
+    clauses = [item.strip() for item in re.split(r"(?<=[.!?])\s+|[\r\n]+", normalized)]
+    return any(
+        clause
+        and not clause.endswith("?")
+        and bool(re.search(r"[A-Za-z0-9\u4e00-\u9fff]", clause))
+        for clause in clauses
+    )
+
+
 @contextmanager
 def _provider_seed(seed: int, *, supported: bool):
     if not supported:
@@ -221,14 +264,12 @@ class LocalDeepTutorRunner:
         raw_output_dir: Path,
         seed_supported: bool,
     ) -> None:
-        from deeptutor.learning.storage import LearningStore
-
-        self._store = LearningStore(root=runtime_root / "learning")
+        self._runtime_root = runtime_root
         self._raw_output_dir = raw_output_dir
         self._seed_supported = seed_supported
 
     @contextmanager
-    def _isolated_learning_store(self):
+    def _isolated_learning_store(self, store: Any):
         modules = (
             "deeptutor.learning.coordinator.service",
             "deeptutor.learning.service",
@@ -245,11 +286,11 @@ class LocalDeepTutorRunner:
                     continue
                 if hasattr(module, "LearningStore"):
                     stack.enter_context(
-                        patch.object(module, "LearningStore", lambda *_args, **_kwargs: self._store)
+                        patch.object(module, "LearningStore", lambda *_args, **_kwargs: store)
                     )
             storage = __import__("deeptutor.learning.storage", fromlist=["LearningStore"])
             stack.enter_context(
-                patch.object(storage, "LearningStore", lambda *_args, **_kwargs: self._store)
+                patch.object(storage, "LearningStore", lambda *_args, **_kwargs: store)
             )
             yield
 
@@ -264,19 +305,29 @@ class LocalDeepTutorRunner:
         from deeptutor.learning.coordinator import LearningCoordinator, decision_payload
         from deeptutor.learning.coordinator.models import CapabilityLearningResult
         from deeptutor.learning.evidence import validate_open_assessment
+        from deeptutor.learning.storage import LearningStore
         from deeptutor.runtime.orchestrator import ChatOrchestrator
         from deeptutor.runtime.registry.capability_registry import get_capability_registry
+        from deeptutor.runtime.registry.tool_registry import get_tool_registry
         from deeptutor.services.llm.config import get_llm_config
 
         started = time.perf_counter()
+        arm_root = self._runtime_root / f"arm-{secrets.token_hex(16)}"
+        store = LearningStore(root=arm_root / "learning")
         attachments, source_manifest, source_index = _source_manifest(case)
         registry = get_capability_registry()
+        tool_registry = get_tool_registry()
         session_id = (
             "eval-"
-            + hashlib.sha256(f"{case.id}:{coordinator_mode}".encode("utf-8")).hexdigest()[:24]
+            + hashlib.sha256(case.id.encode("utf-8")).hexdigest()[:24]
         )
         turn_id = "eval-turn-" + hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:20]
-        loaded_resume = self._store_resume_fixture(case, coordinator_mode, resume_state)
+        loaded_resume = self._store_resume_fixture(
+            store,
+            case,
+            session_id,
+            resume_state,
+        )
         extension_state: dict[str, dict[str, Any]] = {}
         active_capability = "chat"
         decision = None
@@ -294,63 +345,70 @@ class LocalDeepTutorRunner:
                 "server_next_activity": None,
             },
         }
-        if coordinator_mode == "active":
-            decision = await LearningCoordinator(store=self._store).prepare_payload(
-                payload,
-                set(registry.list_capabilities()),
-                get_llm_config(),
-            )
-            decision = decision.model_copy(
-                update={
-                    "thread_id": "eval-thread-"
-                    + hashlib.sha256(case.id.encode("utf-8")).hexdigest()[:20]
-                }
-            )
-            active_capability = (
-                decision.route if registry.get(decision.route) is not None else "chat"
-            )
-            extension_state = {"learning_coordinator": {"decision": decision_payload(decision)}}
-
-        context = UnifiedContext(
-            session_id=session_id,
-            user_message=case.prompt,
-            conversation_history=[],
-            enabled_tools=[],
-            allowed_builtin_tools=[],
-            active_capability=active_capability,
-            attachments=attachments,
-            source_manifest=source_manifest,
-            runtime=TurnRuntimeContext(turn_id=turn_id),
-            extension_state=extension_state,
-            metadata={
-                "turn_id": turn_id,
-                "source_index": source_index,
-                "book_references": [],
-                "mastery_path_id": "",
-                "_mastery_nav_available": False,
-            },
-        )
-        before = _mastery_snapshot(self._store)
+        before = _mastery_snapshot(store)
         events: list[dict[str, Any]] = []
+        context = None
+        preparation_error: Exception | None = None
         try:
+            if coordinator_mode == "active":
+                decision = await LearningCoordinator(store=store).prepare_payload(
+                    payload,
+                    set(registry.list_capabilities()),
+                    get_llm_config(),
+                )
+                decision = decision.model_copy(
+                    update={
+                        "thread_id": str((loaded_resume or {}).get("thread_id") or "")
+                        or "eval-thread-"
+                        + hashlib.sha256(case.id.encode("utf-8")).hexdigest()[:20]
+                    }
+                )
+                active_capability = (
+                    decision.route if registry.get(decision.route) is not None else "chat"
+                )
+                extension_state = {
+                    "learning_coordinator": {"decision": decision_payload(decision)}
+                }
+
+            context = UnifiedContext(
+                session_id=session_id,
+                user_message=case.prompt,
+                conversation_history=[],
+                enabled_tools=[],
+                allowed_builtin_tools=[],
+                active_capability=active_capability,
+                attachments=attachments,
+                source_manifest=source_manifest,
+                runtime=TurnRuntimeContext(turn_id=turn_id),
+                extension_state=extension_state,
+                metadata={
+                    "turn_id": turn_id,
+                    "source_index": source_index,
+                    "book_references": [],
+                    "mastery_path_id": "",
+                    "_mastery_nav_available": False,
+                },
+            )
             with (
-                self._isolated_learning_store(),
+                self._isolated_learning_store(store),
                 _provider_seed(int(fixture["provider_seed"]), supported=self._seed_supported),
             ):
                 async for event in ChatOrchestrator(registry).handle(context):
                     events.append(event.to_dict())
         except Exception as exc:
-            events.append({"type": "error", "content": str(exc), "metadata": {}})
-        after = _mastery_snapshot(self._store)
-        raw_ref = self._write_raw_output(case, coordinator_mode, events)
+            preparation_error = exc
+            metadata: dict[str, Any] = {}
+            error_code = getattr(exc, "error_code", None)
+            if isinstance(error_code, str) and error_code:
+                metadata["error_code"] = error_code
+            events.append({"type": "error", "content": str(exc), "metadata": metadata})
+        after = _mastery_snapshot(store)
+        raw_ref = self._write_raw_output(events)
         done = next((item for item in reversed(events) if item.get("type") == "done"), {})
         errors = [str(item.get("content") or "") for item in events if item.get("type") == "error"]
         terminal_status = str((done.get("metadata") or {}).get("status") or "failed")
         status = "completed" if terminal_status == "completed" and not errors else "failed"
-        if status == "failed" and any(
-            marker in " ".join(errors).casefold()
-            for marker in ("provider", "api key", "model", "endpoint", "rate limit", "quota")
-        ):
+        if status == "failed" and self._provider_unavailable(events, preparation_error):
             status = "blocked"
         result_metadata = next(
             (
@@ -361,7 +419,11 @@ class LocalDeepTutorRunner:
             {},
         )
         cost_summary = result_metadata.get("metadata", {}).get("cost_summary", {})
-        coordinator_result = context.extension_state.get("learning_coordinator", {}).get("result")
+        coordinator_result = (
+            context.extension_state.get("learning_coordinator", {}).get("result")
+            if context is not None
+            else None
+        )
         assessment_valid: bool | None = None
         evidence = None
         if isinstance(coordinator_result, dict):
@@ -387,19 +449,26 @@ class LocalDeepTutorRunner:
             metadata = item.get("metadata") or {}
             citation_ids.update(_citation_ids(metadata.get("citations")))
             citation_ids.update(_citation_ids(metadata.get("citation_ids")))
-        route_available = not case.missing_tools and registry.get(active_capability) is not None
+        planned_route = decision.route if decision is not None else active_capability
+        route_available = registry.get(planned_route) is not None and all(
+            tool_registry.get(name) is not None for name in case.missing_tools
+        )
         help_level = decision.activity.help_level if decision is not None else 0
+        response = str(result_metadata.get("response") or "")
         return EvalResult(
             status=status,
             scope=decision.scope.value if decision is not None else case.scope,
             approval_requested=(decision.requires_approval if decision is not None else False),
             path_created_before_approval=(case.scope == "path" and before != after),
             final_help_level=help_level,
+            direct_answer_honored=(
+                _response_gives_direct_answer(response) if case.direct_answer else None
+            ),
             source_ids=sorted(citation_ids),
             evidence=evidence,
             route=active_capability,
             route_available=route_available,
-            resumed_from_state=dict(loaded_resume or {}),
+            resumed_from_state=self._observed_resume_state(store, loaded_resume),
             assessment_valid=assessment_valid,
             mastery_before=before,
             mastery_after=after,
@@ -413,31 +482,99 @@ class LocalDeepTutorRunner:
             },
         )
 
+    @staticmethod
+    def _provider_unavailable(
+        events: list[dict[str, Any]], preparation_error: Exception | None
+    ) -> bool:
+        from deeptutor.services.llm.exceptions import (
+            LLMAuthenticationError,
+            LLMCircuitBreakerError,
+            LLMConfigError,
+            LLMModelNotFoundError,
+            LLMProviderTransportError,
+            LLMRateLimitError,
+            LLMTimeoutError,
+        )
+
+        provider_failures = (
+            LLMConfigError,
+            LLMProviderTransportError,
+            LLMCircuitBreakerError,
+            LLMTimeoutError,
+            LLMRateLimitError,
+            LLMAuthenticationError,
+            LLMModelNotFoundError,
+        )
+        if isinstance(preparation_error, provider_failures):
+            return True
+        explicit_codes = {
+            "provider_unavailable",
+            "provider_transport",
+            "llm_config",
+            "authentication",
+            "rate_limit",
+            "model_not_found",
+            "circuit_open",
+        }
+        return any(
+            str((event.get("metadata") or {}).get("error_code") or "") in explicit_codes
+            for event in events
+            if event.get("type") == "error"
+        )
+
     def _store_resume_fixture(
         self,
+        store: Any,
         case: EvalCase,
-        coordinator_mode: str,
+        session_id: str,
         resume_state: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
         if resume_state is None:
             return None
-        state_dir = self._raw_output_dir / "state"
-        state_dir.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha256(f"{case.id}:{coordinator_mode}".encode("utf-8")).hexdigest()[:20]
-        state_path = state_dir / f"{digest}.json"
-        write_redacted_report(state_path, resume_state)
-        loaded = json.loads(state_path.read_text(encoding="utf-8"))
-        return loaded if isinstance(loaded, dict) else None
+        from deeptutor.learning.models import LearningThread, LearningThreadStatus
+
+        thread_id = str(resume_state.get("thread_id") or "")
+        if not thread_id:
+            return None
+        next_activity = {
+            "activity_id": str(resume_state.get("next_activity_id") or ""),
+            "help_level": int(resume_state.get("help_level") or 0),
+        }
+        if resume_state.get("last_outcome"):
+            next_activity["last_outcome"] = str(resume_state["last_outcome"])
+        store.create_learning_thread(
+            LearningThread(
+                thread_id=thread_id,
+                session_id=session_id,
+                scope=case.scope if case.scope in {"lesson", "path"} else "lesson",
+                goal=case.prompt,
+                status=LearningThreadStatus.ACTIVE,
+                next_activity=next_activity,
+            )
+        )
+        return self._observed_resume_state(store, {"thread_id": thread_id})
+
+    @staticmethod
+    def _observed_resume_state(
+        store: Any, loaded_resume: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        if not loaded_resume:
+            return {}
+        thread = store.get_learning_thread(str(loaded_resume.get("thread_id") or ""))
+        if thread is None:
+            return {}
+        return {
+            "thread_id": thread.thread_id,
+            "next_activity_id": str(thread.next_activity.get("activity_id") or ""),
+            "help_level": int(thread.next_activity.get("help_level") or 0),
+        }
 
     def _write_raw_output(
         self,
-        case: EvalCase,
-        coordinator_mode: str,
         events: list[dict[str, Any]],
     ) -> str:
         self._raw_output_dir.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha256(f"{case.id}:{coordinator_mode}".encode("utf-8")).hexdigest()[:24]
-        path = self._raw_output_dir / f"{digest}.json"
+        path = self._raw_output_dir / f"{secrets.token_hex(16)}.json"
         write_redacted_report(path, {"events": events})
         return f"{self._raw_output_dir.name}/{path.name}"
 
@@ -449,6 +586,7 @@ def _result_summary(result: EvalResult, score: ContractScore) -> dict[str, Any]:
         "approval_requested": result.approval_requested,
         "path_created_before_approval": result.path_created_before_approval,
         "final_help_level": result.final_help_level,
+        "direct_answer_honored": result.direct_answer_honored,
         "source_ids": result.source_ids,
         "evidence": result.evidence,
         "route": result.route,
@@ -496,17 +634,30 @@ async def run_paired_evaluation(
         any_contract_failure = any_contract_failure or not coordinator_score.passed
 
         outputs = [
-            {"raw_output_ref": baseline.raw_output_ref},
-            {"raw_output_ref": coordinator.raw_output_ref},
+            {
+                "raw_output_ref": baseline.raw_output_ref,
+                "latency_ms": baseline.latency_ms,
+                "token_usage": baseline.token_usage,
+            },
+            {
+                "raw_output_ref": coordinator.raw_output_ref,
+                "latency_ms": coordinator.latency_ms,
+                "token_usage": coordinator.token_usage,
+            },
         ]
-        random.Random(f"{provider_seed}:{case.id}").shuffle(outputs)
+        secrets.SystemRandom().shuffle(outputs)
         pairs.append(
             {
                 "case_id": case.id,
                 "case_version": case.version,
                 "domain": case.domain,
                 "scope": case.scope,
-                "execution_fixture": fixture,
+                "execution_fixture": {
+                    "model": model,
+                    "settings": dict(settings),
+                    "source_ids": _fixture_source_ids(case),
+                    "provider_seed_applied": seed_supported,
+                },
                 "baseline_result": _result_summary(baseline, baseline_score),
                 "coordinator_result": _result_summary(coordinator, coordinator_score),
                 "contract_failures": {
@@ -516,14 +667,6 @@ async def run_paired_evaluation(
                 "blinded_outputs": {"A": outputs[0], "B": outputs[1]},
                 "human_rubric": {
                     label: {dimension: None for dimension in dimensions} for label in ("A", "B")
-                },
-                "latency_ms": {
-                    "baseline": baseline.latency_ms,
-                    "coordinator": coordinator.latency_ms,
-                },
-                "token_usage": {
-                    "baseline": baseline.token_usage,
-                    "coordinator": coordinator.token_usage,
                 },
             }
         )
@@ -551,8 +694,8 @@ def _redact_string(value: str) -> str:
         value,
     )
     redacted = re.sub(
-        r"(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|secret)"
-        r"\s*[:=]\s*)[^\s,;]+",
+        r"(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|"
+        r"id[_-]?token|token|password|secret|credentials?)\s*[:=]\s*)[^\s,;&#?]+",
         r"\1[REDACTED]",
         redacted,
     )
@@ -574,7 +717,7 @@ def _redacted(value: Any, *, key: str = "") -> Any:
     normalized_key = key.casefold().replace("-", "_")
     if normalized_key in SENSITIVE_KEYS or any(
         normalized_key.endswith(f"_{suffix}")
-        for suffix in ("api_key", "access_token", "refresh_token", "password", "secret")
+        for suffix in ("api_key", "token", "password", "secret", "credential", "credentials")
     ):
         return "[REDACTED]"
     if isinstance(value, dict):
@@ -732,7 +875,11 @@ def score_contracts(case: EvalCase, result: EvalResult) -> ContractScore:
         failures.append("approval_gate_mismatch")
     if result.path_created_before_approval:
         failures.append("path_created_before_approval")
-    if case.direct_answer and result.final_help_level != 4:
+    if (
+        case.direct_answer
+        and result.status == "completed"
+        and result.direct_answer_honored is not True
+    ):
         failures.append("direct_answer_not_honored")
     allowed_source_ids = set(case.expected.get("allowed_source_ids", []))
     observed_source_ids = set(result.source_ids)
