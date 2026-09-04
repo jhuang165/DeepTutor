@@ -194,6 +194,17 @@ def _decorate_done_event(event: StreamEvent, payload: dict[str, Any]) -> StreamE
     return event
 
 
+def _learning_decision_contract(value: object) -> dict[str, Any]:
+    """Return the validated decision fields without runtime routing metadata."""
+
+    if not isinstance(value, dict):
+        return {}
+    decision = dict(value)
+    decision.pop("requested_capability", None)
+    decision.pop("active_capability", None)
+    return decision
+
+
 class TurnExecutor:
     if TYPE_CHECKING:
         store: SessionStoreProtocol
@@ -847,7 +858,13 @@ class TurnExecutor:
                     subagent_consult_budget=payload.get("subagent_consult_budget"),
                 ),
                 extension_state=(
-                    {"learning_coordinator": {"decision": dict(payload["learning_decision"])}}
+                    {
+                        "learning_coordinator": {
+                            "decision": _learning_decision_contract(
+                                payload["learning_decision"]
+                            )
+                        }
+                    }
                     if isinstance(payload.get("learning_decision"), dict)
                     else {}
                 ),

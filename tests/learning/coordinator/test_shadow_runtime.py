@@ -529,7 +529,10 @@ async def test_active_mode_falls_back_to_chat_when_decision_route_is_unavailable
 
     assert turn["capability"] == "chat"
     assert captured["active_capability"] == "chat"
-    assert captured["session_metadata"]["learning_decision"]["route"] == "not_registered"
+    decision_metadata = captured["session_metadata"]["learning_decision"]
+    assert decision_metadata["route"] == "not_registered"
+    assert decision_metadata["requested_capability"] == "chat"
+    assert decision_metadata["active_capability"] == "chat"
 
 
 @pytest.mark.asyncio
@@ -694,6 +697,64 @@ async def test_resumed_thread_supplies_server_owned_learning_state(
         "server_next_activity": next_activity,
         "repeated_request": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_active_mode_resumes_approved_path_thread(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+    learning_store = LearningStore(root=tmp_path / "approved-path-learning-store")
+    learning_store.create_learning_thread(
+        LearningThread(
+            thread_id="thread-approved-path",
+            session_id="session-approved-path",
+            scope="path",
+            goal="Understand eigenvectors",
+            status="active",
+            path_id="topic-approved",
+        )
+    )
+    session_store = SQLiteSessionStore(tmp_path / "approved-path-runtime.db")
+    session = await session_store.create_session(session_id="session-approved-path")
+
+    _configure_runtime(
+        monkeypatch,
+        captured,
+        mode="active",
+        saved_opt_in=True,
+        decision_scope="path",
+    )
+    captured["learning_store"] = learning_store
+    monkeypatch.setattr(
+        "deeptutor.learning.storage.LearningStore",
+        lambda *_args, **_kwargs: learning_store,
+    )
+    runtime = TurnRuntimeManager(session_store)
+    _session, turn = await runtime.start_turn(
+        {
+            "session_id": session["id"],
+            "content": "Continue my approved learning path",
+            "capability": "chat",
+            "tools": [],
+            "knowledge_bases": [],
+            "attachments": [],
+            "language": "en",
+            "config": {},
+            "learning_thread_id": "thread-approved-path",
+        }
+    )
+    events = [event async for event in runtime.subscribe_turn(turn["id"], after_seq=0)]
+
+    assert turn["capability"] == "mastery_path"
+    assert captured["active_capability"] == "mastery_path"
+    session_metadata = next(event["metadata"] for event in events if event["type"] == "session")
+    assert session_metadata["learning_decision"]["thread_id"] == "thread-approved-path"
+    resumed = learning_store.get_learning_thread("thread-approved-path")
+    assert resumed is not None
+    assert resumed.status.value == "active"
+    assert resumed.path_id == "topic-approved"
+    assert resumed.next_activity["kind"] == "prediction"
 
 
 @pytest.mark.asyncio

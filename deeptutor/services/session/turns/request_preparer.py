@@ -487,7 +487,6 @@ class TurnRequestPreparer:
                     set(registry.list_capabilities()),
                     resolve_llm_config_for_selection(payload.get("llm_selection")),
                 )
-                learning_decision = decision_payload(decision)
                 learning_decision_status = "prepared"
                 if coordinator_mode == "active":
                     capability = (
@@ -543,6 +542,9 @@ class TurnRequestPreparer:
                             if expected_scope == "path"
                             else LearningThreadStatus.ACTIVE
                         )
+                        resumable_statuses = {expected_status}
+                        if expected_scope == "path":
+                            resumable_statuses.add(LearningThreadStatus.ACTIVE)
                         activity_payload = decision.activity.model_dump(mode="json")
                         if prior_learning_thread is None:
                             prior_learning_thread = await asyncio.to_thread(
@@ -568,7 +570,7 @@ class TurnRequestPreparer:
                                 raise RuntimeError(
                                     "Learning thread goal does not match the decision"
                                 )
-                            if prior_learning_thread.status is not expected_status:
+                            if prior_learning_thread.status not in resumable_statuses:
                                 raise RuntimeError("Learning thread is not resumable")
                             prior_learning_thread = await asyncio.to_thread(
                                 learning_store.set_learning_thread_next_activity,
@@ -576,7 +578,11 @@ class TurnRequestPreparer:
                                 activity_payload,
                             )
                         decision = decision.model_copy(update={"thread_id": thread_id})
-                        learning_decision = decision_payload(decision)
+                learning_decision = {
+                    **decision_payload(decision),
+                    "requested_capability": requested_capability,
+                    "active_capability": capability,
+                }
             except Exception as exc:
                 # The coordinator is observational in Release 1. Do not
                 # include request content in this operational error surface.
