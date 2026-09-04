@@ -16,6 +16,7 @@ Thank you for your interest in contributing to DeepTutor! We welcome developers 
 - [Branching Strategy](#branching-strategy)
 - [Quick Start for Contributors](#quick-start-for-contributors)
 - [Development Setup](#development-setup)
+- [Learning Coordinator Teaching Evaluation](#learning-coordinator-teaching-evaluation)
 - [Code Quality & Security](#code-quality--security)
 - [Coding Standards](#coding-standards)
 - [Commit Message Format](#commit-message-format)
@@ -170,6 +171,30 @@ Use a separate Git worktree for each feature (`git worktree add ../DeepTutor-<ta
 and long-running agents operate independently without rewriting one another's
 outputs. Before removing a worktree, commit or explicitly preserve its changes;
 do not use `git reset --hard` or `git clean` as a routine cleanup shortcut.
+
+---
+
+## Learning Coordinator Teaching Evaluation
+
+Changes to Learning Coordinator teaching behavior must run the paired baseline and
+coordinator evaluation with the same configured model, chat settings, sources, and
+provider seed when the provider supports one:
+
+```bash
+python scripts/eval_learning_coordinator.py --mode paired --output .artifacts/learning-coordinator-eval.json
+```
+
+The command succeeds even when no model provider is configured. In that case every
+pair is recorded as `blocked` and none is counted as a deterministic pass. Inspect
+the generated report for contract failures, redacted raw-output references, latency,
+token usage, and randomized `A`/`B` review slots. Human reviewers must fill all six
+0–4 rubric dimensions; a model grader cannot fill those slots or certify release.
+
+Do not change the coordinator rollout default from `off`, or an opt-in deployment
+from `active`, until deterministic checks pass and the blinded human review is
+complete. The `.artifacts/learning-coordinator-eval.json` report and its raw-output
+directory are local evaluation evidence and should not be committed.
+
 ---
 
 ## Code Quality & Security

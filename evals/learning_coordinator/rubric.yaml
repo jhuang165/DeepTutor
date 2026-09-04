@@ -1,0 +1,47 @@
+version: 1
+dimensions:
+  factual_correctness:
+    0: Materially wrong, fabricated, or unsafe.
+    1: Major errors make the response unreliable.
+    2: Mostly correct with a meaningful omission or error.
+    3: Correct with only a minor omission that does not block learning.
+    4: Correct, bounded, and checkable.
+  method_fit:
+    0: The teaching method conflicts with the learner's need.
+    1: The method is largely unsuitable or unusable.
+    2: The method partly fits but misses an important need.
+    3: The method fits with a small adaptation needed.
+    4: The method is well matched to the domain, scope, and learner state.
+  diagnosis_quality:
+    0: Ignores or reinforces the learner's difficulty.
+    1: Guesses at the difficulty without useful evidence.
+    2: Identifies a plausible issue but does not test it.
+    3: Identifies and checks the likely issue with a minor gap.
+    4: Accurately isolates the issue and adapts using observable learner evidence.
+  source_honesty:
+    0: Invents, misattributes, or violates source constraints.
+    1: Makes unsupported claims with serious attribution gaps.
+    2: Sources are mostly honest but one material claim is weakly grounded.
+    3: Claims and limitations are traceable with a minor citation gap.
+    4: Every source-dependent claim is traceable and constraints are explicit.
+  cognitive_load:
+    0: The response is unusably overwhelming or fragmented.
+    1: Excess detail or missing structure substantially obstructs learning.
+    2: The load is manageable but has a significant pacing or structure issue.
+    3: The response is clear and paced with one minor load issue.
+    4: The response is concise, staged, and appropriately scaffolded.
+  independent_transfer:
+    0: No learner action or transfer opportunity.
+    1: Learner action only repeats the demonstrated steps.
+    2: Near-copy practice with limited adaptation.
+    3: Independent application in a familiar variation.
+    4: An independent unfamiliar application with evidence of reasoning.
+review:
+  labels: [A, B]
+  randomize_per_case: true
+  initial_value: null
+  reveal_modes_after_review: true
+release_gate:
+  human_review_required: true
+  model_grader_may_fill_results: false
+  model_grader_may_certify: false
