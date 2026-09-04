@@ -1417,3 +1417,67 @@ def test_reviewer_and_machine_artifacts_are_blind_sealed_and_round_trip(
             unblinded["cases"][0]["results"][mode]["raw_output_ref"]
             == machine["cases"][0]["results"][mode]["raw_output_ref"]
         )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "duplicate_reviewer_replaces_omitted",
+        "extra_reviewer",
+        "missing_reviewer",
+        "duplicate_machine",
+    ),
+)
+def test_unblinding_rejects_non_bijective_case_sets(tmp_path, mutation: str) -> None:
+    # Production break caught: case arrays that are not a one-to-one match can
+    # still be joined after duplicate IDs collapse during mapping conversion.
+    module = _load_eval_module()
+    rubric = module.load_rubric(RUBRIC_PATH)
+    cases = module.load_cases(CASES_PATH)[:2]
+
+    class ControlledRunner:
+        async def run(self, requested_case, coordinator_mode, fixture, resume_state):
+            del fixture, resume_state
+            return module.EvalResult(
+                status="completed",
+                scope=requested_case.scope,
+                route="chat",
+                route_available=True,
+                raw_output_ref=f"raw/{requested_case.id}-{coordinator_mode}.json",
+                review_material=f"{requested_case.id} {coordinator_mode} response",
+            )
+
+    artifacts = asyncio.run(
+        module.run_paired_evaluation(
+            cases,
+            runner=ControlledRunner(),
+            rubric=rubric,
+            model="test-model",
+            settings={"temperature": 0.0},
+            provider_seed=317,
+            seed_supported=True,
+        )
+    )
+    reviewer = artifacts["reviewer"]
+    machine = artifacts["machine"]
+    for case in reviewer["cases"]:
+        for scores in case["human_rubric"].values():
+            for dimension in scores:
+                scores[dimension] = 3
+
+    if mutation == "duplicate_reviewer_replaces_omitted":
+        reviewer["cases"][1] = dict(reviewer["cases"][0])
+    elif mutation == "extra_reviewer":
+        reviewer["cases"].append(dict(reviewer["cases"][0]))
+    elif mutation == "missing_reviewer":
+        reviewer["cases"].pop()
+    elif mutation == "duplicate_machine":
+        machine["cases"][1] = dict(machine["cases"][0])
+
+    reviewer_path = tmp_path / "paired.json"
+    machine_path = tmp_path / "paired.machine.json"
+    reviewer_path.write_text(json.dumps(reviewer), encoding="utf-8")
+    machine_path.write_text(json.dumps(machine), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="same unique case IDs"):
+        module.unblind_scored_review(reviewer_path, machine_path)

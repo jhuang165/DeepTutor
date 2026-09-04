@@ -1,6 +1,8 @@
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
+import { createInstance } from 'i18next'
+import { I18nextProvider } from 'react-i18next'
 
 import { LearningActivityPanel } from '@/features/learning/components/LearningActivityPanel'
 import { LearningHome } from '@/features/learning/components/LearningHome'
@@ -10,6 +12,7 @@ import type {
   LearningPathDraft,
   LearningQueueItem,
 } from '@/features/learning/model'
+import zhApp from '@/locales/zh/app.json'
 
 const queueItem: LearningQueueItem = {
   thread_id: 'thread-1',
@@ -96,6 +99,39 @@ describe('LearningHome', () => {
     expect(screen.getByText('Review {{objective}}; its spaced-repetition practice is due.')).toBeVisible()
     await user.click(screen.getByRole('button', { name: 'Continue learning' }))
     expect(onContinue).toHaveBeenCalledWith(queueItem)
+  })
+
+  it('renders the empty-objective fallback in Chinese', async () => {
+    // Production break caught: locale-neutral empty interpolation data renders
+    // an empty label unless the frontend chooses a localized fallback.
+    const zhI18n = createInstance()
+    await zhI18n.init({
+      resources: { zh: { app: zhApp } },
+      lng: 'zh',
+      defaultNS: 'app',
+      keySeparator: false,
+      interpolation: { escapeValue: false },
+    })
+    const item = {
+      ...queueItem,
+      reason: 'unfinished_attempt' as const,
+      objective_id: '',
+      reason_data: {
+        objective: '',
+        goal: '',
+        path_name: '',
+        answer_state: 'pending_answer' as const,
+      },
+    }
+
+    render(
+      <I18nextProvider i18n={zhI18n}>
+        <LearningHome items={[item]} loading={false} onContinue={vi.fn()} />
+      </I18nextProvider>
+    )
+
+    expect(screen.getByText('请回答“当前学习目标”尚未完成的问题。')).toBeVisible()
+    expect(screen.queryByText(/this objective/i)).not.toBeInTheDocument()
   })
 
   it('sends the complete edited draft once and routes only after approval resolves', async () => {

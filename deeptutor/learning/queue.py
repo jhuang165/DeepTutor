@@ -61,7 +61,6 @@ class LearningQueueService:
             if session_id and interaction.session_id != session_id:
                 continue
             objective_id = interaction.question.knowledge_point_id
-            objective = objective_id or "this objective"
             answered = interaction.status is InteractionStatus.ANSWERED
             items.append(
                 LearningQueueItem(
@@ -74,7 +73,7 @@ class LearningQueueService:
                     },
                     reason=LearningQueueReason.UNFINISHED_ATTEMPT,
                     reason_data={
-                        "objective": objective,
+                        "objective": objective_id,
                         "answer_state": "pending_grading" if answered else "pending_answer",
                     },
                     priority=0,

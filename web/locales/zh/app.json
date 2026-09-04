@@ -4734,6 +4734,7 @@
   "Make the next activity less rigorous.": "降低下一项学习活动的严谨度。",
   "Slow down the next activity.": "放慢下一项学习活动的节奏。",
   "Speed up the next activity.": "加快下一项学习活动的节奏。",
+  "this objective": "当前学习目标",
   "Your answer for {{objective}} is waiting for grading.": "你对“{{objective}}”的回答正在等待评分。",
   "Answer the outstanding question for {{objective}}.": "请回答“{{objective}}”尚未完成的问题。",
   "Resume the lesson: {{goal}}.": "继续课程：{{goal}}。",

@@ -58,20 +58,21 @@ function queueReasonText(item: LearningQueueItem, t: TFunction): string {
     path_name: '',
     answer_state: '',
   }
+  const objective = data.objective || t('this objective')
   switch (item.reason) {
     case 'unfinished_attempt':
       return data.answer_state === 'pending_grading'
         ? t('Your answer for {{objective}} is waiting for grading.', {
-            objective: data.objective,
+            objective,
           })
         : t('Answer the outstanding question for {{objective}}.', {
-            objective: data.objective,
+            objective,
           })
     case 'resume_lesson':
       return t('Resume the lesson: {{goal}}.', { goal: data.goal })
     case 'due_review':
       return t('Review {{objective}}; its spaced-repetition practice is due.', {
-        objective: data.objective,
+        objective,
       })
     case 'needs_transfer':
       return t('Apply {{goal}} to a new situation to show transfer.', { goal: data.goal })

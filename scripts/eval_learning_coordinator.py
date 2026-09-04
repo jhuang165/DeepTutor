@@ -991,13 +991,32 @@ def unblind_scored_review(reviewer_path: Path, machine_path: Path) -> dict[str, 
     machine_cases = machine.get("cases")
     if not isinstance(reviewer_cases, list) or not isinstance(machine_cases, list):
         raise ValueError("reviewer and machine artifacts must contain case arrays")
+
+    def unique_case_ids(cases: list[Any]) -> list[str]:
+        case_ids = [
+            str(case.get("case_id") or "")
+            for case in cases
+            if isinstance(case, dict)
+        ]
+        if (
+            len(case_ids) != len(cases)
+            or any(not case_id for case_id in case_ids)
+            or len(set(case_ids)) != len(case_ids)
+        ):
+            raise ValueError("reviewer and machine artifacts must have the same unique case IDs")
+        return case_ids
+
+    reviewer_case_ids = unique_case_ids(reviewer_cases)
+    machine_case_ids = unique_case_ids(machine_cases)
+    if len(reviewer_case_ids) != len(machine_case_ids) or set(reviewer_case_ids) != set(
+        machine_case_ids
+    ):
+        raise ValueError("reviewer and machine artifacts must have the same unique case IDs")
     machine_by_case = {
         str(case.get("case_id") or ""): case
         for case in machine_cases
         if isinstance(case, dict)
     }
-    if len(machine_by_case) != len(machine_cases) or len(reviewer_cases) != len(machine_cases):
-        raise ValueError("reviewer and machine artifacts do not contain the same cases")
     rubric_dimensions = machine.get("rubric_dimensions")
     if not isinstance(rubric_dimensions, list) or not rubric_dimensions:
         raise ValueError("machine artifact does not define rubric dimensions")

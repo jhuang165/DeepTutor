@@ -205,6 +205,21 @@ def test_queue_reason_is_typed_and_contains_only_interpolation_data(
     assert item.priority == 0
 
 
+def test_queue_empty_objective_interpolation_stays_locale_neutral(
+    service: LearningQueueService, store: LearningStore, learning_service: LearningService
+) -> None:
+    # Production break caught: a backend-authored English fallback leaks into
+    # localized queue copy when the pending question has no objective ID.
+    _seed_path(learning_service, "path-1")
+    _seed_active_interaction(store, "path-1", objective_id="")
+
+    item = service.list_items(session_id="s")[0]
+
+    assert item.reason is LearningQueueReason.UNFINISHED_ATTEMPT
+    assert item.objective_id == ""
+    assert item.reason_data.objective == ""
+
+
 def test_queue_projects_resume_and_transfer_thread_activities(
     service: LearningQueueService, store: LearningStore
 ) -> None:
