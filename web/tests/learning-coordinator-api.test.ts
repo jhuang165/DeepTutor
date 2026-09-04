@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { fetchLearningQueue, removeLearningEvidence } from '../lib/learning-coordinator-api'
+import {
+  approveLearningPath,
+  fetchLearningQueue,
+  removeLearningEvidence,
+} from '../lib/learning-coordinator-api'
+import type { LearningPathDraft } from '../features/learning/model'
 
 function mockFetchJson(body: unknown): {
   calls: Array<[RequestInfo | URL, RequestInit | undefined]>
@@ -41,5 +46,42 @@ test('uses DELETE for evidence removal', async () => {
     assert.equal(mock.calls[0]?.[1]?.method, 'DELETE')
   } finally {
     mock.restore()
+  }
+})
+
+test('sends the edited learning preferences when approving a path', async () => {
+  // Break caught: approval drops learner-edited context before the server validates the draft.
+  let body: Record<string, unknown> | undefined
+  const original = globalThis.fetch
+  globalThis.fetch = async (_input, init) => {
+    body = JSON.parse(String(init?.body)) as Record<string, unknown>
+    return Response.json({ path_id: 'path-1' })
+  }
+  const draft: LearningPathDraft = {
+    path_id: 'draft-1',
+    name: 'Signals',
+    goal: 'Understand signals',
+    description: 'A route',
+    starting_point: 'I can sketch sine waves.',
+    teaching_preferences: 'Use visual examples first.',
+    sources: [],
+    modules: [
+      {
+        id: 'module-1',
+        name: 'Foundation',
+        order: 0,
+        pass_threshold: 0.7,
+        knowledge_points: [
+          { id: 'objective-1', name: 'Frequency', type: 'concept', module_id: 'module-1' },
+        ],
+      },
+    ],
+  }
+  try {
+    await approveLearningPath('thread-1', draft)
+    assert.equal(body?.starting_point, 'I can sketch sine waves.')
+    assert.equal(body?.teaching_preferences, 'Use visual examples first.')
+  } finally {
+    globalThis.fetch = original
   }
 })

@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 
@@ -72,13 +72,14 @@ const learningDecision: LearningDecision = {
 }
 
 describe('LearningHome', () => {
-  it('keeps ordinary chat usable when the queue failed', () => {
-    // Break caught: a learning queue failure replaces the ordinary-chat fallback surface.
+  it('leaves queue failures non-destructive without creating another chat composer', () => {
+    // Break caught: a queue error creates a disconnected second composer instead of preserving Task 4 ownership.
     render(
       <LearningHome items={[]} loading={false} error={new Error('offline')} onContinue={vi.fn()} />
     )
     expect(screen.getByRole('heading', { name: 'What do you want to understand?' })).toBeVisible()
-    expect(screen.getByRole('textbox', { name: 'Ask anything' })).toBeEnabled()
+    expect(screen.getByRole('status')).toHaveTextContent('Learning suggestions are unavailable.')
+    expect(screen.queryByRole('textbox', { name: 'Ask anything' })).not.toBeInTheDocument()
   })
 
   it('shows one continuation and the due-review count', async () => {
@@ -91,9 +92,13 @@ describe('LearningHome', () => {
     expect(onContinue).toHaveBeenCalledWith(queueItem)
   })
 
-  it('only approves a complete edited draft and waits for success before routing', async () => {
-    // Break caught: a draft is approved without objectives or routes before authenticated approval resolves.
-    const approvePath = vi.fn(async () => 'path-1')
+  it('sends the complete edited draft once and routes only after approval resolves', async () => {
+    // Break caught: edited draft fields are lost, duplicate approval starts, or navigation runs before success.
+    let resolveApproval: (pathId: string) => void = () => undefined
+    const approval = new Promise<string>(resolve => {
+      resolveApproval = resolve
+    })
+    const approvePath = vi.fn(() => approval)
     const onApproved = vi.fn()
     const user = userEvent.setup()
     render(
@@ -104,9 +109,36 @@ describe('LearningHome', () => {
         onApproved={onApproved}
       />
     )
+    await user.clear(screen.getByRole('textbox', { name: 'Starting point' }))
+    await user.type(screen.getByRole('textbox', { name: 'Starting point' }), 'I know calculus.')
+    await user.clear(screen.getByRole('textbox', { name: 'Teaching preferences' }))
+    await user.type(screen.getByRole('textbox', { name: 'Teaching preferences' }), 'Use diagrams.')
     await user.click(screen.getByRole('button', { name: 'Approve path and begin' }))
-    expect(approvePath).toHaveBeenCalledWith('thread-1', pathDraft)
-    expect(onApproved).toHaveBeenCalledWith('/mastery/path-1')
+    expect(approvePath).toHaveBeenCalledWith(
+      'thread-1',
+      expect.objectContaining({
+        starting_point: 'I know calculus.',
+        teaching_preferences: 'Use diagrams.',
+      })
+    )
+    expect(onApproved).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'Approve path and begin' }))
+    expect(approvePath).toHaveBeenCalledTimes(1)
+    resolveApproval('path-1')
+    await waitFor(() => expect(onApproved).toHaveBeenCalledWith('/mastery/path-1'))
+  })
+
+  it('gates approval when an editable module has no objectives', () => {
+    // Break caught: a broad path with an empty module can bypass authenticated approval validation.
+    render(
+      <LearningPathProposal
+        threadId="thread-1"
+        draft={{ ...pathDraft, modules: [{ ...pathDraft.modules[0], knowledge_points: [] }] }}
+        approvePath={vi.fn(async () => 'path-1')}
+        onApproved={vi.fn()}
+      />
+    )
+    expect(screen.getByRole('button', { name: 'Approve path and begin' })).toBeDisabled()
   })
 
   it('marks direct explanations as non-independent evidence', async () => {

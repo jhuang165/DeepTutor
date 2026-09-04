@@ -62,6 +62,8 @@ export async function approveLearningPath(
         name: draft.name,
         goal: draft.goal,
         description: draft.description,
+        starting_point: draft.starting_point,
+        teaching_preferences: draft.teaching_preferences,
         emoji: '🧭',
         sources: draft.sources,
         modules: draft.modules,

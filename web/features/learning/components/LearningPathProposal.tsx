@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import { useTranslation } from 'react-i18next'
 
 import type { LearningModule, LearningPathDraft } from '../model'
 
@@ -28,6 +29,7 @@ export function LearningPathProposal({
   approvePath,
   onApproved,
 }: LearningPathProposalProps) {
+  const { t } = useTranslation()
   const [draft, setDraft] = useState(() => copyDraft(initialDraft))
   const [approving, setApproving] = useState(false)
   const [error, setError] = useState<Error | null>(null)
@@ -60,10 +62,10 @@ export function LearningPathProposal({
   return (
     <section aria-labelledby="learning-path-title" className="min-w-0 max-w-full">
       <h2 id="learning-path-title" className="text-lg font-semibold">
-        Learning path proposal
+        {t('Learning path proposal')}
       </h2>
       <label className="mt-3 block text-sm" htmlFor="learning-goal">
-        Goal
+        {t('Goal')}
       </label>
       <textarea
         id="learning-goal"
@@ -72,7 +74,7 @@ export function LearningPathProposal({
         className="mt-1 w-full min-w-0 rounded border p-2"
       />
       <label className="mt-3 block text-sm" htmlFor="learning-starting-point">
-        Starting point
+        {t('Starting point')}
       </label>
       <textarea
         id="learning-starting-point"
@@ -81,7 +83,7 @@ export function LearningPathProposal({
         className="mt-1 w-full min-w-0 rounded border p-2"
       />
       <label className="mt-3 block text-sm" htmlFor="learning-sources">
-        Sources
+        {t('Sources')}
       </label>
       <textarea
         id="learning-sources"
@@ -110,7 +112,7 @@ export function LearningPathProposal({
         className="mt-1 w-full min-w-0 rounded border p-2"
       />
       <label className="mt-3 block text-sm" htmlFor="learning-preferences">
-        Teaching preferences
+        {t('Teaching preferences')}
       </label>
       <textarea
         id="learning-preferences"
@@ -122,7 +124,7 @@ export function LearningPathProposal({
         {draft.modules.map((module, index) => (
           <li key={module.id} className="min-w-0 rounded border p-3">
             <label className="block text-sm" htmlFor={`module-${module.id}`}>
-              Module {index + 1}
+              {t('Module {{count}}', { count: index + 1 })}
             </label>
             <input
               id={`module-${module.id}`}
@@ -131,7 +133,7 @@ export function LearningPathProposal({
               className="mt-1 w-full min-w-0 rounded border p-2"
             />
             <label className="mt-2 block text-sm" htmlFor={`objectives-${module.id}`}>
-              Objectives
+              {t('Objectives')}
             </label>
             <textarea
               id={`objectives-${module.id}`}
@@ -167,7 +169,7 @@ export function LearningPathProposal({
         className="mt-4 rounded bg-primary px-3 py-2 text-primary-foreground disabled:opacity-50"
         onClick={() => void approve()}
       >
-        Approve path and begin
+        {t('Approve path and begin')}
       </button>
     </section>
   )
