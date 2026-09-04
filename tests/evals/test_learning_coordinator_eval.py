@@ -295,6 +295,40 @@ def test_local_runner_rejects_guidance_then_answer_solicitation_as_a_direct_answ
 
 
 @pytest.mark.parametrize(
+    "response",
+    [
+        "You could try x = 5. Does that satisfy the equation?",
+        "Maybe x = 5. Does that satisfy the equation?",
+    ],
+)
+def test_local_runner_rejects_reviewer_hedged_equations_before_a_question(
+    tmp_path, monkeypatch, response
+) -> None:
+    module = _load_eval_module()
+    case = next(case for case in module.load_cases(CASES_PATH) if case.id == "math-direct-002")
+    from deeptutor.learning.coordinator import LearningCoordinator
+
+    async def direct_prepare(self, payload, available_capabilities, llm_config):
+        del self, payload, available_capabilities, llm_config
+        return _learning_decision(scope="answer", help_level=4)
+
+    async def hedged_answer_handle(self, context):
+        del self, context
+        for event in _completed_events(response):
+            yield event
+
+    monkeypatch.setattr(LearningCoordinator, "prepare_payload", direct_prepare)
+    _patch_orchestrator(monkeypatch, hedged_answer_handle)
+    _patch_llm_config(monkeypatch)
+
+    result = asyncio.run(_local_runner(module, tmp_path).run(case, "active", _fixture(), None))
+
+    assert result.status == "completed", _raw_events(tmp_path, result)
+    assert result.direct_answer_honored is False
+    assert "direct_answer_not_honored" in module.score_contracts(case, result).failures
+
+
+@pytest.mark.parametrize(
     ("response", "expected"),
     [
         pytest.param(
@@ -329,13 +363,48 @@ def test_local_runner_rejects_guidance_then_answer_solicitation_as_a_direct_answ
         ),
         pytest.param(
             "The direct answer is x = 5. Can you explain why?",
-            True,
-            id="english-answer-with-follow-up",
+            False,
+            id="english-answer-with-learner-question",
         ),
         pytest.param(
             "答案是 x = 5。你能解释原因吗？",
+            False,
+            id="chinese-answer-with-learner-question",
+        ),
+        pytest.param(
+            "This response outlines a process for finding the answer.",
+            False,
+            id="english-generic-process-declarative",
+        ),
+        pytest.param(
+            "下面说明求解过程。",
+            False,
+            id="chinese-generic-process-declarative",
+        ),
+        pytest.param(
+            "Maybe x = 5.",
+            False,
+            id="english-hedged-equation-without-question",
+        ),
+        pytest.param(
+            "也许 x = 5。",
+            False,
+            id="chinese-hedged-equation-without-question",
+        ),
+        pytest.param(
+            "The direct answer is x = 5.",
             True,
-            id="chinese-answer-with-follow-up",
+            id="english-unhedged-direct-answer",
+        ),
+        pytest.param(
+            "答案是 x = 5。",
+            True,
+            id="chinese-unhedged-direct-answer",
+        ),
+        pytest.param(
+            "x = 5.",
+            True,
+            id="unhedged-substantive-equation",
         ),
     ],
 )

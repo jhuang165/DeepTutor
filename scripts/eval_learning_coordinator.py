@@ -224,50 +224,38 @@ def _citation_ids(value: Any) -> set[str]:
 
 
 def _response_gives_direct_answer(response: str) -> bool:
-    """Conservatively require a substantive clause in the terminal response."""
+    """Certify only a question-free, unhedged explicit answer or value."""
 
     normalized = re.sub(r"[`*_>#]", " ", response).strip()
-    if not normalized:
+    if not normalized or "?" in normalized or "？" in normalized:
         return False
-    clauses = [
-        item.strip()
-        for item in re.findall(r"[^.!?。！？\r\n]+[.!?。！？]?", normalized)
-        if item.strip()
-    ]
+    hedged = re.compile(
+        r"(?i)(?:\b(?:maybe|perhaps|possibly|probably|likely|apparently|might|may|"
+        r"could|would|try|guess|suppose|seems?)\b|"
+        r"也许|可能|或许|大概|恐怕|似乎|看起来|试着|试试|猜(?:测)?|不妨)"
+    )
+    if hedged.search(normalized):
+        return False
     explicit_answer = re.compile(
-        r"(?i)(?:\b(?:the\s+)?(?:answer|result|solution|conclusion)\s+(?:is|are)\b|"
-        r"(?:答案|结果|结论)\s*(?:是|为)|(?<![<>=!])=(?!=))"
+        r"(?i)(?:"
+        r"\b(?:the\s+)?(?:direct\s+)?(?:answer|result|solution|conclusion)\b\s*"
+        r"(?:(?:is|are|equals)\s+|[:=]\s*)\S|"
+        r"(?:答案|结果|结论|解)\s*(?:是|为|等于|[:：=])\s*\S)"
     )
-    guidance = re.compile(
-        r"(?i)^(?:"
-        r"let(?:'s| us)\b|we (?:can|could|will|should|need to)\b|"
-        r"i (?:can|could|will|'ll)\b|"
-        r"try\b|start\b|begin\b|first\b|next\b|please\b|"
-        r"think\b|consider\b|look\b|work\b|take\b|use\b|"
-        r"tell me\b|show me\b|give it\b|have a go\b|here(?:'s| is) (?:a|one) hint\b|"
-        r"我们|咱们|让我|我来|请|试(?:一试|试看)?|先|想一想|考虑|"
-        r"告诉我|你(?:来|先)|这里有一个提示|给你一个提示)"
+    explicit_value = re.compile(
+        r"(?i)(?:\b(?:value|amount|total|output)\b\s*"
+        r"(?:(?:is|are|equals)\s+|[:=]\s*)\S|"
+        r"(?:值|数值|总数|输出)\s*(?:是|为|等于|[:：=])\s*\S)"
     )
-    acknowledgement = re.compile(
-        r"(?i)^(?:sure|okay|ok|certainly|of course|好的|好|当然|可以)[.!。！]?$"
+    substantive_equation = re.compile(
+        r"(?<![<>=!])(?:\b[A-Za-z_]\w*|\b\d+(?:\.\d+)?)\s*=\s*(?![=])"
+        r"(?:[-+]?\d+(?:\.\d+)?\b|[A-Za-z_]\w*\b)"
     )
-    answer_clauses = [clause for clause in clauses if not clause.endswith(("?", "？"))]
-    substantive_clauses = [
-        clause
-        for clause in answer_clauses
-        if not guidance.search(clause) and not acknowledgement.fullmatch(clause)
-    ]
-    explicit_answer_present = any(
-        explicit_answer.search(clause) for clause in substantive_clauses
+    return bool(
+        explicit_answer.search(normalized)
+        or explicit_value.search(normalized)
+        or substantive_equation.search(normalized)
     )
-    if any(clause.endswith(("?", "？")) for clause in clauses):
-        return explicit_answer_present
-    for clause in substantive_clauses:
-        if explicit_answer.search(clause):
-            return True
-        if re.search(r"[A-Za-z0-9\u4e00-\u9fff]", clause):
-            return True
-    return False
 
 
 @contextmanager
