@@ -256,6 +256,223 @@ def _patch_runtime_support(monkeypatch) -> None:
     )
 
 
+def test_local_runner_finishes_batch_after_real_runtime_waiting_input(
+    tmp_path, monkeypatch
+) -> None:
+    # Regression: a genuine runtime learner-input pause hangs subscription,
+    # prevents later arms, and loses the question because no RESULT exists.
+    module = _load_eval_module()
+    cases = module.load_cases(CASES_PATH)
+    cases = [
+        next(case for case in cases if case.id == case_id)
+        for case_id in ("math-lesson-004", "math-answer-001")
+    ]
+    from deeptutor.core.stream import StreamEvent, StreamEventType
+    from deeptutor.learning.coordinator import LearningCoordinator
+    from deeptutor.services.session.turn_runtime import TurnRuntimeManager
+    from deeptutor.tools.builtin import AskUserTool
+
+    runtimes = []
+    original_init = TurnRuntimeManager.__init__
+
+    def capture_runtime(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        runtimes.append(self)
+
+    async def controlled_prepare(self, payload, available_capabilities, llm_config):
+        del self, available_capabilities, llm_config
+        first_case = payload["content"] == cases[0].prompt
+        return _learning_decision(
+            scope="lesson" if first_case else "answer",
+            route="mastery_path" if first_case else "chat",
+            goal=payload["content"],
+        )
+
+    async def controlled_handle(self, context):
+        del self
+        if context.active_capability == "mastery_path":
+            yield StreamEvent(
+                type=StreamEventType.CONTENT,
+                source="mastery_path",
+                content="Think about an invariant direction.",
+            )
+            question = await AskUserTool().execute(
+                intro="Choose one direction.",
+                questions=[
+                    {
+                        "id": "direction",
+                        "prompt": "Which vector stays parallel?",
+                        "options": [
+                            {"label": "A", "description": "The first vector"},
+                            {"label": "B", "description": "The second vector"},
+                        ],
+                    }
+                ],
+            )
+            yield StreamEvent(
+                type=StreamEventType.TOOL_RESULT,
+                source="mastery_path",
+                content=question.content,
+                metadata={"tool_name": "ask_user", "tool_metadata": question.metadata},
+            )
+            await context.runtime.wait_for_user_reply()
+            raise AssertionError("The evaluator must cancel, never supply a learner reply")
+        for event in _completed_events():
+            yield event
+
+    monkeypatch.setattr(TurnRuntimeManager, "__init__", capture_runtime)
+    monkeypatch.setattr(LearningCoordinator, "prepare_payload", controlled_prepare)
+    _patch_orchestrator(monkeypatch, controlled_handle)
+    _patch_runtime_support(monkeypatch)
+
+    async def evaluate():
+        return await asyncio.wait_for(
+            module.run_paired_evaluation(
+                cases,
+                runner=_local_runner(module, tmp_path),
+                rubric=module.load_rubric(RUBRIC_PATH),
+                model="controlled-model",
+                settings={},
+                provider_seed=317,
+                seed_supported=False,
+            ),
+            timeout=5,
+        )
+
+    artifacts = asyncio.run(evaluate())
+    machine = artifacts["machine"]
+    paused = machine["cases"][0]["results"]["coordinator"]
+    assert paused["status"] == "waiting_input"
+    assert paused["incomplete_reason"] == "learner_input_required"
+    assert paused["blocked_reason"] == ""
+    assert paused["deterministic_passed"] is False
+    assert machine["release_gate"] == "deterministic_failed"
+    assert "learner_input_required" in machine["cases"][0]["contract_failures"]["coordinator"]
+    assert machine["cases"][1]["results"]["coordinator"]["status"] == "completed"
+    assert paused["activity_consumed"] is False
+    for visible_text in (
+        "Think about an invariant direction.",
+        "Choose one direction.",
+        "Which vector stays parallel?",
+        "A",
+        "The first vector",
+        "The second vector",
+    ):
+        assert visible_text in paused["review_material"]
+    raw = json.loads((tmp_path / paused["raw_output_ref"]).read_text())["events"]
+    assert any(item["type"] == "tool_result" for item in raw)
+    assert any(item["type"] == "done" and item["metadata"]["status"] == "cancelled" for item in raw)
+    assert not any((item.get("metadata") or {}).get("ask_user_resolved") for item in raw)
+    assert len(runtimes) == 4
+    assert all(not runtime._executions and not runtime._reply_queues for runtime in runtimes)
+    serialized_reviewer = json.dumps(artifacts["reviewer"])
+    assert "learner_input_required" not in serialized_reviewer
+    assert "waiting_input" not in serialized_reviewer
+
+
+@pytest.mark.parametrize("fail_execution", [False, True])
+def test_local_runner_does_not_infer_pause_from_question_metadata(
+    tmp_path, monkeypatch, fail_execution
+) -> None:
+    # A card alone cannot establish that the production runtime paused.
+    module = _load_eval_module()
+    case = next(case for case in module.load_cases(CASES_PATH) if case.id == "math-answer-001")
+    from deeptutor.core.stream import StreamEvent, StreamEventType
+    from deeptutor.tools.builtin import AskUserTool
+
+    async def controlled_handle(self, context):
+        del self, context
+        question = await AskUserTool().execute(question="Which vector stays parallel?")
+        yield StreamEvent(
+            type=StreamEventType.TOOL_RESULT,
+            source="chat",
+            content=question.content,
+            metadata={"tool_name": "ask_user", "tool_metadata": question.metadata},
+        )
+        if fail_execution:
+            raise RuntimeError("controlled execution defect")
+        for event in _completed_events():
+            yield event
+
+    _patch_orchestrator(monkeypatch, controlled_handle)
+    _patch_runtime_support(monkeypatch)
+    result = asyncio.run(_local_runner(module, tmp_path).run(case, "off", _fixture(), None))
+    assert result.status == ("failed" if fail_execution else "completed")
+    assert result.incomplete_reason == ""
+    assert result.blocked_reason == ""
+    if not fail_execution:
+        assert result.review_material == "The direct answer is x = 5."
+
+
+def test_baseline_waiting_input_prevents_release_even_when_coordinator_passes() -> None:
+    # An incomplete baseline cannot support a paired teaching comparison.
+    module = _load_eval_module()
+    case = next(case for case in module.load_cases(CASES_PATH) if case.id == "math-answer-001")
+
+    class PausedBaselineRunner:
+        async def run(self, case, coordinator_mode, fixture, resume_state):
+            del fixture, resume_state
+            return _complete_result(
+                module,
+                case,
+                decision_persisted=True,
+                status="waiting_input" if coordinator_mode == "off" else "completed",
+            )
+
+    artifacts = asyncio.run(
+        module.run_paired_evaluation(
+            [case],
+            runner=PausedBaselineRunner(),
+            rubric=module.load_rubric(RUBRIC_PATH),
+            model="controlled-model",
+            settings={},
+            provider_seed=317,
+            seed_supported=False,
+        )
+    )
+    machine = artifacts["machine"]
+    assert machine["cases"][0]["results"]["coordinator"]["deterministic_passed"] is True
+    assert machine["release_gate"] == "deterministic_failed"
+
+
+def test_local_runner_cancellation_releases_execution_and_subscription(
+    tmp_path, monkeypatch
+) -> None:
+    # Interrupting the batch must not leave the new collector/observer tasks alive.
+    module = _load_eval_module()
+    case = next(case for case in module.load_cases(CASES_PATH) if case.id == "math-answer-001")
+    started = asyncio.Event()
+    never = asyncio.Event()
+
+    async def controlled_handle(self, context):
+        del self, context
+        started.set()
+        await never.wait()
+        for event in _completed_events():
+            yield event
+
+    _patch_orchestrator(monkeypatch, controlled_handle)
+    _patch_runtime_support(monkeypatch)
+
+    async def interrupt():
+        # Memory reclamation intentionally outlives turns; isolate unrelated
+        # process housekeeping so leaked evaluator tasks remain visible.
+        monkeypatch.setattr(
+            "deeptutor.runtime.memory_reclaim.schedule_memory_reclaim", lambda: None
+        )
+        tasks_before = asyncio.all_tasks()
+        task = asyncio.create_task(
+            _local_runner(module, tmp_path).run(case, "off", _fixture(), None)
+        )
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert asyncio.all_tasks() == tasks_before
+
+    asyncio.run(interrupt())
+
+
 def test_local_runner_detects_path_created_during_coordinator_preparation(
     tmp_path, monkeypatch
 ) -> None:

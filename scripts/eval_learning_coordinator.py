@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, aclosing, contextmanager
 import hashlib
 import json
 import os
@@ -115,6 +115,7 @@ class EvalResult:
         review_material: str = "",
         raw_output_ref: str = "",
         blocked_reason: str = "",
+        incomplete_reason: str = "",
         latency_ms: float | None = None,
         token_usage: dict[str, int] | None = None,
     ) -> None:
@@ -139,6 +140,7 @@ class EvalResult:
         self.review_material = review_material
         self.raw_output_ref = raw_output_ref
         self.blocked_reason = blocked_reason
+        self.incomplete_reason = incomplete_reason
         self.latency_ms = latency_ms
         self.token_usage = dict(token_usage or {})
 
@@ -453,6 +455,7 @@ class LocalDeepTutorRunner:
         runtime._maybe_generate_session_title = skip_title_generation
         turn: dict[str, Any] = {}
         messages: list[dict[str, Any]] = []
+        observed_status = ""
         try:
             with (
                 self._isolated_runtime(store, attachment_store, coordinator_mode),
@@ -465,9 +468,7 @@ class LocalDeepTutorRunner:
                     resume_state=resume_state,
                     goal=str((resume_state or {}).get("goal") or case.prompt),
                 )
-                _session, turn = await runtime.start_turn(payload)
-                async for event in runtime.subscribe_turn(turn["id"]):
-                    events.append(event)
+                turn, observed_status = await self._collect_turn(runtime, payload, events)
                 messages = await session_store.get_messages(session_id)
         except Exception as exc:
             preparation_error = exc
@@ -531,6 +532,8 @@ class LocalDeepTutorRunner:
         status = "completed" if terminal_status == "completed" and not errors else "failed"
         if status == "failed" and self._provider_unavailable(events, preparation_error):
             status = "blocked"
+        if observed_status == "waiting_input":
+            status = observed_status
         result_metadata = next(
             (
                 item.get("metadata") or {}
@@ -563,6 +566,9 @@ class LocalDeepTutorRunner:
             "",
         )
         response = str(result_metadata.get("response") or persisted_response)
+        if observed_status == "waiting_input":
+            question_text = self._pending_question_text(events)
+            response = "\n\n".join(part for part in (response, question_text) if part)
         return EvalResult(
             status=status,
             scope=decision.scope.value if decision is not None else case.scope,
@@ -587,6 +593,7 @@ class LocalDeepTutorRunner:
             review_material=response,
             raw_output_ref=raw_ref,
             blocked_reason="; ".join(errors) if status == "blocked" else "",
+            incomplete_reason="learner_input_required" if status == "waiting_input" else "",
             latency_ms=round((time.perf_counter() - started) * 1000, 3),
             token_usage={
                 "prompt_tokens": int(cost_summary.get("prompt_tokens") or 0),
@@ -594,6 +601,67 @@ class LocalDeepTutorRunner:
                 "total_tokens": int(cost_summary.get("total_tokens") or 0),
             },
         )
+
+    @staticmethod
+    async def _collect_turn(
+        runtime: Any, payload: dict[str, Any], events: list[dict[str, Any]]
+    ) -> tuple[dict[str, Any], str]:
+        # waiting_input has no stream event. Observe this arm's successful
+        # persistence transition, not card-shaped metadata or elapsed time.
+        waiting_input = asyncio.Event()
+        transition_turn = runtime.store.transition_turn
+
+        async def observe_transition(turn_id: str, status: str, *args: Any, **kwargs: Any):
+            transitioned = await transition_turn(turn_id, status, *args, **kwargs)
+            if transitioned and status == "waiting_input":
+                waiting_input.set()
+            return transitioned
+
+        async def collect(turn_id: str) -> None:
+            async with aclosing(runtime.subscribe_turn(turn_id)) as subscription:
+                async for event in subscription:
+                    events.append(event)
+
+        with patch.object(runtime.store, "transition_turn", observe_transition):
+            _session, turn = await runtime.start_turn(payload)
+            collector = asyncio.create_task(collect(turn["id"]))
+            pause_observer = asyncio.create_task(waiting_input.wait())
+            observed_status = ""
+            try:
+                await asyncio.wait((collector, pause_observer), return_when=asyncio.FIRST_COMPLETED)
+                if waiting_input.is_set():
+                    observed_status = "waiting_input"
+                    # Cancel explicitly before close(): graceful shutdown sends
+                    # None to reply queues, which would resume the capability.
+                    # Drain the resulting events and persisted partial answer.
+                    await runtime.cancel_turn(turn["id"])
+                await collector
+            finally:
+                if not collector.done():
+                    await runtime.cancel_turn(turn["id"])
+                    collector.cancel()
+                pause_observer.cancel()
+                await asyncio.gather(collector, pause_observer, return_exceptions=True)
+        return turn, observed_status
+
+    @staticmethod
+    def _pending_question_text(events: list[dict[str, Any]]) -> str:
+        for event in reversed(events):
+            metadata = event.get("metadata") or {}
+            if event.get("type") != "tool_result" or metadata.get("tool_name") != "ask_user":
+                continue
+            card = (metadata.get("tool_metadata") or {}).get("ask_user") or {}
+            lines = [str(card["intro"])] if card.get("intro") else []
+            for question in card.get("questions") or []:
+                lines.append(str(question.get("prompt") or ""))
+                for option in question.get("options") or []:
+                    lines.append(
+                        " — ".join(
+                            str(option[key]) for key in ("label", "description") if option.get(key)
+                        )
+                    )
+            return "\n".join(lines)
+        return ""
 
     @staticmethod
     async def _seed_session_history(
@@ -764,6 +832,7 @@ def _result_summary(result: EvalResult, score: ContractScore) -> dict[str, Any]:
         "activity_consumed": result.activity_consumed,
         "review_material": result.review_material,
         "blocked_reason": result.blocked_reason,
+        "incomplete_reason": result.incomplete_reason,
         "deterministic_passed": score.passed,
     }
 
@@ -805,7 +874,9 @@ async def run_paired_evaluation(
         baseline_score = score_contracts(case, baseline)
         coordinator_score = score_contracts(case, coordinator, require_coordinator=True)
         any_blocked = any_blocked or "blocked" in {baseline.status, coordinator.status}
-        any_contract_failure = any_contract_failure or not coordinator_score.passed
+        any_contract_failure = (
+            any_contract_failure or baseline.status != "completed" or not coordinator_score.passed
+        )
 
         named_outputs = {
             "baseline": {
@@ -1228,6 +1299,8 @@ def score_contracts(
     failures: list[str] = []
     if result.status == "blocked":
         failures.append("provider_unavailable")
+    elif result.status == "waiting_input":
+        failures.append("learner_input_required")
     elif result.status != "completed":
         failures.append("execution_failed")
     if result.scope != case.expected["scope"]:
