@@ -223,8 +223,47 @@ def _citation_ids(value: Any) -> set[str]:
     return set()
 
 
+def _bare_result_text(response: str) -> str:
+    """Remove only presentation wrappers around a possible bare result."""
+
+    candidate = response.strip()
+    candidate = re.sub(r"^(?:>\s*)+", "", candidate)
+    candidate = re.sub(r"^#{1,6}\s+", "", candidate)
+    wrappers = (
+        ("$$", "$$"),
+        ("$", "$"),
+        (r"\[", r"\]"),
+        (r"\(", r"\)"),
+        ("**", "**"),
+        ("__", "__"),
+        ("`", "`"),
+        ("(", ")"),
+        ("[", "]"),
+        ("{", "}"),
+        ('"', '"'),
+        ("'", "'"),
+        ("“", "”"),
+        ("‘", "’"),
+    )
+    surrounding_punctuation = " \t\r\n.,;:!。；：！，"
+    while candidate:
+        previous = candidate
+        candidate = candidate.strip(surrounding_punctuation)
+        for opening, closing in wrappers:
+            if (
+                candidate.startswith(opening)
+                and candidate.endswith(closing)
+                and len(candidate) > len(opening) + len(closing)
+            ):
+                candidate = candidate[len(opening) : -len(closing)].strip()
+                break
+        if candidate == previous:
+            break
+    return candidate
+
+
 def _response_gives_direct_answer(response: str) -> bool:
-    """Certify only a question-free, unhedged explicit answer or value."""
+    """Certify only a question-free, unhedged labelled or bare result."""
 
     normalized = re.sub(r"[`*_>#]", " ", response).strip()
     if not normalized or "?" in normalized or "？" in normalized:
@@ -247,14 +286,25 @@ def _response_gives_direct_answer(response: str) -> bool:
         r"(?:(?:is|are|equals)\s+|[:=]\s*)\S|"
         r"(?:值|数值|总数|输出)\s*(?:是|为|等于|[:：=])\s*\S)"
     )
-    substantive_equation = re.compile(
-        r"(?<![<>=!])(?:\b[A-Za-z_]\w*|\b\d+(?:\.\d+)?)\s*=\s*(?![=])"
-        r"(?:[-+]?\d+(?:\.\d+)?\b|[A-Za-z_]\w*\b)"
+    number = r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+    atom = rf"(?:{number}|[A-Za-z_][A-Za-z0-9_]*|[π∞])"
+    operator = r"(?:\*\*|[+*/^×÷·-])"
+    expression = rf"[-+]?\s*{atom}(?:\s*{operator}\s*[-+]?\s*{atom})*"
+    bare_assignment_or_equality = re.compile(
+        rf"{expression}\s*=\s*{expression}",
+        re.IGNORECASE,
     )
+    bare_value = re.compile(
+        rf"(?:[-+]?\s*{number}\s*%?|"
+        rf"[-+]?\s*{atom}(?:\s*{operator}\s*[-+]?\s*{atom})+)",
+        re.IGNORECASE,
+    )
+    bare_result = _bare_result_text(response)
     return bool(
         explicit_answer.search(normalized)
         or explicit_value.search(normalized)
-        or substantive_equation.search(normalized)
+        or bare_assignment_or_equality.fullmatch(bare_result)
+        or bare_value.fullmatch(bare_result)
     )
 
 

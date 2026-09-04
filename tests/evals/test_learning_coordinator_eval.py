@@ -357,9 +357,19 @@ def test_local_runner_rejects_reviewer_hedged_equations_before_a_question(
             id="english-guidance-with-trial-equation",
         ),
         pytest.param(
+            "First, set x = 5.",
+            False,
+            id="english-process-instruction-with-equation",
+        ),
+        pytest.param(
             "试着令 x = 5。它满足方程吗？",
             False,
             id="chinese-guidance-with-trial-equation",
+        ),
+        pytest.param(
+            "首先，令 x = 5。",
+            False,
+            id="chinese-process-instruction-with-equation",
         ),
         pytest.param(
             "The direct answer is x = 5. Can you explain why?",
@@ -405,6 +415,16 @@ def test_local_runner_rejects_reviewer_hedged_equations_before_a_question(
             "x = 5.",
             True,
             id="unhedged-substantive-equation",
+        ),
+        pytest.param(
+            r"  \[x = 5\].  ",
+            True,
+            id="math-delimited-bare-equation",
+        ),
+        pytest.param(
+            "42.",
+            True,
+            id="bare-numeric-value",
         ),
     ],
 )
