@@ -1377,6 +1377,8 @@ def start(
         "-m",
         "uvicorn",
         "deeptutor.api.main:app",
+        "--app-dir",
+        str(PACKAGE_ROOT.resolve()),
         "--host",
         "0.0.0.0",
         "--port",

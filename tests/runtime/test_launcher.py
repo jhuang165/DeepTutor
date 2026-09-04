@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 
@@ -603,6 +604,98 @@ def test_start_uses_ipv4_loopback_for_frontend_proxy(
     assert "DEEPTUTOR_NEXT_DIST_DIR" not in captured_envs["frontend"]
     assert launcher.DETACHED_WORKER_ENV not in captured_envs["backend"]
     assert launcher.DETACHED_TOKEN_ENV not in captured_envs["backend"]
+
+
+def test_backend_uvicorn_imports_app_from_selected_package_with_conflicting_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from deeptutor.services import config as config_module
+    from deeptutor.services import setup as setup_module
+
+    selected = tmp_path / "selected"
+    runtime_home = tmp_path / "runtime-home"
+    marker = tmp_path / "loaded-app.txt"
+    app_source = (
+        "import os\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['DEEPTUTOR_TEST_APP_PROVENANCE']).write_text(\n"
+        "    __file__, encoding='utf-8'\n"
+        ")\n"
+        "async def app(scope, receive, send):\n"
+        "    if scope['type'] == 'lifespan':\n"
+        "        await receive()\n"
+        "        await send({\n"
+        "            'type': 'lifespan.startup.failed',\n"
+        "            'message': 'expected provenance-test shutdown',\n"
+        "        })\n"
+    )
+    for root in (selected, runtime_home):
+        api = root / "deeptutor" / "api"
+        api.mkdir(parents=True)
+        (api.parent / "__init__.py").write_text("", encoding="utf-8")
+        (api / "__init__.py").write_text("", encoding="utf-8")
+        (api / "main.py").write_text(app_source, encoding="utf-8")
+
+    settings_dir = runtime_home / "data" / "user" / "settings"
+    settings = config_module.LaunchSettings(
+        backend_port=0,
+        frontend_port=3782,
+        language="en",
+        source="test",
+        settings_dir=settings_dir,
+        interface_json_path=settings_dir / "interface.json",
+        system_json_path=settings_dir / "system.json",
+    )
+    monkeypatch.setattr(launcher, "PACKAGE_ROOT", selected)
+    monkeypatch.setattr(launcher, "_relax_console_encoding", lambda: None)
+    monkeypatch.setattr(launcher, "_reset_runtime_singletons", lambda: None)
+    monkeypatch.setattr(config_module, "ensure_runtime_settings_files", lambda: None)
+    monkeypatch.setattr(config_module, "load_launch_settings", lambda _home: settings)
+    monkeypatch.setattr(config_module, "export_runtime_settings_to_env", lambda **_kwargs: {})
+    monkeypatch.setattr(config_module, "load_auth_settings", lambda: {"enabled": False})
+    monkeypatch.setattr(config_module, "get_ws_max_size", lambda: 1024)
+    monkeypatch.setattr(setup_module, "init_user_directories", lambda _home: None)
+    monkeypatch.setattr(launcher, "resolve_language", lambda: "en")
+    monkeypatch.setattr(launcher, "print_banner", lambda **_kwargs: None)
+    monkeypatch.setattr(launcher, "_log", lambda _message: None)
+    monkeypatch.setattr(
+        launcher,
+        "_resolve_frontend",
+        lambda *_args, **_kwargs: launcher.FrontendRuntime("source-production", ["node"], tmp_path),
+    )
+    monkeypatch.setattr(launcher, "_detect_existing_source_frontend", lambda _runtime: None)
+    monkeypatch.setattr(
+        launcher,
+        "_resolve_port_conflicts",
+        lambda **_kwargs: (0, 3782),
+    )
+    monkeypatch.setattr(launcher, "_install_signal_handlers", lambda _callback, **_kwargs: None)
+    monkeypatch.setattr(launcher.atexit, "register", lambda _callback: None)
+    monkeypatch.setattr(launcher, "_terminate", lambda _process: None)
+    monkeypatch.setenv("DEEPTUTOR_TEST_APP_PROVENANCE", str(marker))
+
+    def _run_backend(command, *, cwd, env, name):
+        assert name == "backend"
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert completed.returncode != 0
+        raise RuntimeError("backend provenance captured")
+
+    monkeypatch.setattr(launcher, "_spawn", _run_backend)
+
+    with pytest.raises(RuntimeError, match="backend provenance captured"):
+        launcher.start(runtime_home, open_browser=False)
+
+    assert marker.read_text(encoding="utf-8") == str(
+        (selected / "deeptutor" / "api" / "main.py").resolve()
+    )
 
 
 def test_foreground_signal_handlers_keep_windows_ctrl_c(monkeypatch) -> None:
