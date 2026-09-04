@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import React from "react";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -252,6 +252,81 @@ function setActiveLesson() {
   ];
 }
 
+function setPathProposal() {
+  workspace.state.sessionId = "session-1";
+  workspace.state.messages = [
+    {
+      id: 1,
+      role: "assistant",
+      content: "I drafted a path.",
+      events: [
+        {
+          type: "tool_result",
+          metadata: {
+            proposal: {
+              path_id: "draft-1",
+              name: "Signals",
+              goal: "Understand signals",
+              description: "An editable route.",
+              starting_point: "Basic algebra",
+              teaching_preferences: "Use examples",
+              sources: [],
+              modules: [
+                {
+                  id: "module-1",
+                  name: "Foundations",
+                  order: 0,
+                  pass_threshold: 0.7,
+                  knowledge_points: [
+                    {
+                      id: "objective-1",
+                      name: "Frequency",
+                      type: "concept",
+                      module_id: "module-1",
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+        },
+        {
+          type: "done",
+          metadata: {
+            learning_decision: {
+              scope: "path",
+              route: "chat",
+              goal: "Understand signals",
+              language: "en",
+              thread_id: "thread-1",
+              objective_id: "objective-1",
+              activity: {
+                kind: "explanation",
+                objective: "Plan a route",
+                learner_action: "Review the proposed route.",
+                knowledge_type: "concept",
+                recipe_id: "concept-transfer",
+                recipe_version: 1,
+                recipe_step: 0,
+                help_level: 0,
+                source_refs: [],
+                assessment_method: "rubric",
+                independent_required: false,
+                transfer_required: false,
+                next_action: "Approve the path",
+              },
+              reason: "This broad goal needs an ordered path.",
+              confidence: 0.9,
+              requires_approval: true,
+              source_policy: "open",
+            },
+          },
+        },
+      ],
+    },
+  ];
+}
+
 describe("chat workspace composition", () => {
   it("keeps the route as a small composition boundary", () => {
     const route = [
@@ -467,78 +542,7 @@ describe("learning coordinator workspace", () => {
 
   it("shows a path proposal for path-scope metadata", async () => {
     // Break caught: a broad learning decision stays buried in the transcript instead of requiring draft approval.
-    workspace.state.sessionId = "session-1";
-    workspace.state.messages = [
-      {
-        id: 1,
-        role: "assistant",
-        content: "I drafted a path.",
-        events: [
-          {
-            type: "tool_result",
-            metadata: {
-              proposal: {
-                path_id: "draft-1",
-                name: "Signals",
-                goal: "Understand signals",
-                description: "An editable route.",
-                starting_point: "Basic algebra",
-                teaching_preferences: "Use examples",
-                sources: [],
-                modules: [
-                  {
-                    id: "module-1",
-                    name: "Foundations",
-                    order: 0,
-                    pass_threshold: 0.7,
-                    knowledge_points: [
-                      {
-                        id: "objective-1",
-                        name: "Frequency",
-                        type: "concept",
-                        module_id: "module-1",
-                      },
-                    ],
-                  },
-                ],
-              },
-            },
-          },
-          {
-            type: "done",
-            metadata: {
-              learning_decision: {
-                scope: "path",
-                route: "chat",
-                goal: "Understand signals",
-                language: "en",
-                thread_id: "thread-1",
-                objective_id: "objective-1",
-                activity: {
-                  kind: "explanation",
-                  objective: "Plan a route",
-                  learner_action: "Review the proposed route.",
-                  knowledge_type: "concept",
-                  recipe_id: "concept-transfer",
-                  recipe_version: 1,
-                  recipe_step: 0,
-                  help_level: 0,
-                  source_refs: [],
-                  assessment_method: "rubric",
-                  independent_required: false,
-                  transfer_required: false,
-                  next_action: "Approve the path",
-                },
-                reason: "This broad goal needs an ordered path.",
-                confidence: 0.9,
-                requires_approval: true,
-                source_policy: "open",
-              },
-            },
-          },
-        ],
-      },
-    ];
+    setPathProposal();
     render(<ChatWorkspace />);
 
     expect(
@@ -547,6 +551,42 @@ describe("learning coordinator workspace", () => {
     expect(
       screen.getByRole("textbox", { name: /i want to be able to/i }),
     ).toHaveValue("Understand signals");
+  });
+
+  it("keeps a hydrated opt-out authoritative for a historical path proposal", async () => {
+    // Break caught: a path-scope decision forces coordinator routing after the saved preference hydrates false.
+    let resolveSettings: (response: Response) => void = () => undefined;
+    workspace.settingsResponse = new Promise<Response>((resolve) => {
+      resolveSettings = resolve;
+    });
+    setPathProposal();
+    const user = userEvent.setup();
+    render(<ChatWorkspace />);
+
+    await screen.findByRole("heading", { name: /proposed learning path/i });
+    await act(async () => {
+      resolveSettings({
+        ok: true,
+        json: async () => ({ learning_coordinator_enabled: false }),
+      } as Response);
+    });
+
+    const composer = screen.getAllByRole("textbox").at(-1);
+    expect(composer).toBeDefined();
+    await user.type(composer!, "Ask an ordinary follow-up");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(workspace.adapter.sendMessage).toHaveBeenCalledWith(
+      "Ask an ordinary follow-up",
+      expect.any(Array),
+      expect.any(Object),
+      expect.any(Array),
+      expect.any(Array),
+      expect.objectContaining({ learningCoordinator: false }),
+      expect.any(Array),
+      undefined,
+      expect.any(Array),
+    );
   });
 
   it("renders the active lesson in Activity and sends a hint through the existing transport", async () => {

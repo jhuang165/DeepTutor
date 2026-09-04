@@ -819,7 +819,7 @@ export default function ChatWorkspace() {
     learningCoordinatorEnabled === true && coordinatorContextActive;
   const learningCoordinatorForTurn = !coordinatorContextActive
     ? false
-    : learningDecision
+    : learningDecision?.scope === "lesson"
       ? true
       : (learningCoordinatorEnabled ?? undefined);
   const continueLearning = useCallback(
