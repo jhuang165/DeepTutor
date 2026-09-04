@@ -595,6 +595,59 @@ describe("learning coordinator workspace", () => {
     ).toBeVisible();
   });
 
+  it.each([false, true])("waits for the replacement decision's own draft (unrelated draft: %s)", async unrelatedDraft => {
+    // Break caught: independently scanning decisions and drafts submits old
+    // Signals content to the newly arrived Biology thread's approval endpoint.
+    setPathProposal();
+    const original = workspace.state.messages[0];
+    const originalProposal = original.events[0];
+    const originalDecision = original.events[1];
+    const user = userEvent.setup();
+    const { rerender } = render(<ChatWorkspace />);
+    await user.clear(screen.getByRole("textbox", { name: /i want to be able to/i }));
+    await user.type(screen.getByRole("textbox", { name: /i want to be able to/i }), "My Signals edit");
+
+    const replacement = {
+      id: 2,
+      role: "assistant",
+      content: "Preparing Biology",
+      events: [{ ...originalDecision, metadata: {
+        learning_decision: { ...originalDecision.metadata.learning_decision,
+          thread_id: "thread-B", goal: "Learn Biology" },
+      } }],
+    };
+    const unrelated = unrelatedDraft ? [{
+      id: 3, role: "assistant", content: "Unrelated draft",
+      events: [{ ...originalProposal, metadata: { proposal: {
+        ...originalProposal.metadata.proposal,
+        path_id: "unrelated-draft", name: "History", goal: "Learn History",
+      } } }],
+    }] : [];
+    workspace.state.messages = [original, replacement, ...unrelated];
+    await act(async () => { rerender(<ChatWorkspace />); });
+    expect(screen.queryByRole("button", { name: "Approve path and begin" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: /i want to be able to/i })).not.toBeInTheDocument();
+    expect(workspace.apiCalls.filter(({ url }) => url.includes("/approve-path"))).toEqual([]);
+
+    // The actual proposal arrives on the same assistant turn as its decision.
+    const biologyProposal = { ...originalProposal, metadata: { proposal: {
+      ...originalProposal.metadata.proposal,
+      path_id: "biology-draft", name: "Biology", goal: "Learn Biology",
+    } } };
+    workspace.state.messages = [original, {
+      ...replacement, events: [...replacement.events, biologyProposal],
+    }, ...unrelated];
+    await act(async () => { rerender(<ChatWorkspace />); });
+    expect(screen.getByRole("textbox", { name: /i want to be able to/i })).toHaveValue("Learn Biology");
+    await user.click(screen.getByRole("button", { name: "Approve path and begin" }));
+    const approvals = workspace.apiCalls.filter(({ url }) => url.includes("/approve-path"));
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0].url).toBe("/api/learning/threads/thread-B/approve-path");
+    expect(JSON.parse(String(approvals[0].init?.body))).toEqual(expect.objectContaining({
+      name: "Biology", goal: "Learn Biology",
+    }));
+  });
+
   it("shows a path proposal for path-scope metadata", async () => {
     // Break caught: a broad learning decision stays buried in the transcript instead of requiring draft approval.
     setPathProposal();

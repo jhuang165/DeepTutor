@@ -765,24 +765,23 @@ export default function ChatWorkspace() {
     !state.courseId &&
     !state.masteryPathId &&
     !state.workspaceMode;
-  const learningDecision = useMemo(() => {
+  const learningTurn = useMemo(() => {
     if (!coordinatorContextActive) return null;
     for (let index = state.messages.length - 1; index >= 0; index -= 1) {
-      const decision = selectLearningDecision(state.messages[index]);
+      const message = state.messages[index];
+      const decision = selectLearningDecision(message);
       // Only active preparation persists a thread. Shadow audit decisions
       // deliberately carry no identity and cannot activate UI or opt-in.
-      if (decision?.thread_id) return decision;
+      if (decision?.thread_id) {
+        // Proposal events belong to this assistant turn. Never borrow an
+        // older or unrelated draft while this decision's proposal is pending.
+        return { decision, pathDraft: selectLearningPathProposal(message) };
+      }
     }
     return null;
   }, [coordinatorContextActive, state.messages]);
-  const learningPathDraft = useMemo(() => {
-    if (!coordinatorContextActive) return null;
-    for (let index = state.messages.length - 1; index >= 0; index -= 1) {
-      const draft = selectLearningPathProposal(state.messages[index]);
-      if (draft) return draft;
-    }
-    return null;
-  }, [coordinatorContextActive, state.messages]);
+  const learningDecision = learningTurn?.decision ?? null;
+  const learningPathDraft = learningTurn?.pathDraft ?? null;
   const [learningEvidence, setLearningEvidence] = useState<LearningEvidence[]>(
     [],
   );
