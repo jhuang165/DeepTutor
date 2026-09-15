@@ -219,6 +219,8 @@ interface SessionEntry extends ChatState {
   activeTurnId: string | null;
   lastSeq: number;
   updatedAt: number;
+  /** Monotonic guard against applying snapshots requested before local edits. */
+  revision: number;
   /** Edit-branching: maps a parent_message_id (stringified, or "null" for
    *  the session root) to the chosen child id at that branch point. */
   selectedBranches: Record<string, number>;
@@ -227,6 +229,8 @@ interface SessionEntry extends ChatState {
 interface ProviderState {
   selectedKey: string | null;
   sessions: Record<string, SessionEntry>;
+  /** Recently retired draft keys, kept so queued stream actions still land. */
+  sessionAliases: Record<string, string>;
   sidebarRefreshToken: number;
 }
 
@@ -250,6 +254,10 @@ interface SessionSnapshot {
   personaSelection?: string;
   language?: string;
   selectedBranches?: Record<string, number>;
+  /** Revision observed immediately before the revalidation request began. */
+  requestedRevision?: number;
+  /** Server refresh used to settle an idle local stream with no turn id. */
+  authoritative?: boolean;
 }
 
 type Action =
@@ -351,6 +359,7 @@ function createSessionEntry(
     activeTurnId: null,
     lastSeq: 0,
     updatedAt: Date.now(),
+    revision: 0,
     selectedBranches: {},
   };
 }
@@ -368,7 +377,11 @@ function updateSelectedSession(
 ): ProviderState {
   const current = ensureSelectedSession(state);
   const key = state.selectedKey || current.key;
-  const nextSession = updater(current);
+  const updated = updater(current);
+  const nextSession = {
+    ...updated,
+    revision: current.revision + 1,
+  };
   return {
     ...state,
     selectedKey: key,
@@ -386,6 +399,7 @@ function applySessionConfiguration(
   if (!configuration) return session;
   return {
     ...session,
+    revision: session.revision + 1,
     activeCapability:
       configuration.capability !== undefined
         ? configuration.capability
@@ -445,7 +459,61 @@ function isSameTurnEvent(a: StreamEvent, b: StreamEvent): boolean {
   return Boolean(aTurn && bTurn && aTurn === bTurn);
 }
 
+const MAX_SESSION_ALIASES = 20;
+
+function resolveSessionKey(state: ProviderState, key: string): string {
+  let resolved = key;
+  const visited = new Set<string>();
+  while (state.sessionAliases[resolved] && !visited.has(resolved)) {
+    visited.add(resolved);
+    resolved = state.sessionAliases[resolved];
+  }
+  return resolved;
+}
+
+function addSessionAlias(
+  aliases: Record<string, string>,
+  retiredKey: string,
+  canonicalKey: string,
+): Record<string, string> {
+  if (retiredKey === canonicalKey) return aliases;
+  const next = { ...aliases };
+  for (const [key, target] of Object.entries(next)) {
+    if (target === retiredKey) next[key] = canonicalKey;
+  }
+  delete next[retiredKey];
+  next[retiredKey] = canonicalKey;
+  const keys = Object.keys(next);
+  for (const key of keys.slice(0, Math.max(0, keys.length - MAX_SESSION_ALIASES))) {
+    delete next[key];
+  }
+  return next;
+}
+
+function mutateSession(
+  session: SessionEntry,
+  changes: Partial<SessionEntry>,
+): SessionEntry {
+  return { ...session, ...changes, revision: session.revision + 1 };
+}
+
 function reducer(state: ProviderState, action: Action): ProviderState {
+  if (
+    action.type === "STREAM_EVENT" ||
+    action.type === "STREAM_TOUCH" ||
+    action.type === "STREAM_END" ||
+    action.type === "RECONCILE_TURN" ||
+    action.type === "SET_SESSION_TITLE" ||
+    (action.type === "SET_MASTERY_PATH_ID" && action.key)
+  ) {
+    const actionKey = action.key;
+    if (!actionKey) return state;
+    const resolvedKey = resolveSessionKey(state, actionKey);
+    if (resolvedKey !== actionKey) {
+      return reducer(state, { ...action, key: resolvedKey } as Action);
+    }
+  }
+
   switch (action.type) {
     case "SET_TOOLS":
       return updateSelectedSession(state, (session) => ({
@@ -480,7 +548,9 @@ function reducer(state: ProviderState, action: Action): ProviderState {
         ...state,
         sessions: {
           ...state.sessions,
-          [action.key]: { ...target, masteryPathId: action.masteryPathId },
+          [action.key]: mutateSession(target, {
+            masteryPathId: action.masteryPathId,
+          }),
         },
       };
     }
@@ -532,6 +602,7 @@ function reducer(state: ProviderState, action: Action): ProviderState {
               parentId,
               userId,
             ),
+            revision: session.revision + 1,
             updatedAt: Date.now(),
           },
         },
@@ -549,6 +620,7 @@ function reducer(state: ProviderState, action: Action): ProviderState {
           [action.key]: {
             ...session,
             messages: session.messages.slice(0, -1),
+            revision: session.revision + 1,
             updatedAt: Date.now(),
           },
         },
@@ -578,6 +650,7 @@ function reducer(state: ProviderState, action: Action): ProviderState {
           [action.key]: {
             ...session,
             messages,
+            revision: session.revision + 1,
             updatedAt: Date.now(),
           },
         },
@@ -610,6 +683,7 @@ function reducer(state: ProviderState, action: Action): ProviderState {
                 parentMessageId: tip?.id ?? null,
               },
             ],
+            revision: session.revision + 1,
             updatedAt: Date.now(),
           },
         },
@@ -627,11 +701,8 @@ function reducer(state: ProviderState, action: Action): ProviderState {
       };
     }
     case "STREAM_EVENT": {
-      // If the session entry has been removed (e.g., BIND_SERVER_SESSION
-      // just renamed ``draft_X`` to a real id but a stray event still
-      // targets the old key), drop the event rather than synthesise an
-      // orphan session with no user message — that would scrub the
-      // user's just-sent bubble from view.
+      // Unknown keys are dropped rather than synthesising orphan sessions.
+      // Retired draft keys have already been resolved through sessionAliases.
       if (!state.sessions[action.key]) return state;
       const session = state.sessions[action.key];
       const msgs = [...session.messages];
@@ -686,55 +757,79 @@ function reducer(state: ProviderState, action: Action): ProviderState {
                   : session.currentStage,
             activeTurnId: action.event.turn_id || session.activeTurnId,
             lastSeq: Math.max(session.lastSeq, action.event.seq || 0),
+            revision: session.revision + 1,
             updatedAt: Date.now(),
           },
         },
       };
     }
-    case "STREAM_END":
+    case "STREAM_END": {
+      const session =
+        state.sessions[action.key] ?? createSessionEntry(action.key);
       return {
         ...state,
         sessions: {
           ...state.sessions,
           [action.key]: {
-            ...(state.sessions[action.key] ?? createSessionEntry(action.key)),
+            ...session,
             isStreaming: false,
             currentStage: "",
             status: action.status ?? "completed",
             activeTurnId:
               action.status === "running"
                 ? action.turnId ||
-                  state.sessions[action.key]?.activeTurnId ||
-                  null
+                  session.activeTurnId || null
                 : null,
+            revision: session.revision + 1,
             updatedAt: Date.now(),
           },
         },
         sidebarRefreshToken: state.sidebarRefreshToken + 1,
       };
+    }
     case "BIND_SERVER_SESSION": {
+      const sourceKey = resolveSessionKey(state, action.key);
+      const targetKey = resolveSessionKey(state, action.sessionId);
       const current =
-        state.sessions[action.key] ?? createSessionEntry(action.key);
-      const targetKey = action.sessionId;
+        state.sessions[sourceKey] ??
+        state.sessions[targetKey] ??
+        createSessionEntry(sourceKey);
       const existing = state.sessions[targetKey];
+      if (
+        sourceKey === targetKey &&
+        existing?.sessionId === action.sessionId &&
+        (!existing.isStreaming ||
+          !action.turnId ||
+          existing.activeTurnId === action.turnId)
+      ) {
+        return state;
+      }
       const merged: SessionEntry = {
-        ...(existing ?? current),
         ...current,
         key: targetKey,
         sessionId: action.sessionId,
         sessionTitle: current.sessionTitle || existing?.sessionTitle || "",
         activeTurnId: action.turnId || current.activeTurnId,
         status: current.isStreaming ? "running" : current.status,
+        revision: Math.max(current.revision, existing?.revision ?? 0) + 1,
         updatedAt: Date.now(),
       };
       const nextSessions = { ...state.sessions };
       delete nextSessions[action.key];
+      delete nextSessions[sourceKey];
       nextSessions[targetKey] = merged;
       return {
         ...state,
         selectedKey:
-          state.selectedKey === action.key ? targetKey : state.selectedKey,
+          state.selectedKey === action.key || state.selectedKey === sourceKey
+            ? targetKey
+            : state.selectedKey,
         sessions: nextSessions,
+        sessionAliases: addSessionAlias(
+          state.sessionAliases,
+          action.key,
+          targetKey,
+        ),
         sidebarRefreshToken: state.sidebarRefreshToken + 1,
       };
     }
@@ -752,7 +847,13 @@ function reducer(state: ProviderState, action: Action): ProviderState {
         // whose session went live, but the check belongs here too so no
         // background snapshot can ever clobber a streaming turn.
         const local = state.sessions[action.key];
-        if (!local || local.isStreaming || local.status === "running") {
+        if (
+          !local ||
+          (!action.authoritative &&
+            (local.isStreaming || local.status === "running")) ||
+          action.requestedRevision === undefined ||
+          local.revision !== action.requestedRevision
+        ) {
           return state;
         }
       }
@@ -805,6 +906,7 @@ function reducer(state: ProviderState, action: Action): ProviderState {
             language: action.language ?? existing.language,
             selectedBranches:
               action.selectedBranches ?? existing.selectedBranches,
+            revision: existing.revision + 1,
             updatedAt: Date.now(),
           },
         },
@@ -820,6 +922,7 @@ function reducer(state: ProviderState, action: Action): ProviderState {
           [action.key]: {
             ...session,
             sessionTitle: action.title,
+            revision: session.revision + 1,
             updatedAt: Date.now(),
           },
         },
@@ -852,6 +955,7 @@ function reducer(state: ProviderState, action: Action): ProviderState {
             ...session,
             messages: result.messages,
             selectedBranches: result.selectedBranches,
+            revision: session.revision + 1,
             updatedAt: Date.now(),
           },
         },
@@ -870,6 +974,7 @@ function reducer(state: ProviderState, action: Action): ProviderState {
               ...session.selectedBranches,
               [action.parentKey]: action.childId,
             },
+            revision: session.revision + 1,
             updatedAt: Date.now(),
           },
         },
@@ -885,6 +990,7 @@ function reducer(state: ProviderState, action: Action): ProviderState {
           [action.key]: {
             ...session,
             selectedBranches: { ...action.selectedBranches },
+            revision: session.revision + 1,
             updatedAt: Date.now(),
           },
         },
@@ -920,6 +1026,7 @@ function reducer(state: ProviderState, action: Action): ProviderState {
             messages: nextMessages,
             isStreaming: false,
             status: "idle",
+            revision: session.revision + 1,
             updatedAt: Date.now(),
           },
         },
@@ -962,6 +1069,7 @@ function reducer(state: ProviderState, action: Action): ProviderState {
 const initialState: ProviderState = {
   selectedKey: null,
   sessions: {},
+  sessionAliases: {},
   sidebarRefreshToken: 0,
 };
 
@@ -1051,7 +1159,11 @@ interface ChatContextValue {
    *  dropped rather than applied if a turn started meanwhile. */
   loadSession: (
     sessionId: string,
-    options?: { signal?: AbortSignal; revalidate?: boolean },
+    options?: {
+      signal?: AbortSignal;
+      revalidate?: boolean;
+      authoritative?: boolean;
+    },
   ) => Promise<MessageItem[] | undefined>;
   /** Select an already-loaded session without fetching. Returns false when
    *  it isn't in memory, i.e. the caller must load it. */
@@ -1247,6 +1359,7 @@ export function ChatStateAdapterProvider({
   >(new Map());
   const draftCounterRef = useRef(0);
   const retryTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+  const recoveryRefreshesRef = useRef<Set<string>>(new Set());
   // Tracks in-flight regenerate requests so we can restore the popped
   // assistant message if the server rejects the request (e.g. ``regenerate_busy``
   // or ``nothing_to_regenerate``). Keyed by session entry key.
@@ -1613,8 +1726,15 @@ export function ChatStateAdapterProvider({
   const loadSession = useCallback(
     async (
       sessionId: string,
-      options?: { signal?: AbortSignal; revalidate?: boolean },
+      options?: {
+        signal?: AbortSignal;
+        revalidate?: boolean;
+        authoritative?: boolean;
+      },
     ) => {
+      const requestedRevision = options?.revalidate
+        ? stateRef.current.sessions[sessionId]?.revision
+        : undefined;
       const session = await getSession(sessionId, options?.signal);
       const key = session.session_id || session.id;
       const activeTurn = Array.isArray(session.active_turns)
@@ -1627,7 +1747,14 @@ export function ChatStateAdapterProvider({
         // re-subscribing from ``after_seq: 0`` would replay them on top of
         // what we have, and the snapshot predates the turn anyway.
         const local = stateRef.current.sessions[key];
-        if (!local || local.isStreaming || local.status === "running") return;
+        if (
+          !local ||
+          local.revision !== requestedRevision ||
+          (!options.authoritative &&
+            (local.isStreaming || local.status === "running"))
+        ) {
+          return;
+        }
       }
       const messages = hydrateMessages(session.messages ?? []);
       const loadedWorkspaceMode = normalizeWorkspaceMode(
@@ -1691,6 +1818,8 @@ export function ChatStateAdapterProvider({
         selectedBranches: normalizeSelectedBranches(
           session.preferences?.selected_branches,
         ),
+        requestedRevision,
+        authoritative: options?.authoritative,
       });
       if (loadedStatus === "running" && (activeTurn?.turn_id || activeTurn?.id)) {
         // Reached on a revalidate too, when the turn is live on the server but
@@ -1793,15 +1922,31 @@ export function ChatStateAdapterProvider({
           continue;
         }
 
-        // A local timeout cannot invent a terminal state. Mark the session as
-        // observed so the runtime/session reconciliation path can query the
-        // authoritative turn once the server supplies its id.
-        dispatch({ type: "STREAM_TOUCH", key });
+        // With no turn id there is nothing to resume. A bound session can still
+        // ask the server for its authoritative transcript/status, which recovers
+        // a completion persisted before the stream delivered its session frame.
+        // Unbound drafts must remain intact because no server session exists yet.
+        if (
+          session.sessionId &&
+          !recoveryRefreshesRef.current.has(session.sessionId)
+        ) {
+          recoveryRefreshesRef.current.add(session.sessionId);
+          void loadSession(session.sessionId, {
+            revalidate: true,
+            authoritative: true,
+          })
+            .catch(() => {
+              /* non-fatal — local draft/stream remains usable */
+            })
+            .finally(() => {
+              recoveryRefreshesRef.current.delete(session.sessionId!);
+            });
+        }
       }
     }, CHECK_INTERVAL_MS);
 
     return () => clearInterval(timer);
-  }, [sendThroughRunner]);
+  }, [loadSession, sendThroughRunner]);
 
   const sendMessage = useCallback(
     (
@@ -2430,6 +2575,17 @@ export function ChatStateAdapterProvider({
 
   return <ChatCtx.Provider value={value}>{children}</ChatCtx.Provider>;
 }
+
+/** Narrow reducer surface for race-regression tests. */
+export const chatStateAdapterTestUtils: {
+  createSessionEntry: typeof createSessionEntry;
+  initialState: ProviderState;
+  reducer: typeof reducer;
+} = {
+  createSessionEntry,
+  initialState,
+  reducer,
+};
 
 /** Transitional state adapter for surfaces that have not moved to store selectors yet. */
 export function useChatStateAdapter() {
