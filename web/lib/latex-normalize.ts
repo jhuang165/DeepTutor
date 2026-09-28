@@ -303,7 +303,9 @@ function convertParenDelimiters(text: string): string {
         ? /\\\(([^\n|]*?)\\\)/g
         : /\\\(([^\n]*?)\\\)/g;
       return line.replace(pattern, (match, expr: string) => {
-        const body = expr.trim();
+        // remark-math treats an escaped dollar as the closing `$` delimiter.
+        // Use an equivalent KaTeX command so the expression stays one span.
+        const body = expr.trim().replace(/\\\$/g, "\\char36{}");
         if (!body || body.includes("$")) return match;
         return `$${body}$`;
       });

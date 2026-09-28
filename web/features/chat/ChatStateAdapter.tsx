@@ -87,6 +87,8 @@ import {
 import { watchingTurnFields } from "@/lib/watching-turn-state";
 import {
   decideIdleTurnRecovery,
+  hasLiveLocalTurn,
+  shouldSubscribeLoadedTurn,
   resolveLoadedRunStatus,
 } from "@/lib/chat-idle-recovery";
 import i18n from "i18next";
@@ -104,7 +106,15 @@ import {
 } from "@/lib/reading-references";
 
 type SessionRuntimeStatus =
-  "idle" | "running" | "completed" | "failed" | "cancelled" | "rejected";
+  | "idle"
+  | "running"
+  // Parked on an ask_user card. The server reports it for a session whose
+  // turn is waiting on the learner; the turn is live, not finished.
+  | "waiting_input"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "rejected";
 
 interface OutgoingAttachment {
   type: string;
@@ -1235,8 +1245,7 @@ function reducer(state: ProviderState, action: Action): ProviderState {
         const local = state.sessions[action.key];
         if (
           !local ||
-          (!action.authoritative &&
-            (local.isStreaming || local.status === "running")) ||
+          (!action.authoritative && hasLiveLocalTurn(local)) ||
           action.requestedRevision === undefined ||
           local.revision !== action.requestedRevision
         ) {
@@ -2551,8 +2560,7 @@ export function ChatStateAdapterProvider({
         if (
           !local ||
           local.revision !== requestedRevision ||
-          (!options.authoritative &&
-            (local.isStreaming || local.status === "running"))
+          (!options.authoritative && hasLiveLocalTurn(local))
         ) {
           return;
         }
@@ -2669,12 +2677,19 @@ export function ChatStateAdapterProvider({
         requestedRevision,
         authoritative: options?.authoritative,
       });
-      if (loadedStatus === "running" && (activeTurn?.turn_id || activeTurn?.id)) {
+      if (
+        activeTurn &&
+        shouldSubscribeLoadedTurn(
+          loadedStatus,
+          Boolean(activeTurn.turn_id || activeTurn.id),
+        )
+      ) {
         // Reached on a revalidate too, when the turn is live on the server but
         // not in this tab (started in another tab, or our socket dropped) —
         // that is exactly the case that still needs a subscribe. A turn we
         // just judged stale is not one of them: subscribing would open a
-        // socket for a turn that will never speak again.
+        // socket for a turn that will never speak again. A turn paused on an
+        // ask_user card is live: its question exists only in the turn log.
         sendThroughRunner(key, {
           type: "subscribe_turn",
           turn_id: activeTurn.turn_id || activeTurn.id,

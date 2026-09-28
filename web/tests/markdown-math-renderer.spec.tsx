@@ -72,6 +72,20 @@ describe("math Markdown rendering", () => {
     expect(container).toHaveTextContent("门票 $5 和 $10，共 $15。");
   });
 
+  it("renders escaped currency dollars inside backslash-delimited math", async () => {
+    const content = String.raw`For example, each observed market opportunity may need to satisfy \(0 < \text{bid} \leq \text{ask} < 1\), while a spread constraint such as \(\text{ask}-\text{bid}\leq \$0.10\) determines whether the opportunity is economically comparable.`;
+    const { container } = render(
+      <MarkdownRenderer content={content} variant="prose" />,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelectorAll(".katex")).toHaveLength(2);
+    });
+    expect(container.querySelector(".katex-error")).toBeNull();
+    expect(container).toHaveTextContent("$0.10");
+    expect(container).not.toHaveTextContent("0.10$");
+  });
+
   it("renders generated quiz stems and option formulas with KaTeX", async () => {
     const block: Block = {
       id: "math-quiz",

@@ -121,6 +121,7 @@ export class TurnRuntimeClient {
   private pageVisible = true;
   private turnId: string | null = null;
   private lastSeq = 0;
+  private deliveredForTurn = false;
   private buffered = new Map<number, StreamEvent>();
   private pending: PendingCommand[] = [];
   private connectionState: RuntimeConnectionState = "idle";
@@ -176,6 +177,7 @@ export class TurnRuntimeClient {
       this.clearReplayProbe();
       this.turnId = nextTurnId;
       this.lastSeq = afterSeq;
+      this.deliveredForTurn = false;
       this.buffered.clear();
       this.terminalObserved = false;
       return;
@@ -184,6 +186,12 @@ export class TurnRuntimeClient {
     // transport cursor from that stale snapshot or already-consumed events
     // (including DONE) can be replayed into a new UI state.
     if (afterSeq <= this.lastSeq) return;
+    // Nor jump it forward once this transport has delivered events for the
+    // turn: React learns sequence numbers *from* this transport, so a larger
+    // value can only be stale bookkeeping (typically the previous turn's
+    // high-water mark). Accepting it would make every event up to that seq
+    // look like a duplicate and silently drop the rest of the turn.
+    if (this.deliveredForTurn) return;
     this.lastSeq = afterSeq;
     for (const seq of this.buffered.keys()) {
       if (seq <= afterSeq) this.buffered.delete(seq);
@@ -332,6 +340,7 @@ export class TurnRuntimeClient {
       this.clearReplayProbe();
       this.turnId = eventTurnId;
       this.lastSeq = 0;
+      this.deliveredForTurn = false;
       this.buffered.clear();
       this.terminalObserved = false;
     }
@@ -368,6 +377,7 @@ export class TurnRuntimeClient {
 
   private emitInOrder(event: StreamEvent): void {
     this.lastSeq = event.seq ?? this.lastSeq;
+    this.deliveredForTurn = true;
     this.pending = this.pending.filter(
       (item) => item.requiresAck || this.lastSeq <= item.acknowledgedAfter,
     );

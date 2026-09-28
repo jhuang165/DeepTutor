@@ -486,3 +486,24 @@ test("acknowledged commands get a generated command_id when crypto.randomUUID is
     if (cryptoObject) cryptoObject.randomUUID = original;
   }
 });
+
+test("a stale forward React cursor cannot skip a live turn's events", () => {
+  const { client, events, sockets } = harness();
+  client.setResumeCursor("turn-1", 0);
+  client.connect();
+  sockets[0].open();
+  sockets[0].message(stream(1));
+  sockets[0].message(stream(2));
+
+  // React state still carries the previous turn's high-water mark (the
+  // session-level counter used to grow across turns). It must not be
+  // allowed to leapfrog what this transport has actually delivered.
+  client.setResumeCursor("turn-1", 66);
+  assert.deepEqual(client.cursor, { turnId: "turn-1", afterSeq: 2 });
+
+  sockets[0].message(stream(3));
+  assert.deepEqual(
+    events.map((event) => event.seq),
+    [1, 2, 3],
+  );
+});

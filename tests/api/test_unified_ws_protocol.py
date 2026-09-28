@@ -197,3 +197,84 @@ async def test_ws_send_failure_closes_socket_so_client_can_replay(
 
     assert socket.sent_types == ["content", "done"]
     assert socket.close_calls == 1
+
+
+class _PausedTurns(_Turns):
+    """A turn parked on an ask_user card; the socket never subscribed to it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.replies: list[tuple[str, str | None, list | None, str]] = []
+        self.subscriptions: list[tuple[str, int]] = []
+
+    async def submit_user_reply(
+        self,
+        turn_id: str,
+        *,
+        text: str | None = None,
+        answers: list | None = None,
+        command_id: str,
+    ) -> bool:
+        self.replies.append((turn_id, text, answers, command_id))
+        return True
+
+    async def subscribe_turn(self, turn_id: str, *, after_seq: int = 0):
+        self.subscriptions.append((turn_id, after_seq))
+        yield {
+            "type": "progress",
+            "turn_id": turn_id,
+            "session_id": "session-1",
+            "seq": 9,
+            "timestamp": 1.0,
+            "content": "",
+            "metadata": {"ask_user_resolved": True},
+        }
+        yield {
+            "type": "done",
+            "turn_id": turn_id,
+            "session_id": "session-1",
+            "seq": 10,
+            "timestamp": 2.0,
+            "content": "",
+            "metadata": {"status": "completed"},
+        }
+
+
+def test_ws_reply_from_unsubscribed_socket_streams_the_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A page opened while the turn was already paused answers the card over a
+    # socket that never subscribed to the turn. The reply resumes the turn on
+    # the server; without a subscription the browser would never see the
+    # grading and the next question until it reloaded.
+    turns = _PausedTurns()
+
+    async def allow(_ws):
+        return None
+
+    monkeypatch.setattr(auth, "ws_require_auth", allow)
+    app = FastAPI()
+    app.state.application_container = SimpleNamespace(turns=turns)
+    app.include_router(unified_ws.router)
+    client = TestClient(app)
+
+    with client.websocket_connect("/ws") as socket:
+        socket.send_json(
+            {
+                "type": "submit_user_reply",
+                "turn_id": "turn-1",
+                "answers": [{"questionId": "q1", "text": "A"}],
+                "command_id": "reply-1",
+                "protocol_version": "2.0",
+            }
+        )
+        ack = socket.receive_json()
+        assert ack["type"] == "command_ack"
+        assert ack["accepted"] is True
+        assert socket.receive_json()["type"] == "progress"
+        assert socket.receive_json()["type"] == "done"
+
+    assert turns.subscriptions == [("turn-1", 0)]
+    assert [(turn_id, command_id) for turn_id, _t, _a, command_id in turns.replies] == [
+        ("turn-1", "reply-1")
+    ]
