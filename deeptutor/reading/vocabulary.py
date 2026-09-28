@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from deeptutor.reading._grounding import grounding_context as _grounding_context
+from deeptutor.reading._grounding import grounded_prompt as _prompt
 from deeptutor.reading.extensions import (
     ReadingAction,
     ReadingContext,
@@ -16,7 +15,8 @@ from deeptutor.reading.extensions import (
     ReadingExtensionResult,
 )
 from deeptutor.services.llm import complete
-from deeptutor.utils.json_parser import parse_json_response
+from deeptutor.services.llm.structured_retry import json_with_reasoning_retry
+from deeptutor.services.prompt.language import is_chinese as _is_zh
 
 _SYSTEM_EN = """You explain vocabulary from one verified reading selection.
 
@@ -70,26 +70,8 @@ def _term_comes_from_selection(term: str, selection: str) -> bool:
     return normalized_term in normalized_selection
 
 
-def _is_zh(locale: str) -> bool:
-    return locale.lower().startswith("zh")
-
-
-def _prompt(context: ReadingContext) -> str:
-    return json.dumps(
-        {
-            "selection": context.selection,
-            "surrounding_context": _grounding_context(
-                context.visible_text,
-                context.selection,
-            ),
-        },
-        ensure_ascii=False,
-    )
-
-
-def _vocabulary(raw: str, selection: str) -> _Vocabulary:
-    data: Any = parse_json_response(raw, fallback=None)
-    if not isinstance(data, dict):
+def _vocabulary(data: Any, selection: str) -> _Vocabulary:
+    if not isinstance(data, dict) or not data:
         raise ValueError("Vocabulary model returned invalid JSON.")
     try:
         vocabulary = _Vocabulary.model_validate({"terms": data.get("terms")})
@@ -120,18 +102,22 @@ class VocabularyExtension:
         if not context.selection.strip():
             raise ValueError("Vocabulary help requires selected text.")
 
-        from deeptutor.services.model_selection.tasks import task_llm_scope
+        from deeptutor.services.model_selection.tasks import TaskKind, task_llm_scope
 
-        with task_llm_scope():
-            raw = await complete(
+        async def _run(reasoning_effort: str | None) -> str:
+            return await complete(
                 prompt=_prompt(context),
                 system_prompt=_SYSTEM_ZH if _is_zh(context.locale) else _SYSTEM_EN,
                 temperature=0.2,
-                max_tokens=800,
+                max_tokens=2_000,
                 max_retries=0,
                 response_format={"type": "json_object"},
+                reasoning_effort=reasoning_effort,
             )
-        vocabulary = _vocabulary(raw, context.selection)
+
+        with task_llm_scope(TaskKind.READING_VOCABULARY):
+            data = await json_with_reasoning_retry(_run, expected_key="terms")
+        vocabulary = _vocabulary(data, context.selection)
         return ReadingExtensionResult(
             type="card",
             title="词汇帮助" if _is_zh(context.locale) else "Vocabulary help",

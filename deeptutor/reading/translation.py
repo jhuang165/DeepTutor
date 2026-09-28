@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from deeptutor.reading._grounding import grounding_context as _grounding_context
+from deeptutor.reading._grounding import grounded_prompt as _prompt
 from deeptutor.reading.extensions import (
     ReadingAction,
     ReadingContext,
@@ -66,19 +65,6 @@ def _target_language(action: str) -> Literal["en", "zh"]:
         raise ValueError(f"Unsupported translation action: {action}") from exc
 
 
-def _prompt(context: ReadingContext) -> str:
-    return json.dumps(
-        {
-            "selection": context.selection,
-            "surrounding_context": _grounding_context(
-                context.visible_text,
-                context.selection,
-            ),
-        },
-        ensure_ascii=False,
-    )
-
-
 def _translation(raw: str, target_language: str) -> _Translation:
     data: Any = parse_json_response(raw, fallback=None)
     if not isinstance(data, dict):
@@ -119,9 +105,9 @@ class TranslationExtension:
         if not context.selection.strip():
             raise ValueError("Translation requires selected text.")
 
-        from deeptutor.services.model_selection.tasks import task_llm_scope
+        from deeptutor.services.model_selection.tasks import TaskKind, task_llm_scope
 
-        with task_llm_scope():
+        with task_llm_scope(TaskKind.READING_TRANSLATION):
             raw = await complete(
                 prompt=_prompt(context),
                 system_prompt=_SYSTEM_ZH if target_language == "zh" else _SYSTEM_EN,

@@ -32,6 +32,7 @@ import re
 import time
 from typing import Any
 
+from deeptutor.services.prompt.language import is_chinese as _is_zh
 from deeptutor.services.singleflight_cache import AsyncSingleFlightTTLCache
 
 logger = logging.getLogger(__name__)
@@ -158,10 +159,6 @@ _SYSTEM_ZH = """你要预测用户接下来最可能在聊天框里打出的**�
 差："这是更随意一点的版本：……"    <- 这是助手的口吻，不是用户的"""
 
 
-def _is_zh(language: str) -> bool:
-    return str(language or "en").lower().startswith("zh")
-
-
 def _render(material: _Material, zh: bool) -> str:
     speaker = {"user": "用户" if zh else "User", "assistant": "助手" if zh else "Assistant"}
     body = "\n".join(f"[{speaker.get(role, role)}] {text}" for role, text in material.transcript)
@@ -242,12 +239,12 @@ def _response_language() -> str:
 
 async def _call_llm(material: _Material, language: str) -> str:
     from deeptutor.services.llm import complete
-    from deeptutor.services.model_selection.tasks import task_llm_scope
+    from deeptutor.services.model_selection.tasks import TaskKind, task_llm_scope
 
     zh = _is_zh(language)
     # Same call class as titles and starter lines — short, frequent, and
     # nobody asked for it — so it runs on the task model when one is set.
-    with task_llm_scope():
+    with task_llm_scope(TaskKind.CHAT_ASK_HINT):
         return await asyncio.wait_for(
             complete(
                 prompt=_render(material, zh),

@@ -14,9 +14,9 @@ from typing import Any
 
 import pytest
 
-from deeptutor.agents.chat.agent_loop import MAX_SETTLEMENT_ROUNDS
 from deeptutor.agents.chat.agentic_pipeline import AgenticChatPipeline
-from deeptutor.agents.chat.context_budget import (
+from deeptutor.agents.loop.agent_loop import MAX_SETTLEMENT_ROUNDS
+from deeptutor.agents.loop.context_budget import (
     LLMRequestSnapshot,
     build_context_budget,
     count_conversation_tokens,
@@ -227,11 +227,11 @@ def test_messages_count_tool_calls_and_multimodal_text() -> None:
 
 
 def test_window_estimated_when_not_configured() -> None:
-    info = resolve_window_info(context_window=None, model="gpt-4o")
+    info = resolve_window_info(context_window=None, model="unknown")
 
     assert info.estimated is True
     assert info.window > 0
-    assert _budget(context_window=None, model="gpt-4o")["window_estimated"] is True
+    assert _budget(context_window=None, model="unknown")["window_estimated"] is True
 
 
 def test_window_not_estimated_when_configured() -> None:
@@ -262,7 +262,7 @@ def test_configured_window_is_not_clamped_to_the_planner_ceiling() -> None:
 def test_unparseable_window_falls_back_and_says_so() -> None:
     # ``resolve_effective_context_window`` treats junk as absent; the flag must
     # follow the same branch rather than trusting the raw config value.
-    info = resolve_window_info(context_window="not-a-number", model="gpt-4o")
+    info = resolve_window_info(context_window="not-a-number", model="unknown")
 
     assert info.estimated is True
 
@@ -312,6 +312,15 @@ def test_malformed_material_degrades_to_no_budget() -> None:
 
 
 class _Registry:
+    def deferred_tools(self) -> list[Any]:
+        """No provider tools, so the turn keeps using this registry directly.
+
+        ``build_tool_view`` short-circuits to the base registry when there is
+        nothing external to scope; without this the view would raise and the
+        turn would fall back to a scoped wrapper reading through ``get``.
+        """
+        return []
+
     def build_prompt_text(self, *_args: Any, **_kwargs: Any) -> str:
         return "- rag: retrieve from a knowledge base"
 
@@ -395,7 +404,7 @@ async def _stream(chunks: list[SimpleNamespace]):
 @pytest.mark.asyncio
 async def test_turn_result_carries_the_context_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "deeptutor.agents.chat.agentic_pipeline.get_llm_config",
+        "deeptutor.agents.loop.pipeline.get_llm_config",
         lambda: SimpleNamespace(
             binding="openai",
             model="gpt-test",
@@ -467,7 +476,7 @@ async def test_forced_finish_still_reports_the_tools_the_turn_carried(
     # available, so the model must keep requesting them to reach the hard
     # finish.
     monkeypatch.setattr(
-        "deeptutor.agents.chat.agentic_pipeline.get_llm_config",
+        "deeptutor.agents.loop.pipeline.get_llm_config",
         lambda: SimpleNamespace(
             binding="openai",
             model="gpt-test",
@@ -526,3 +535,9 @@ async def test_forced_finish_still_reports_the_tools_the_turn_carried(
     result = [e for e in events if e.type == StreamEventType.RESULT][-1]
     budget = result.metadata["metadata"]["context_budget"]
     assert _tokens(budget)["system_tools"] > 0
+
+
+def test_known_context_window_readout_is_not_clamped():
+    info = resolve_window_info(model="gemini-2.5-pro")
+    assert info.window == 1048576
+    assert info.estimated is False

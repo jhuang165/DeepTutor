@@ -16,6 +16,7 @@ import type { StreamEvent } from "@/features/chat/model/protocol";
 import {
   ActivityDetailGrid,
   ActivityDivider,
+  ActivityFold,
   ActivityHeader,
   ActivityRow,
   ActivityStack,
@@ -41,8 +42,9 @@ import {
   getTraceRole,
   groupTraceEvents,
   hasRenderableCallTrace as selectHasRenderableCallTrace,
+  hasSettledFinalRound,
   isChatLoopAnswerContent,
-  isNarrationRound,
+  isRetractedRound,
   isTracePending,
   selectTraceDisplayItems,
 } from "./selectors";
@@ -175,14 +177,11 @@ function describeToolCall(
   switch (toolName) {
     case "exec":
       return {
-        verb: t("Running command"),
-        chip: clip(str(a.command), 48) || null,
-        mono: true,
-      };
-    case "code_execution":
-      return {
-        verb: t("Running code"),
-        chip: str(a.language) || t("Code"),
+        verb: a.language === "shell" ? t("Running command") : t("Running code"),
+        chip:
+          a.language === "shell"
+            ? clip(str(a.code), 48) || null
+            : str(a.language) || t("Python"),
         mono: true,
       };
     case "rag":
@@ -449,17 +448,15 @@ function getTraceHeader(
 }
 
 // Chat-loop `content` (call_kind "agent_loop_round") is the model's
-// user-facing text. Whether it belongs in the trace depends on the round:
-//   - a NARRATION round (the round ended with a tool call) → its text was
-//     the model's commentary before acting. It is stripped from the answer
-//     bubble, so it MUST surface in the trace.
-//   - a FINISH round (the round ended with no tool call) → its text IS the
-//     answer bubble; keep it out of the trace to avoid duplication.
-// The differentiator is the round's own ``call_status`` marker (call_role).
+// user-facing text, and it stays in the answer bubble — commentary written
+// before a tool call included. So it is kept OUT of the trace by default, to
+// avoid showing the same sentence twice. The one exception is a round a
+// capability retracted: that text is no longer in the bubble, so the trace is
+// the only place left for it.
 function getTraceText(
   events: StreamEvent[],
   eventTypes: Array<StreamEvent["type"]>,
-  // When the caller knows this group is a narration round, its
+  // When the caller knows this group's text was retracted, its
   // ``agent_loop_round`` content is trace material and should NOT be
   // filtered out as answer-bubble text.
   includeChatLoopContent = false,
@@ -784,7 +781,7 @@ function TraceRowBody({
   );
   const thoughtText = getTraceText(callEvents, ["thinking"]);
   const observationText = getTraceText(callEvents, ["observation"]);
-  // A chat round can emit BOTH reasoning (thinking) and narration commentary
+  // A chat round can emit BOTH reasoning (thinking) and retracted commentary
   // (content) in a single call; both are trace material and render as
   // separate stacked blocks. Other pipelines keep the legacy "thought or
   // content" fallback so their rows are unchanged.
@@ -792,7 +789,7 @@ function TraceRowBody({
   const contentText = getTraceText(
     callEvents,
     ["content"],
-    isNarrationRound(callEvents),
+    isRetractedRound(callEvents),
   );
   const bodyBlocks =
     role === "observe"
@@ -957,7 +954,7 @@ function hasExpandableContent(
   const contentText = getTraceText(
     callEvents,
     ["content"],
-    isNarrationRound(callEvents),
+    isRetractedRound(callEvents),
   );
   const genericBodyText =
     role === "observe"
@@ -1024,7 +1021,7 @@ function TraceRowItem({
   const isToolRow = kind === "tool_planning" || group === "tool_call";
   const isChatRound = kind === "agent_loop_round";
   const isRetrieve = role === "retrieve";
-  const narration = isNarrationRound(callEvents);
+  const retracted = isRetractedRound(callEvents);
   // The model's own text-form deliberation — chat-loop reasoning/narration and
   // pipeline "Thought"/"Plan" rounds. Unlike a tool call (whose result is
   // secondary detail worth folding away), here the text IS the substance, so
@@ -1042,7 +1039,12 @@ function TraceRowItem({
   // briefing runs long enough to walk the trace up the viewport while the
   // page is pinned to the bottom.
   const isContextExploration = kind === "context_exploration";
-  const autoOpen = isThinking && !isContextExploration ? active : false;
+  const answering =
+    isChatRound &&
+    !retracted &&
+    callEvents.some(isChatLoopAnswerContent);
+  const autoOpen =
+    isThinking && !isContextExploration && !answering ? active : false;
   const open = expandable && (userOpen ?? autoOpen);
   // Every row with detail is clickable now, deliberation included — it has to
   // be, since a settled round folds itself and the text has to be reachable.
@@ -1061,7 +1063,7 @@ function TraceRowItem({
     | undefined;
 
   const thoughtText = getTraceText(callEvents, ["thinking"]).trim();
-  const contentText = getTraceText(callEvents, ["content"], narration).trim();
+  const contentText = getTraceText(callEvents, ["content"], retracted).trim();
 
   // Resolve every row into a uniform { icon, headline, chip } triple so the
   // activity feed reads consistently across pipelines. Tool calls get a human
@@ -1101,9 +1103,10 @@ function TraceRowItem({
         callEvents.map((e) => getTraceMeta(e).subagent_name).find(Boolean) ||
           "",
       );
-      headline = agentName
-        ? `${t("Consult Subagent")} ${agentName}`
-        : t("Consult Subagent");
+      const kind = callEvents.map((event) => getTraceMeta(event).subagent_kind).find(Boolean);
+      const action = kind === "partner_group" ? t("Organize partner discussion")
+        : kind === "partner" ? t("Ask partner") : t("Ask subagent");
+      headline = agentName ? `${action} ${agentName}` : action;
     }
   } else if (isRetrieve) {
     headline = engine ? `${providerLabel(engine)} ${header}` : header;
@@ -1152,7 +1155,11 @@ function TraceRowItem({
       title={headline}
       detail={
         chip?.text ??
-        (isThinking && deliberation.length
+        // The preview is what stands in for the text while the row is folded.
+        // An open row already shows that text in full below, so repeating its
+        // opening on the title line prints the same sentence twice — which is
+        // what a short deliberation looks like the whole time it streams.
+        (isThinking && deliberation.length && !open
           ? plainPreview(deliberation[0])
           : undefined)
       }
@@ -1343,9 +1350,9 @@ function detectStreamingMode(
     // question with the structured qa_pair in metadata — that's the signal
     // the quizzing phase is active.
     if (callKind === "agent_loop_round") {
-      // The chat loop streams user-facing text as `content` (a short
-      // narration before a tool call, or the finish answer): show
-      // "responding" while text is flowing; thinking keeps "exploring".
+      // The chat loop streams user-facing text as `content` (commentary
+      // before a tool call, or the closing answer): show "responding" while
+      // text is flowing; thinking keeps "exploring".
       return event.type === "content" ? "responding" : "exploring";
     }
     if (callKind === "quiz_question_emitted") return "quizzing";
@@ -1486,6 +1493,29 @@ function getExploreContextStatusLabel(
   return null;
 }
 
+function getReasoningProgressStatusLabel(
+  events: StreamEvent[],
+  t: (key: string, opts?: Record<string, unknown>) => string,
+  isStreaming: boolean,
+) {
+  if (!isStreaming) return null;
+  for (let idx = events.length - 1; idx >= 0; idx -= 1) {
+    const event = events[idx];
+    const meta = getTraceMeta(event);
+    if (meta.trace_kind === "reasoning_progress") {
+      return t("Still reasoning before acting…");
+    }
+    if (
+      meta.trace_kind === "call_status" &&
+      (meta.call_state === "running" || meta.call_state === "complete")
+    ) {
+      return null;
+    }
+    if (event.type === "content" || event.type === "tool_call") return null;
+  }
+  return null;
+}
+
 export function StreamingStatus({
   events,
   isStreaming,
@@ -1494,12 +1524,16 @@ export function StreamingStatus({
   expandable = false,
   expanded = false,
   onToggle,
+  summary,
   agentName,
   showMark = true,
+  traceBounds,
 }: {
   events: StreamEvent[];
   isStreaming?: boolean;
   content?: string;
+  /** The turn's real span, when ``events`` is only a preview of it. */
+  traceBounds?: { started_at?: number | null; ended_at?: number | null } | null;
   // Extra layout classes from the call site (e.g. ``mt-3`` when the row
   // sits at the bottom of the assistant output).
   className?: string;
@@ -1509,6 +1543,8 @@ export function StreamingStatus({
   expandable?: boolean;
   expanded?: boolean;
   onToggle?: () => void;
+  // What the folded stack holds, shown while it is closed.
+  summary?: ReactNode;
   // Who is doing the thinking — partner chat passes the partner's name so
   // the status reads "Ada Exploring…" instead of the product name.
   agentName?: string;
@@ -1529,10 +1565,15 @@ export function StreamingStatus({
     return () => window.clearInterval(timer);
   }, [isStreaming]);
 
-  // Only render once we either have a streaming turn OR a completed turn that
-  // produced visible content — empty placeholders (e.g. system message
-  // shells) shouldn't show a status row.
-  if (!isStreaming && !hasFinalContent) return null;
+  // Only render once we either have a streaming turn, a completed turn that
+  // produced visible content, or a completed turn whose trace is still worth
+  // disclosing — empty placeholders (e.g. system message shells) shouldn't
+  // show a status row. A turn that ran tools and then ended without a
+  // user-facing answer belongs in that third case: dropping the row there
+  // also drops the only affordance for opening the trace, so the whole
+  // activity block renders as an invisible collapsed shell and the turn looks
+  // like it never happened.
+  if (!isStreaming && !hasFinalContent && !expandable) return null;
   const mode = detectStreamingMode(
     events,
     hasFinalContent,
@@ -1558,6 +1599,7 @@ export function StreamingStatus({
   const label =
     getExploreContextStatusLabel(events, t, Boolean(isStreaming)) ??
     getDeepResearchStatusLabel(events, t, Boolean(isStreaming)) ??
+    getReasoningProgressStatusLabel(events, t, Boolean(isStreaming)) ??
     modeLabel;
 
   // Single turn-level clock. Ticks every second while the turn is in
@@ -1568,6 +1610,7 @@ export function StreamingStatus({
     events,
     nowSeconds,
     Boolean(isStreaming),
+    traceBounds,
   );
   const durationLabel =
     turnSeconds != null ? formatTurnDuration(turnSeconds) : null;
@@ -1585,6 +1628,7 @@ export function StreamingStatus({
       expandable={expandable}
       expanded={expanded}
       onToggle={onToggle}
+      summary={summary}
       showOrb={showMark}
       className={className}
     />
@@ -1670,45 +1714,19 @@ function isChatLoopTurn(events: StreamEvent[]): boolean {
   return false;
 }
 
-/**
- * Whether the most recently *completed* round settled the turn: either a
- * genuinely tool-less ``finish`` round, or a round the backend explicitly
- * marked ``answer_visible`` — mastery's teaching-plus-status-check rounds, a
- * DSML-fallback round, a token-truncated-but-visible round (see
- * ``agent_loop.py``'s completion metadata) all combine tool calls with
- * learner-facing text in the same round, so ``call_role`` never reaches
- * ``"finish"`` for them even though the round is exactly what the trace
- * should collapse for.
- *
- * Looks at only the LATEST completed round, not "has one ever appeared" —
- * a token-truncated round is explicitly non-terminal (the loop keeps
- * writing), so once ITS OWN next round completes, that round's marker
- * supersedes this one and correctly reopens the trace if fresh tool calls
- * are still coming.
- */
-function lastRoundSettledFinal(events: StreamEvent[]): boolean {
-  for (let idx = events.length - 1; idx >= 0; idx -= 1) {
-    const meta = getTraceMeta(events[idx]);
-    if (meta.trace_kind === "call_status" && meta.call_state === "complete") {
-      return meta.call_role === "finish" || meta.answer_visible === true;
-    }
-  }
-  return false;
-}
-
 function isFinalAnswerPhase(
   events: StreamEvent[],
   isStreaming: boolean,
   hasFinalContent: boolean,
 ): boolean {
   if (!isStreaming) return true;
-  if (lastRoundSettledFinal(events)) return true;
+  if (hasSettledFinalRound(events)) return true;
   const mode = detectStreamingMode(events, hasFinalContent, true);
   if (mode === "responding" || mode === "responded") {
-    // Chat's single loop streams narration text mid-loop, which also reads
-    // as "responding" — there only a settled round marker (above) settles
-    // the phase; trusting the mode would flap the trace shut on every
-    // narration line and open again on the next tool call.
+    // Chat's single loop streams commentary mid-loop, which also reads as
+    // "responding" — there only a settled round marker (above) settles the
+    // phase; trusting the mode would flap the trace shut on every line of
+    // commentary and open again on the next tool call.
     return !isChatLoopTurn(events);
   }
   return false;
@@ -1724,6 +1742,23 @@ function isFinalAnswerPhase(
  * The header doubles as a disclosure toggle, so the user can re-open a
  * collapsed trace (or fold an expanded one) at any time.
  */
+/**
+ * Shown while a persisted trace is being fetched.
+ *
+ * The header can now open before its rows exist, so without this the panel
+ * would expand onto nothing and read as broken rather than as loading.
+ */
+function TraceLoadingRow() {
+  const { t } = useTranslation();
+  return (
+    <div className="flex items-center gap-2 py-1 pl-1 text-xs text-[var(--muted-foreground)]">
+      <span className="size-1.5 animate-pulse rounded-full bg-[var(--muted-foreground)]" />
+      {t("Loading the full trace…")}
+    </div>
+  );
+}
+
+
 export function AssistantActivity({
   events,
   traceEvents,
@@ -1733,6 +1768,11 @@ export function AssistantActivity({
   agentName,
   showMark = true,
   headerClassName = "",
+  onTraceToggle,
+  traceBounds,
+  hasStoredTrace = false,
+  processContent,
+  processSummary,
 }: {
   events: StreamEvent[];
   /**
@@ -1754,6 +1794,35 @@ export function AssistantActivity({
   /** Extra classes on the status header row (e.g. a min-height so the row
    *  vertically centers against an adjacent avatar). */
   headerClassName?: string;
+  /** Notified when a persisted trace is opened or collapsed. */
+  onTraceToggle?: (open: boolean) => void;
+  /** The turn's real span, when ``events`` is only a preview of it. */
+  traceBounds?: { started_at?: number | null; ended_at?: number | null } | null;
+  /**
+   * Whether the server still holds trace rows this preview dropped.
+   *
+   * A finished turn keeps only a compact preview in memory, and that preview
+   * discards ``thinking`` — which for a round that called no tools is the
+   * entire trace. The header then had nothing renderable, so it rendered as
+   * *not expandable*, so the click that would have fetched the full trace
+   * could never happen: no rows, therefore no way to ever get rows. This flag
+   * breaks that circle by letting the header open on the promise of rows.
+   */
+  hasStoredTrace?: boolean;
+  /**
+   * The turn's working-out, already laid out by the caller: what it said it
+   * was about to do, the steps it took, what each one turned up. Given this,
+   * the header folds THAT away rather than a bare stack of trace rows — the
+   * whole process becomes one line once the answer lands, and one click
+   * brings it back.
+   *
+   * The chat surface passes it because its process is prose interleaved with
+   * rows. Surfaces with nothing but rows pass nothing and keep the old
+   * behaviour.
+   */
+  processContent?: ReactNode;
+  /** One line naming what ``processContent`` holds, for the folded header. */
+  processSummary?: ReactNode;
 }) {
   const shownTraceEvents = traceEvents ?? events;
   const hasTrace = useMemo(
@@ -1768,11 +1837,18 @@ export function AssistantActivity({
   // null = follow the phase automatically (open while working, collapsed
   // once answered). A click pins the user's choice for this message.
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
-  const open = hasTrace && (userOpen ?? !finalPhase);
+  // Openable either because rows are already here, or because the server has
+  // rows to hand over once asked. Auto-open still follows the phase only when
+  // there is something to show right now: a settled turn stays collapsed until
+  // the reader asks for it.
+  const hasProcess = processContent != null;
+  const expandable = hasProcess || hasTrace || hasStoredTrace;
+  const open =
+    expandable && (userOpen ?? ((hasProcess || hasTrace) && !finalPhase));
 
-  // Match StreamingStatus's own null-guard: nothing to show for an empty,
-  // non-streaming shell with no trace either.
-  if (!isStreaming && !hasFinalContent && !hasTrace) return null;
+  // Match StreamingStatus's own null-guard — it takes ``expandable`` into
+  // account for exactly this case, so both surfaces appear or neither does.
+  if (!isStreaming && !hasFinalContent && !expandable) return null;
 
   return (
     <div className={className}>
@@ -1780,32 +1856,39 @@ export function AssistantActivity({
         events={events}
         isStreaming={isStreaming}
         content={content}
-        expandable={hasTrace}
+        expandable={expandable}
         expanded={open}
-        onToggle={() => setUserOpen(!open)}
+        onToggle={() => {
+          const next = !open;
+          setUserOpen(next);
+          onTraceToggle?.(next);
+        }}
+        summary={processSummary}
         agentName={agentName}
         showMark={showMark}
         className={headerClassName}
+        traceBounds={traceBounds}
       />
-      {hasTrace ? (
-        <div
-          className={`grid transition-[grid-template-rows,opacity] duration-300 ease-out ${
-            open ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0"
-          }`}
-        >
-          <div className="overflow-hidden">
-            {/* The trace hangs from a faint guide line aligned under the
-                header's activity mark, so it reads as "nested below" the
-                status (the elbow/tree language used elsewhere). pt-2 = gap
-                below the header when open; [&>div]:mb-0 strips
-                CallTracePanel's own bottom margin so the single gap to the
-                body comes from this block's outer ``mb-3`` in both states. */}
+      {expandable ? (
+        <ActivityFold open={open}>
+          {/* The process hangs from a faint guide line on the header's own
+              left edge — where the activity mark sits — with its content
+              indented past it, so the working-out reads as nested inside the
+              turn while the answer below stays at the top level. pt-2 = gap
+              below the header when open; [&>div]:mb-0 strips CallTracePanel's
+              own bottom margin so the single gap to the body comes from this
+              block's outer ``mb-3`` in both states. */}
+          {hasProcess ? (
+            <div className="pt-2">{processContent}</div>
+          ) : hasTrace ? (
             <NestedTraceFlow
               events={shownTraceEvents}
               isStreaming={isStreaming}
             />
-          </div>
-        </div>
+          ) : (
+            <TraceLoadingRow />
+          )}
+        </ActivityFold>
       ) : null}
     </div>
   );

@@ -1,9 +1,48 @@
-import { apiFetch, apiUrl } from "@/lib/api";
+import { apiFetch, apiUrl as baseApiUrl } from "@/lib/api";
 import { invalidateClientCache, withClientCache } from "@/lib/client-cache";
 import { DOCUMENT_UPLOAD_MAX_BYTES } from "@/lib/document-upload-policy";
 import type { ImaKnowledgeBaseOption } from "@/lib/ima-connection";
 
+function inKnowledgeLibrary(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    /^\/knowledge-bases(?:\/|$)/.test(window.location.pathname)
+  );
+}
+
+function apiUrl(path: string): string {
+  const url = baseApiUrl(path);
+  return inKnowledgeLibrary() &&
+    path.startsWith("/api/knowledge-bases") &&
+    !path.includes("resource_library=")
+    ? `${url}${url.includes("?") ? "&" : "?"}resource_library=true`
+    : url;
+}
+
 const KNOWLEDGE_CACHE_PREFIX = "knowledge:";
+
+export type EmbeddingModelSelection = { profile_id: string; model_id: string };
+export type EmbeddingUsage = EmbeddingModelSelection & {
+  name: string;
+  workspace_name: string;
+};
+
+export async function getEmbeddingUsage(): Promise<EmbeddingUsage[]> {
+  const res = await apiFetch(apiUrl("/api/knowledge-bases/embedding-usage"), {
+    cache: "no-store",
+  });
+  if (!res.ok)
+    throw new Error(
+      await readErrorDetail(res, "Failed to load embedding model usage"),
+    );
+  return (await res.json()).knowledge_bases;
+}
+
+export interface IndexingLLMSelection {
+  profile_id: string;
+  model_id: string;
+  reasoning_effort?: string;
+}
 
 export interface KnowledgeBaseSummary {
   id?: string;
@@ -85,7 +124,29 @@ export interface GraphRagConfig {
   dynamic_community_selection: boolean;
 }
 
+export interface LightRagRoleModel {
+  mode: "inherit" | "model" | "disabled";
+  selection?: IndexingLLMSelection | null;
+  reasoning_effort?: string | null;
+  max_async: number;
+  timeout: number;
+}
+
+export interface LightRagRoleModels {
+  base: IndexingLLMSelection;
+  extract: LightRagRoleModel;
+  keyword: LightRagRoleModel;
+  query: LightRagRoleModel;
+  vlm: LightRagRoleModel;
+}
+
+export interface LightRagIndexingSelection {
+  extract: IndexingLLMSelection;
+  vlm: { mode: "disabled" | "enabled"; selection?: IndexingLLMSelection };
+}
+
 export interface LightRagConfig {
+  role_models?: LightRagRoleModels;
   version: number;
   top_k: number;
   response_type: string;
@@ -95,7 +156,9 @@ export interface LightRagConfig {
   llm_model_max_async: number;
   /** Extra extraction passes per chunk, to recover missed entities. */
   entity_extract_max_gleaning: number;
-  /** Stable catalog reference, or empty strings for the global active chat model. */
+  /** Per-call timeout for LightRAG's LLM requests, in seconds. */
+  llm_timeout: number;
+  /** Query model and default indexing selection; empty uses the active chat model. */
   llm_profile_id: string;
   llm_model_id: string;
 }
@@ -221,13 +284,23 @@ function normalizeUploadPolicy(data: unknown): KnowledgeUploadPolicy {
   };
 }
 
-export async function listKnowledgeBases(options?: { force?: boolean }) {
+export async function listKnowledgeBases(options?: {
+  force?: boolean;
+  library?: boolean;
+}) {
   return withClientCache<KnowledgeBaseSummary[]>(
-    `${KNOWLEDGE_CACHE_PREFIX}list`,
+    `${KNOWLEDGE_CACHE_PREFIX}list:${options?.library || inKnowledgeLibrary() ? "library" : "workspace"}`,
     async () => {
-      const response = await apiFetch(apiUrl("/api/knowledge-bases"), {
-        cache: "no-store",
-      });
+      const response = await apiFetch(
+        apiUrl(
+          options?.library
+            ? "/api/knowledge-bases?resource_library=true"
+            : "/api/knowledge-bases",
+        ),
+        {
+          cache: "no-store",
+        },
+      );
       if (!response.ok) {
         throw new Error(
           await readErrorDetail(response, "Failed to list knowledge bases"),
@@ -472,6 +545,22 @@ export const updateGraphRagConfig = (
   payload: Partial<Omit<GraphRagConfig, "version">>,
 ) => updateEngineConfig<GraphRagConfig>("graphrag", payload);
 
+export async function getLightRagModelOptions(): Promise<
+  import("@/lib/llm-options").LLMOptionsResponse
+> {
+  const res = await apiFetch(
+    apiUrl("/api/knowledge-bases/rag-pipelines/lightrag/model-options"),
+    {
+      cache: "no-store",
+    },
+  );
+  if (!res.ok)
+    throw new Error(
+      await readErrorDetail(res, "Failed to load LightRAG models"),
+    );
+  return res.json();
+}
+
 export const getLightRagConfig = (options?: { force?: boolean }) =>
   getEngineConfig<LightRagConfig>("lightrag", "lightrag-config", options);
 export const updateLightRagConfig = (
@@ -635,7 +724,7 @@ export function knowledgeBaseFilePath(
   return `/api/knowledge-bases/${encodeURIComponent(kbName)}/files/${filename
     .split("/")
     .map(encodeURIComponent)
-    .join("/")}`;
+    .join("/")}${inKnowledgeLibrary() ? "?resource_library=true" : ""}`;
 }
 
 /** Build the `/api/...` path for extracted plain-text preview of a raw KB file. */
@@ -646,10 +735,11 @@ export function knowledgeBaseFilePreviewTextPath(
   return `/api/knowledge-bases/${encodeURIComponent(kbName)}/file-preview-text/${filename
     .split("/")
     .map(encodeURIComponent)
-    .join("/")}`;
+    .join("/")}${inKnowledgeLibrary() ? "?resource_library=true" : ""}`;
 }
 
 export interface KnowledgeTaskResponse {
+  id?: string;
   task_id?: string;
   message?: string;
   noop?: boolean;
@@ -682,16 +772,22 @@ export async function createKnowledgeBase(payload: {
   name: string;
   provider: string;
   files: File[];
+  storageWorkspaceId?: string;
   pageindexMode?: "flash" | "standard";
   searchMode?: string;
+  embeddingModel?: EmbeddingModelSelection;
 }): Promise<KnowledgeTaskResponse> {
   const form = new FormData();
   form.append("name", payload.name);
   form.append("rag_provider", payload.provider);
+  if (payload.storageWorkspaceId !== undefined)
+    form.append("storage_workspace_id", payload.storageWorkspaceId);
   if (payload.pageindexMode) {
     form.append("pageindex_mode", payload.pageindexMode);
   }
   if (payload.searchMode) form.append("search_mode", payload.searchMode);
+  if (payload.embeddingModel)
+    form.append("embedding_model", JSON.stringify(payload.embeddingModel));
   appendFilesWithPaths(form, payload.files);
 
   const res = await apiFetch(apiUrl("/api/knowledge-bases"), {
@@ -705,6 +801,82 @@ export async function createKnowledgeBase(payload: {
   }
   invalidateKnowledgeCaches();
   return (await res.json()) as KnowledgeTaskResponse;
+}
+
+export interface KiwixArticle {
+  title: string;
+  article_path: string;
+  excerpt: string;
+}
+
+export interface KiwixArchive {
+  zim_name: string;
+  title: string;
+}
+
+export async function listKiwixArchives(serverUrl: string, query = ""): Promise<KiwixArchive[]> {
+  const path = `/api/knowledge-bases/kiwix-catalog?server_url=${encodeURIComponent(serverUrl)}&q=${encodeURIComponent(query)}`;
+  const res = await apiFetch(apiUrl(path), { cache: "no-store" });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Could not browse Kiwix archives"));
+  const body = (await res.json()) as { archives: KiwixArchive[] };
+  return body.archives;
+}
+
+export async function probeKiwix(payload: {
+  serverUrl: string;
+  zimName: string;
+}): Promise<{ ok: boolean; title: string; zim_name: string }> {
+  const res = await apiFetch(apiUrl("/api/knowledge-bases/probe-kiwix"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ server_url: payload.serverUrl, zim_name: payload.zimName }),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Could not reach Kiwix archive"));
+  return (await res.json()) as { ok: boolean; title: string; zim_name: string };
+}
+
+export async function connectKiwix(payload: {
+  name: string;
+  serverUrl: string;
+  zimName: string;
+}): Promise<void> {
+  const res = await apiFetch(apiUrl("/api/knowledge-bases/connect-kiwix"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: payload.name,
+      server_url: payload.serverUrl,
+      zim_name: payload.zimName,
+    }),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Could not connect Kiwix archive"));
+  invalidateKnowledgeCaches();
+}
+
+export async function searchKiwixArticles(kbRef: string, query: string): Promise<KiwixArticle[]> {
+  const path = `/api/knowledge-bases/kiwix-articles?kb_ref=${encodeURIComponent(kbRef)}&q=${encodeURIComponent(query)}`;
+  const res = await apiFetch(apiUrl(path), { cache: "no-store" });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Kiwix search failed"));
+  const body = (await res.json()) as { articles: KiwixArticle[] };
+  return body.articles;
+}
+
+export async function importKiwixArticle(payload: {
+  kbRef: string;
+  articlePath: string;
+  title: string;
+}): Promise<{ workspace: { workspace_id: string } }> {
+  const res = await apiFetch(baseApiUrl("/api/reading/library/import-zim-article"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      kb_ref: payload.kbRef,
+      article_path: payload.articlePath,
+      title: payload.title,
+    }),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Could not open Kiwix article"));
+  return (await res.json()) as { workspace: { workspace_id: string } };
 }
 
 export async function connectObsidianVault(payload: {
@@ -778,6 +950,24 @@ export interface LinkedFolderProbe {
   error: string | null;
 }
 
+export interface LinkedFolderInfo {
+  id: string;
+  path: string;
+  added_at: string;
+  file_count: number;
+  last_sync: string | null;
+}
+
+export interface SyncFolderResponse {
+  message: string;
+  folder_path?: string | null;
+  files: string[];
+  new_files: number;
+  modified_files: number;
+  file_count: number;
+  task_id: string | null;
+}
+
 export async function probeLinkedFolder(payload: {
   folderPath: string;
   provider: string;
@@ -827,6 +1017,85 @@ export async function connectLinkedFolder(payload: {
     rag_provider: string;
     warnings: string[];
   };
+}
+
+// ── Linked document folders ──────────────────────────────────────────
+
+export async function listLinkedFolders(
+  kbName: string,
+  options?: { signal?: AbortSignal },
+): Promise<LinkedFolderInfo[]> {
+  const res = await apiFetch(
+    apiUrl(`/api/knowledge-bases/${encodeURIComponent(kbName)}/linked-folders`),
+    { signal: options?.signal },
+  );
+  if (!res.ok) {
+    throw new Error(
+      await readErrorDetail(
+        res,
+        `Failed to list linked folders (${res.status})`,
+      ),
+    );
+  }
+  return (await res.json()) as LinkedFolderInfo[];
+}
+
+export async function linkFolder(
+  kbName: string,
+  folderPath: string,
+): Promise<LinkedFolderInfo> {
+  const res = await apiFetch(
+    apiUrl(`/api/knowledge-bases/${encodeURIComponent(kbName)}/link-folder`),
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ folder_path: folderPath }),
+    },
+  );
+  if (!res.ok) {
+    throw new Error(
+      await readErrorDetail(res, `Failed to link folder (${res.status})`),
+    );
+  }
+  invalidateKnowledgeCaches();
+  return (await res.json()) as LinkedFolderInfo;
+}
+
+export async function unlinkFolder(
+  kbName: string,
+  folderId: string,
+): Promise<void> {
+  const res = await apiFetch(
+    apiUrl(
+      `/api/knowledge-bases/${encodeURIComponent(kbName)}/linked-folders/${encodeURIComponent(folderId)}`,
+    ),
+    { method: "DELETE" },
+  );
+  if (!res.ok) {
+    throw new Error(
+      await readErrorDetail(res, `Failed to unlink folder (${res.status})`),
+    );
+  }
+  invalidateKnowledgeCaches();
+}
+
+export async function syncLinkedFolder(
+  kbName: string,
+  folderId: string,
+): Promise<SyncFolderResponse> {
+  const res = await apiFetch(
+    apiUrl(
+      `/api/knowledge-bases/${encodeURIComponent(kbName)}/sync-folder/${encodeURIComponent(folderId)}`,
+    ),
+    { method: "POST" },
+  );
+  if (!res.ok) {
+    throw new Error(
+      await readErrorDetail(res, `Failed to sync linked folder (${res.status})`),
+    );
+  }
+  invalidateKnowledgeCaches();
+  return (await res.json()) as SyncFolderResponse;
 }
 
 export interface LightRagServerProbe {
@@ -1172,14 +1441,49 @@ export async function setDefaultKnowledgeBase(name: string): Promise<void> {
   invalidateKnowledgeCaches();
 }
 
+export interface LightRagRebuildConfig {
+  fingerprint: string;
+  indexing_policy: import("@/lib/knowledge-helpers").LightRagIndexingPolicy;
+  embedding: { model: string; dimension: number };
+  embedding_selection?: EmbeddingModelSelection | null;
+}
+
+export async function getReindexConfig(
+  name: string,
+  embeddingModel?: EmbeddingModelSelection,
+): Promise<LightRagRebuildConfig> {
+  const query = embeddingModel
+    ? `?${new URLSearchParams({ embedding_model: JSON.stringify(embeddingModel) })}`
+    : "";
+  const res = await apiFetch(
+    apiUrl(
+      `/api/knowledge-bases/${encodeURIComponent(name)}/reindex-config${query}`,
+    ),
+    { cache: "no-store" },
+  );
+  if (!res.ok)
+    throw new Error(
+      await readErrorDetail(res, "Failed to load rebuild configuration"),
+    );
+  return (await res.json()) as LightRagRebuildConfig;
+}
+
 export async function reindexKnowledgeBase(
   name: string,
+  configFingerprint?: string,
+  embeddingModel?: EmbeddingModelSelection,
 ): Promise<KnowledgeTaskResponse> {
+  const request: RequestInit = { method: "POST" };
+  if (configFingerprint || embeddingModel) {
+    const form = new FormData();
+    if (configFingerprint) form.append("config_fingerprint", configFingerprint);
+    if (embeddingModel)
+      form.append("embedding_model", JSON.stringify(embeddingModel));
+    request.body = form;
+  }
   const res = await apiFetch(
     apiUrl(`/api/knowledge-bases/${encodeURIComponent(name)}/reindex`),
-    {
-      method: "POST",
-    },
+    request,
   );
   if (!res.ok) {
     const detail = await readErrorDetail(
@@ -1213,13 +1517,21 @@ export async function retryKnowledgeBase(
   return (await res.json()) as KnowledgeTaskResponse;
 }
 
+/**
+ * Deletes by name in the body, not in the path.
+ *
+ * A name registered before the `register_*` methods validated one can contain
+ * a `/`. uvicorn decodes `%2F` back to a separator before routing, so the
+ * path route cannot match such a name and answers 404 — leaving a KB that is
+ * listed but not removable from the UI. A body has no such limit, so this is
+ * the one delete that reaches every registered entry.
+ */
 export async function deleteKnowledgeBase(name: string): Promise<void> {
-  const res = await apiFetch(
-    apiUrl(`/api/knowledge-bases/${encodeURIComponent(name)}`),
-    {
-      method: "DELETE",
-    },
-  );
+  const res = await apiFetch(apiUrl(`/api/knowledge-bases/delete`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
   if (!res.ok) {
     throw new Error(
       await readErrorDetail(res, `Delete failed (${res.status})`),
@@ -1351,6 +1663,8 @@ export interface WebSource {
   max_depth: number;
   max_pages: number;
   enabled: boolean;
+  auto_sync_enabled: boolean;
+  sync_interval_hours: number;
   page_count: number;
   last_synced_at: string;
   last_sync_status: string;
@@ -1380,6 +1694,23 @@ export interface WebSyncResult {
   ok: boolean;
   message: string;
   results: WebSyncSourceResult[];
+}
+
+export interface WebSourceSyncJob {
+  owner_id: string;
+  kb_name: string;
+  source_id: string;
+  state: string;
+  next_run_at: number;
+  last_run_at?: number | null;
+  attempt: number;
+  error?: string | null;
+  cancel_requested: boolean;
+}
+
+export interface WebSourceSchedulePayload {
+  auto_sync_enabled: boolean;
+  sync_interval_hours: number;
 }
 
 export async function listWebSources(
@@ -1439,6 +1770,82 @@ export async function removeWebSource(
     );
   }
   invalidateKnowledgeCaches();
+}
+
+export async function listWebSourceSyncJobs(
+  kbName: string,
+  options?: { signal?: AbortSignal },
+): Promise<WebSourceSyncJob[]> {
+  const res = await apiFetch(
+    apiUrl(
+      `/api/knowledge-bases/${encodeURIComponent(kbName)}/web-source-sync`,
+    ),
+    { signal: options?.signal },
+  );
+  if (!res.ok) {
+    throw new Error(
+      await readErrorDetail(res, `Failed to list sync jobs (${res.status})`),
+    );
+  }
+  return (await res.json()) as WebSourceSyncJob[];
+}
+
+export async function updateWebSourceSchedule(
+  kbName: string,
+  sourceId: string,
+  payload: WebSourceSchedulePayload,
+): Promise<WebSource> {
+  const res = await apiFetch(
+    apiUrl(
+      `/api/knowledge-bases/${encodeURIComponent(kbName)}/web-source/${encodeURIComponent(sourceId)}/schedule`,
+    ),
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+  if (!res.ok) {
+    throw new Error(
+      await readErrorDetail(res, `Failed to update sync schedule (${res.status})`),
+    );
+  }
+  invalidateKnowledgeCaches();
+  return (await res.json()) as WebSource;
+}
+
+export async function cancelWebSourceSync(
+  kbName: string,
+  sourceId: string,
+): Promise<void> {
+  const res = await apiFetch(
+    apiUrl(
+      `/api/knowledge-bases/${encodeURIComponent(kbName)}/web-source/${encodeURIComponent(sourceId)}/cancel`,
+    ),
+    { method: "POST" },
+  );
+  if (!res.ok) {
+    throw new Error(
+      await readErrorDetail(res, `Failed to cancel sync (${res.status})`),
+    );
+  }
+}
+
+export async function retryWebSourceSync(
+  kbName: string,
+  sourceId: string,
+): Promise<void> {
+  const res = await apiFetch(
+    apiUrl(
+      `/api/knowledge-bases/${encodeURIComponent(kbName)}/web-source/${encodeURIComponent(sourceId)}/retry`,
+    ),
+    { method: "POST" },
+  );
+  if (!res.ok) {
+    throw new Error(
+      await readErrorDetail(res, `Failed to retry sync (${res.status})`),
+    );
+  }
 }
 
 export async function syncWebSources(kbName: string): Promise<WebSyncResult> {

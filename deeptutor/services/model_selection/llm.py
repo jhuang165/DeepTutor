@@ -120,14 +120,21 @@ def list_llm_options(catalog: dict[str, Any]) -> dict[str, Any]:
             if not model_id or not model_value:
                 continue
 
+            from deeptutor.services.config.provider_links import resolve_profile_provider
+
+            effective = resolve_profile_provider(catalog, "llm", profile, model)
+            model_provider = str(effective.get("binding") or provider)
+            model_spec = find_by_name(model_provider)
             option: dict[str, Any] = {
                 "profile_id": profile_id,
                 "model_id": model_id,
-                "profile_name": profile_name,
+                "profile_name": str(effective.get("name") or profile_name),
                 "model_name": str(model.get("name") or model_value).strip(),
                 "model": model_value,
-                "provider": provider,
-                "provider_label": provider_label,
+                "provider": model_provider,
+                "provider_label": model_spec.label
+                if model_spec
+                else model_provider or provider_label,
                 "is_active_default": (
                     profile_id == active_profile_id and model_id == active_model_id
                 ),
@@ -137,6 +144,18 @@ def list_llm_options(catalog: dict[str, Any]) -> dict[str, Any]:
                 context_window = _coerce_int(model.get("context_window_tokens"))
             if context_window is not None:
                 option["context_window"] = context_window
+            reasoning_effort = str(model.get("reasoning_effort") or "").strip().lower()
+            if reasoning_effort:
+                option["reasoning_effort"] = reasoning_effort
+            supported_levels = model.get("codex_supported_reasoning_levels")
+            if isinstance(supported_levels, list):
+                option["supported_reasoning_efforts"] = [
+                    str(level).strip().lower() for level in supported_levels if str(level).strip()
+                ]
+            declared = model.get("capabilities") or {}
+            for capability in ("reasoning", "vision"):
+                if type(declared.get(capability)) is bool:
+                    option[f"declared_{capability}"] = declared[capability]
             options.append(option)
 
     return {

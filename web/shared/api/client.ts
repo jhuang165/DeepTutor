@@ -1,5 +1,6 @@
 import { ApiError, type AppError, type AppErrorScope } from "./errors";
 import { browserReturnPath, loginHref } from "../auth/return-url";
+import { scopedUrl } from "@/lib/workspace-scope";
 
 export interface RequestOptions extends RequestInit {
   scope?: AppErrorScope;
@@ -9,11 +10,11 @@ export interface RequestOptions extends RequestInit {
 let runtimeAuthEnabled = false;
 
 export function apiUrl(path: string): string {
-  return path;
+  return scopedUrl(path);
 }
 
 export function wsUrl(path: string): string {
-  return path;
+  return scopedUrl(path);
 }
 
 export function parseAuthEnabled(raw: string | undefined): boolean {
@@ -29,7 +30,10 @@ export async function apiFetch(
   init?: RequestInit & { skipAuthRedirect?: boolean },
 ): Promise<Response> {
   const { skipAuthRedirect, ...fetchInit } = init ?? {};
-  const response = await fetch(input, { credentials: "include", ...fetchInit });
+  const scopedInput = typeof input === "string" ? scopedUrl(input)
+    : input instanceof URL ? new URL(scopedUrl(input.toString()))
+    : new Request(scopedUrl(input.url), input);
+  const response = await fetch(scopedInput, { credentials: "include", ...fetchInit });
 
   if (
     response.status === 401 &&
@@ -78,18 +82,24 @@ function normalizedHttpError(
     value.detail && typeof value.detail === "object"
       ? (value.detail as Record<string, unknown>)
       : {};
+  let retryable: boolean;
+  if (typeof value.retryable === "boolean") {
+    retryable = value.retryable;
+  } else if (typeof detail.retryable === "boolean") {
+    retryable = detail.retryable;
+  } else {
+    retryable =
+      response.status === 408 ||
+      response.status === 429 ||
+      response.status >= 500;
+  }
   return {
     code:
       (typeof value.error_code === "string" && value.error_code) ||
       (typeof detail.error_code === "string" && detail.error_code) ||
       `http_${response.status}`,
     message: messageFromBody(body, response.statusText || "Request failed"),
-    retryable:
-      (typeof value.retryable === "boolean" && value.retryable) ||
-      (typeof detail.retryable === "boolean" && detail.retryable) ||
-      response.status === 408 ||
-      response.status === 429 ||
-      response.status >= 500,
+    retryable,
     scope,
     correlationId:
       (typeof value.correlation_id === "string" && value.correlation_id) ||
@@ -190,4 +200,25 @@ export async function requestBlob(
       { cause: error },
     );
   }
+}
+
+/**
+ * Parse a response, throwing FastAPI's ``detail`` as the message on failure.
+ *
+ * The status line alone ("500 Internal Server Error") tells a reader nothing;
+ * the backend's own detail is what names the actual problem. Callers wanting
+ * structured refusals (an error code, a log tail) parse the body themselves.
+ */
+export async function asJsonOrThrow(response: Response): Promise<any> {
+  if (!response.ok) {
+    let detail = `${response.status} ${response.statusText}`;
+    try {
+      const body = await response.json();
+      if (body?.detail) detail = String(body.detail);
+    } catch {
+      /* the body was not JSON; the status line is all we have */
+    }
+    throw new Error(detail);
+  }
+  return response.json();
 }

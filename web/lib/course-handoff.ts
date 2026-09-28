@@ -1,4 +1,8 @@
+import { scopedUrl } from "@/lib/workspace-scope";
+
+import { masterySessionsRoute, readingCollectionRoute, MASTERY_HOME, READING_HOME } from "@/lib/learning-routes";
 import type { StreamEvent } from "@/features/chat/model/protocol";
+import { toolResultPayload } from "@/lib/tool-event";
 
 /**
  * Reading the `course_study` capability's hand-off signals off a turn's stream.
@@ -119,13 +123,7 @@ export function courseHandoffFrom(event: {
   const metadata = event.metadata;
   if (!metadata || typeof metadata !== "object") return null;
 
-  const outer = metadata as Record<string, unknown>;
-  const nested = outer.tool_metadata;
-  const source = (
-    nested && typeof nested === "object" ? nested : outer
-  ) as Record<string, unknown>;
-
-  const raw = source.course_handoff;
+  const raw = toolResultPayload(metadata, "course_handoff");
   if (!raw || typeof raw !== "object") return null;
   const payload = raw as Record<string, unknown>;
   if (!isTarget(payload.target)) return null;
@@ -173,23 +171,22 @@ export function extractCourseHandoffs(
  */
 export function courseHandoffHref(payload: CourseHandoffPayload): string {
   const course = encodeURIComponent(payload.course_id);
-  const ref = encodeURIComponent(payload.ref_id);
   switch (payload.target) {
     case "immersive_reading":
       // Every branch stays course-scoped: an existing workspace still opens a
       // conversation that belongs to this course, rather than only the empty
       // index honouring the context that sent the learner here.
       return payload.ref_id
-        ? `/reading/${ref}?course=${course}`
-        : `/reading?course=${course}`;
+        ? scopedUrl(`${readingCollectionRoute(payload.ref_id, "")}?course=${course}`)
+        : scopedUrl(`${READING_HOME}?course=${course}`);
     case "mastery_path":
       // The study route, not the path overview: the overview has no composer,
       // so a prepared opening line would have nowhere to land.
       return payload.ref_id
-        ? `/mastery/${ref}/sessions?course=${course}`
-        : `/mastery?course=${course}`;
+        ? masterySessionsRoute(payload.ref_id, new URLSearchParams({ course: payload.course_id }))
+        : `${MASTERY_HOME}?course=${course}`;
     case "question_bank":
-      return `/space/questions?course=${course}`;
+      return `/learning/practice?course=${course}`;
     case "notebook":
       return `/notebooks?course=${course}`;
     case "chat":

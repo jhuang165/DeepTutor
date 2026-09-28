@@ -14,7 +14,9 @@ from deeptutor.runtime.capability_routing import route_explicit_quiz_request
 from deeptutor.services.session.workspace_preferences import (
     WORKSPACE_MODE_MASTERY,
     WORKSPACE_MODE_READING,
+    WORKSPACE_MODE_WATCHING,
 )
+from deeptutor.services.workspace.activity import workspace_writer
 
 from .._turn_runtime_shared import (
     _apply_course_defaults,
@@ -40,6 +42,43 @@ if TYPE_CHECKING:
     from deeptutor.services.session.protocol import SessionStoreProtocol
 
 
+# Request snapshots use the browser's display keys. Only these saved turn
+# inputs are restored by Resend; runtime bookkeeping and message identity are
+# always assembled from the persisted message and current session instead.
+_REPLAY_SNAPSHOT_FIELDS: dict[str, str] = {
+    "capability": "capability",
+    "tools": "enabledTools",
+    "knowledge_bases": "knowledgeBases",
+    "language": "language",
+    "config": "config",
+    "notebook_references": "notebookReferences",
+    "history_references": "historyReferences",
+    "partner_group_references": "partnerGroupReferences",
+    "question_notebook_references": "questionNotebookReferences",
+    "book_references": "bookReferences",
+    "reading_references": "readingReferences",
+    "memory_references": "memoryReferences",
+    "skills": "skills",
+    "mcp": "mcp",
+    "persona": "persona",
+    "llm_selection": "llmSelection",
+    "workspace_mode": "workspaceMode",
+    "workspace_id": "workspaceId",
+    "course_id": "courseId",
+    "mastery_path_id": "masteryPathId",
+    "mastery_session_mode": "masterySessionMode",
+    "mastery_answer": "masteryAnswer",
+    "mastery_skip": "masterySkip",
+    "reading_material_id": "readingMaterialId",
+    "reading_material_revision": "readingMaterialRevision",
+    "reading_workspace_id": "readingWorkspaceId",
+    "timed_media_id": "timedMediaId",
+    "consult_partner_id": "consultPartnerId",
+    "partner_discussion_group_id": "partnerDiscussionGroupId",
+    "auto_route": "autoRoute",
+}
+
+
 class TurnRequestPreparer:
     if TYPE_CHECKING:
         store: SessionStoreProtocol
@@ -61,6 +100,16 @@ class TurnRequestPreparer:
             remembered_path_id: str,
         ) -> None: ...
 
+        async def _commit_mastery_card_answer(
+            self,
+            *,
+            path_id: str,
+            session_id: str,
+            turn_id: str,
+            question_id: str,
+            answer: str,
+        ) -> None: ...
+
         async def _acquire_mastery_path_lease(
             self,
             *,
@@ -80,8 +129,19 @@ class TurnRequestPreparer:
 
         async def _coordinate_execution(self, execution: _TurnExecution) -> None: ...
 
-    async def start_turn(self, payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    @workspace_writer
+    async def start_turn(
+        self,
+        payload: dict[str, Any],
+        *,
+        replace_assistant_message_id: int | str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         await self._ensure_accepting_turns()
+        from deeptutor.services.workspace.context import get_workspace_scope
+
+        active_scope = get_workspace_scope()
+        if active_scope is not None and active_scope.archived:
+            raise RuntimeError("Restore this workspace before starting a conversation.")
         # ``TurnRuntimeManager`` remains a one-version compatibility facade;
         # transport adapters normally strip their envelope before reaching it.
         payload = TurnRequest.model_validate(
@@ -95,6 +155,8 @@ class TurnRequestPreparer:
 
             payload = {**payload, "language": get_response_language(default="en")}
         raw_config = dict(payload.get("config", {}) or {})
+        resource_reuse = raw_config.pop("_resource_reuse", None)
+        persistent_kbs = raw_config.pop("_persistent_knowledge_bases", None)
         per_turn_auto_route = payload.get("auto_route")
         if per_turn_auto_route is None:
             from deeptutor.services.config.runtime_settings import load_system_settings
@@ -104,8 +166,67 @@ class TurnRequestPreparer:
             )
         else:
             routing_enabled = _coerce_bool(per_turn_auto_route, False)
+        if (
+            payload.get("session_id")
+            and await self.store.get_session(payload["session_id"]) is None
+        ):
+            raise RuntimeError("Conversation not found in this workspace.")
         session = await self.store.ensure_session(payload.get("session_id"))
         preferences = session.get("preferences") or {}
+
+        # A conversation-level choice wins over the account default that the
+        # browser sends on every turn. Only the selector's explicit field may
+        # change or clear this durable override (#1511).
+        if "reply_language_override" in payload:
+            reply_language_override = payload["reply_language_override"]
+        else:
+            reply_language_override = preferences.get("reply_language_override")
+        if reply_language_override:
+            payload["language"] = reply_language_override
+        payload["_reply_language_fixed"] = bool(reply_language_override)
+
+        # Freeze the content binding at admission, before scheduling the turn.
+        # Existing conversations are moved through the organization endpoint;
+        # a stale tab must never move one by sending its cached preference.
+        from deeptutor.multi_user.context import get_current_user
+        from deeptutor.services.partners.scope import is_partner_user_id
+        from deeptutor.services.workspace import get_content_workspace_service
+        from deeptutor.services.workspace.context import get_workspace_scope
+
+        scope = get_workspace_scope()
+        if scope is not None:
+            requested = str(payload.get("workspace_id") or "")
+            if "workspace_id" in payload and requested != scope.workspace_id:
+                raise RuntimeError("The request workspace does not match its connection.")
+            stored = str(preferences.get("workspace_id") or "")
+            if "workspace_id" in preferences and stored != scope.workspace_id:
+                raise RuntimeError("The conversation belongs to another workspace.")
+            payload["workspace_id"] = scope.workspace_id
+
+        content_workspace_id = str(preferences.get("workspace_id") or "").strip()
+        if "workspace_id" in payload:
+            requested_workspace_id = str(payload.get("workspace_id") or "").strip()
+            if "workspace_id" in preferences and requested_workspace_id != content_workspace_id:
+                raise RuntimeError("The conversation workspace changed. Reload the conversation.")
+            content_workspace_id = requested_workspace_id
+        content_workspace_enabled = (
+            "workspace_id" in preferences
+            or "workspace_id" in payload
+            or (not is_partner_user_id(get_current_user().id))
+        )
+        if content_workspace_enabled:
+            workspace_service = get_content_workspace_service()
+            if content_workspace_id == workspace_service.general_binding().workspace_id:
+                content_workspace_id = ""
+            binding = (
+                workspace_service.validate_chat_binding(
+                    content_workspace_id,
+                    existing=content_workspace_id == preferences.get("workspace_id"),
+                )
+                if content_workspace_id
+                else workspace_service.session_binding(session["id"])
+            )
+            payload["_content_workspace_id"] = binding.workspace_id
 
         course_id_explicit = "course_id" in payload
         requested_course_id = str(
@@ -133,10 +254,21 @@ class TurnRequestPreparer:
             )
 
         requested_capability = str(payload.get("capability") or "chat")
+        # Resolved before routing, and from the *requested* action: the
+        # workspace is what decides whether this turn may be re-routed at all,
+        # so it cannot be derived from the routing outcome.
+        workspace_mode_explicit = "workspace_mode" in payload
+        workspace_mode = _workspace_mode(
+            payload.get("workspace_mode")
+            if workspace_mode_explicit
+            else preferences.get("workspace_mode"),
+            capability=requested_capability,
+        )
         capability_route = route_explicit_quiz_request(
             payload.get("content"),
             requested_capability,
             enabled=routing_enabled,
+            workspace_mode=workspace_mode,
         )
         capability = (
             capability_route.capability if capability_route is not None else requested_capability
@@ -148,13 +280,16 @@ class TurnRequestPreparer:
         except PermissionError as exc:
             raise RuntimeError(str(exc)) from exc
 
-        workspace_mode_explicit = "workspace_mode" in payload
-        workspace_mode = _workspace_mode(
-            payload.get("workspace_mode")
-            if workspace_mode_explicit
-            else preferences.get("workspace_mode"),
-            capability=capability,
-        )
+        if workspace_mode == WORKSPACE_MODE_WATCHING:
+            from deeptutor.video_learning import get_timed_media_store
+
+            media_id = _timed_media_id(payload.get("timed_media_id"))
+            if media_id:
+                # Resolve only in the authenticated owner's store before saving the binding.
+                get_timed_media_store().get(media_id)
+        else:
+            payload.pop("timed_media_id", None)
+            payload.pop("timed_media_viewport", None)
         try:
             from deeptutor.runtime.request_contracts import validate_capability_config
 
@@ -192,6 +327,7 @@ class TurnRequestPreparer:
         reading_material_revision = _reading_material_revision(
             payload.get("reading_material_revision")
         )
+        reading_catalog = None
         if workspace_mode == WORKSPACE_MODE_READING and reading_workspace_id:
             from deeptutor.reading import ReadingCatalogStore
 
@@ -206,6 +342,18 @@ class TurnRequestPreparer:
                 tab.material.material_id for tab in reading_workspace.tabs
             }:
                 raise RuntimeError("The active material is not part of this reading workspace.")
+        # The workspace and saved session can still contain a material whose
+        # learner assignment has since been revoked. Authorize the resolved
+        # material, including a default chosen from the workspace, before
+        # attaching the session or admitting a replayed turn.
+        if reading_material_id:
+            from deeptutor.multi_user.learning_access import assert_learning_material
+
+            try:
+                assert_learning_material(reading_material_id)
+            except PermissionError as exc:
+                raise RuntimeError(str(exc)) from exc
+        if reading_catalog is not None:
             reading_catalog.attach_session(
                 reading_workspace_id,
                 session["id"],
@@ -247,10 +395,33 @@ class TurnRequestPreparer:
         mastery_lease_managed = bool(
             mastery_binding is not None and _mastery_loop_managed(workspace_mode, capability)
         )
+        # What this conversation is for — designing the outline, learning, or
+        # reviewing. Durable session state like the path id, but *mutable*:
+        # the tutor may change it mid-turn with ``mastery_mode`` and the
+        # learner may change it from the header, so the value a turn starts
+        # with is only where it starts.
+        from deeptutor.capabilities.mastery.mode import enforced_mode
+
+        # ``or``, not "is the key present": the client writes this key on every
+        # turn and leaves it null whenever it does not happen to hold the mode
+        # in memory (a reload, a session loaded from the server before its
+        # preference came back). Reading a null as "the client said none" threw
+        # away the mode the conversation was actually in — so the tutor was
+        # told it was studying while the learner watched the outline mode
+        # highlighted above the transcript, and never switched because it
+        # believed it already had.
+        raw_mastery_mode = payload.get("mastery_session_mode") or preferences.get(
+            "mastery_session_mode"
+        )
+        # ``enforced_mode`` rather than ``normalize_mode``: a conversation that
+        # never recorded a mode must stay unrecorded all the way down to the
+        # tools, which read the absence as "enforce nothing".
+        mastery_session_mode = enforced_mode(raw_mastery_mode)
         payload = {
             **payload,
             "mastery_path_id": mastery_path_id,
             "mastery_path_lease_managed": mastery_lease_managed,
+            "mastery_session_mode": mastery_session_mode,
         }
         # Persona is a session-level preference (mirrors llm_selection): an
         # explicit ``persona`` key in the payload — including an empty string,
@@ -261,6 +432,18 @@ class TurnRequestPreparer:
             (payload.get("persona") if "persona" in payload else preferences.get("persona")) or ""
         ).strip()
         payload = {**payload, "persona": persona_pref}
+        # Which skills and MCP servers this conversation narrowed itself to,
+        # resolved the same way as persona and the KB scope: an explicit key in
+        # the payload wins and is persisted below (an explicit empty list means
+        # "back to everything the workspace allows"), an absent key keeps what
+        # the conversation already chose so a reload does not widen its reach.
+        skills_explicit = "skills" in payload
+        mcp_explicit = "mcp" in payload
+        selected_skills = list(
+            (payload.get("skills") if skills_explicit else preferences.get("skills")) or []
+        )
+        selected_mcp = list((payload.get("mcp") if mcp_explicit else preferences.get("mcp")) or [])
+        payload = {**payload, "skills": selected_skills, "mcp": selected_mcp}
         raw_llm_selection = payload.get("llm_selection")
         if raw_llm_selection is None:
             raw_llm_selection = preferences.get("llm_selection")
@@ -384,11 +567,20 @@ class TurnRequestPreparer:
             "knowledge_bases": list(payload.get("knowledge_bases") or []),
             "language": str(payload.get("language") or "en"),
         }
+        if payload.get("capability_once"):
+            # One turn in another mode; the conversation keeps its own.
+            preference_update.pop("capability")
+        if "reply_language_override" in payload:
+            preference_update["reply_language_override"] = reply_language_override
+        if content_workspace_enabled and "workspace_id" not in preferences:
+            preference_update["workspace_id"] = content_workspace_id or None
         # Missing legacy chat fields should not manufacture an empty stored
         # preference. Explicit empties still clear a workspace, while a
         # non-empty legacy capability is persisted as part of migration.
         if workspace_mode_explicit or workspace_mode:
             preference_update["workspace_mode"] = workspace_mode
+        if workspace_mode == "immersive_watching":
+            preference_update["timed_media_id"] = _timed_media_id(payload.get("timed_media_id"))
         if course_id_explicit:
             preference_update["course_id"] = requested_course_id
 
@@ -424,6 +616,16 @@ class TurnRequestPreparer:
                 except (LookupError, ValueError) as exc:
                     raise RuntimeError(str(exc)) from exc
                 parent_preferences = parent_session.get("preferences") or {}
+                if "workspace_id" in parent_preferences:
+                    inherited_id = str(parent_preferences.get("workspace_id") or "")
+                    preference_update["workspace_id"] = inherited_id or None
+                    workspace_service = get_content_workspace_service()
+                    inherited_binding = (
+                        workspace_service.validate_chat_binding(inherited_id, existing=True)
+                        if inherited_id
+                        else workspace_service.session_binding(parent_session_id)
+                    )
+                    payload["_content_workspace_id"] = inherited_binding.workspace_id
                 preference_update.update(
                     {
                         "parent_session_id": parent_session_id,
@@ -436,10 +638,21 @@ class TurnRequestPreparer:
         if persona_explicit:
             # Persist explicit set AND explicit clear ("" = back to Default).
             preference_update["persona"] = persona_pref
+        if skills_explicit:
+            preference_update["skills"] = selected_skills
+        if mcp_explicit:
+            preference_update["mcp"] = selected_mcp
+        from .resource_reuse import apply_resource_reuse
+
+        apply_resource_reuse(preference_update, resource_reuse, persistent_kbs)
         if mastery_path_explicit or mastery_binding is not None:
             # Mastery turns persist their fully resolved path so a later turn
             # cannot silently fall back to a different aggregate.
             preference_update["mastery_path_id"] = mastery_path_id
+            # …and what the conversation is for, which is decided when it is
+            # opened and must survive every later turn that does not restate it.
+            if mastery_session_mode:
+                preference_update["mastery_session_mode"] = mastery_session_mode
         if workspace_mode == WORKSPACE_MODE_READING and reading_workspace_id:
             preference_update.update(
                 {
@@ -460,7 +673,8 @@ class TurnRequestPreparer:
                     "reading_material_id": "",
                 }
             )
-        await self.store.update_session_preferences(session["id"], preference_update)
+        if not payload.get("preserve_session_preferences"):
+            await self.store.update_session_preferences(session["id"], preference_update)
         try:
             if lease is None:
                 turn = await self.store.create_turn(session["id"], capability=capability)
@@ -511,6 +725,17 @@ class TurnRequestPreparer:
                     owns_path=mastery_binding.owned_by_session,
                 )
                 mastery_lease_acquired = True
+                card_answer = payload.get("mastery_answer") or {}
+                if isinstance(card_answer, dict) and card_answer.get("question_id"):
+                    # Commit before the loop starts so the tutor's first
+                    # mastery_status already reports this answer.
+                    await self._commit_mastery_card_answer(
+                        path_id=mastery_binding.path_id,
+                        session_id=session["id"],
+                        turn_id=turn["id"],
+                        question_id=str(card_answer.get("question_id") or ""),
+                        answer=str(card_answer.get("text") or ""),
+                    )
             except Exception as exc:
                 async with self._lock:
                     self._executions.pop(turn["id"], None)
@@ -561,8 +786,24 @@ class TurnRequestPreparer:
                     metadata=session_metadata,
                 ),
             )
+            # Regenerate must remove the old answer before the new task reads
+            # conversation history. Do it only after the new turn has passed
+            # admission (including workspace, capability, and model access),
+            # while no execution task has been scheduled yet. A rejected replay
+            # must leave the original assistant row and its id intact.
+            if replace_assistant_message_id is not None:
+                if not await self.store.delete_message(replace_assistant_message_id):
+                    raise RuntimeError("Unable to replace the previous assistant message")
             async with self._lock:
-                execution.task = asyncio.create_task(self._run_turn(execution))
+                from deeptutor.services.workspace.activity import acquire_activity
+
+                activity = acquire_activity()
+                try:
+                    execution.task = asyncio.create_task(self._run_turn(execution))
+                except BaseException:
+                    activity.close()
+                    raise
+                execution.task.add_done_callback(lambda _done: activity.close())
                 if execution.lease is not None and self.coordinator is not None:
                     execution.coordination_task = asyncio.create_task(
                         self._coordinate_execution(execution)
@@ -598,6 +839,11 @@ class TurnRequestPreparer:
         turn with ``persist_user_message=False`` and ``regenerate=True`` so
         the runtime knows not to duplicate the user row or refresh long-term
         memory a second time. The original user message stays in place.
+
+        ``overrides.replay_snapshot`` opts into restoring the saved per-turn
+        request for a persisted failed-turn Resend. Without it, Regenerate
+        retains its session-preference behavior. Explicit overrides win over
+        saved fields, including empty lists and strings.
         """
         session_id = str(session_id or "").strip()
         if not session_id:
@@ -623,10 +869,10 @@ class TurnRequestPreparer:
                 if turn_id:
                     previous_turn_id = turn_id
                     break
-            await self.store.delete_message(last_message["id"])
 
         preferences = session.get("preferences") or {}
-        overrides = overrides or {}
+        overrides = dict(overrides or {})
+        replay_snapshot = overrides.pop("replay_snapshot", False) is True
         snapshot = {}
         metadata = last_user.get("metadata") or {}
         if isinstance(metadata, dict):
@@ -650,9 +896,31 @@ class TurnRequestPreparer:
             if overrides.get("knowledge_bases") is not None
             else preferences.get("knowledge_bases") or []
         )
+        skills = list(
+            overrides.get("skills")
+            if overrides.get("skills") is not None
+            else preferences.get("skills") or []
+        )
+        mcp = list(
+            overrides.get("mcp")
+            if overrides.get("mcp") is not None
+            else preferences.get("mcp") or []
+        )
         language = str(overrides.get("language") or preferences.get("language") or "en")
 
         config: dict[str, Any] = dict(overrides.get("config") or {})
+        consultation_fields = {}
+        snapshot_config = snapshot.get("config") or {}
+        for field, snapshot_key in (
+            ("consult_partner_id", "consultPartnerId"),
+            ("partner_discussion_group_id", "partnerDiscussionGroupId"),
+        ):
+            consultation_fields[field] = (
+                overrides[field]
+                if field in overrides
+                else config.get(field, snapshot.get(snapshot_key, snapshot_config.get(field)))
+            )
+
         llm_selection = (
             overrides.get("llm_selection")
             if overrides.get("llm_selection") is not None
@@ -673,12 +941,32 @@ class TurnRequestPreparer:
         payload: dict[str, Any] = {
             "session_id": session_id,
             "capability": capability,
+            # A turn asked in another mode once (a reading "Quiz me") is
+            # regenerated in it once, too — not adopted as the chat's mode.
+            "capability_once": "capability" not in overrides
+            and snapshot.get("capabilityOnce") is True,
             "workspace_mode": workspace_mode,
             "content": str(last_user.get("content", "") or ""),
             "tools": tools,
             "knowledge_bases": knowledge_bases,
+            "skills": skills,
+            "mcp": mcp,
             "language": language,
-            "attachments": list(last_user.get("attachments") or []),
+            "attachments": [
+                {
+                    key: att.get(key)
+                    for key in ("type", "url", "base64", "filename", "mime_type", "id")
+                    if isinstance(att, dict) and key in att
+                }
+                for att in (last_user.get("attachments") or [])
+                if isinstance(att, dict)
+            ],
+            # The persisted message-row attachments carry upload-time extras
+            # (``id``, ``extracted_text``, ``extracted_chars``) that the wire
+            # contract ``OutgoingAttachment`` forbids; project to the allowed
+            # fields so start_turn's TurnRequest validation passes on retry
+            # (#1484 — otherwise the WS closed with no terminal event and the
+            # UI hung on "Thinking..." forever).
             "notebook_references": list(
                 overrides.get("notebook_references")
                 if overrides.get("notebook_references") is not None
@@ -707,6 +995,14 @@ class TurnRequestPreparer:
                 else snapshot.get("readingReferences")
             ),
             "mastery_path_id": mastery_path_id,
+            # A regenerate must run as the same kind of conversation the turn
+            # originally ran as, or it would be handed a different tool surface
+            # than the answer it is replacing.
+            "mastery_session_mode": (
+                overrides.get("mastery_session_mode")
+                if "mastery_session_mode" in overrides
+                else preferences.get("mastery_session_mode")
+            ),
             # Recovered from the original turn's snapshot so the regenerate runs
             # against the same document. An explicit override wins (the reader
             # may have moved on), and the viewport is deliberately not restored —
@@ -732,12 +1028,40 @@ class TurnRequestPreparer:
                 else snapshot.get("timedMediaId")
             ),
             "config": config,
+            **consultation_fields,
             "persist_user_message": False,
             "regenerate": True,
-            "regenerated_from_message_id": int(last_user["id"]),
+            "regenerated_from_message_id": last_user["id"],
         }
         if previous_turn_id:
             payload["superseded_turn_id"] = previous_turn_id
         if llm_selection:
             payload["llm_selection"] = llm_selection
-        return await self.start_turn(payload)
+
+        if replay_snapshot:
+            payload["preserve_session_preferences"] = True
+            # The ordinary Regenerate path intentionally uses current session
+            # preferences for many fields. Resend instead repeats the failed
+            # message's saved request. Keys absent from an older snapshot keep
+            # the legacy fallback, while explicit overrides always take
+            # precedence, even when they clear a field.
+            for field, snapshot_key in _REPLAY_SNAPSHOT_FIELDS.items():
+                if field in overrides:
+                    payload[field] = overrides[field]
+                elif snapshot_key in snapshot:
+                    payload[field] = snapshot[snapshot_key]
+
+        # Validate the complete replay request before removing the answer it
+        # supersedes. A malformed stored snapshot or override must leave the
+        # visible conversation intact so the learner can retry safely.
+        TurnRequest.model_validate(payload)
+        replace_assistant_message_id = (
+            last_message["id"]
+            if last_message is not None and last_message.get("role") == "assistant"
+            else None
+        )
+        if replace_assistant_message_id is None:
+            return await self.start_turn(payload)
+        return await self.start_turn(
+            payload, replace_assistant_message_id=replace_assistant_message_id
+        )

@@ -116,6 +116,8 @@ def test_store_migrates_legacy_notebook_review_columns(tmp_path: Path) -> None:
     assert listing["total"] == 1
     entry = listing["items"][0]
     assert entry["source"] == "deep_question"
+    assert entry["origin_type"] == "conversation"
+    assert entry["origin_ref"] == "session-1"
     assert entry["score_trend"] == "new"
     assert entry["resolved"] is False
     assert all(not entry[key] for key in ("material_id", "section_id"))
@@ -378,6 +380,69 @@ def test_upsert_notebook_entries_updates_on_conflict(store: SQLiteSessionStore) 
     assert result["items"][0]["user_answer"] == "B"
 
 
+def test_upsert_notebook_entries_with_answer_images(store: SQLiteSessionStore) -> None:
+    """#1245 — INSERT with user_answer_images must include every schema column.
+
+    The ``notebook_entries`` schema has more columns than the INSERT listed
+    historically (notably ``ai_judgment``, added by migration on legacy
+    databases). Skipping one produced ``OperationalError: 22 values for 23
+    columns`` at the call site. Cover both INSERT branches: a fresh entry
+    carrying images, and a re-upsert that only changes ``is_correct`` while
+    keeping the stored images.
+    """
+    session = asyncio.run(store.create_session())
+    sid = session["id"]
+    images = [
+        {
+            "id": "img-1",
+            "url": "/files/attachments/img-1/answer.png",
+            "filename": "answer.png",
+            "mime_type": "image/png",
+        }
+    ]
+
+    asyncio.run(
+        store.upsert_notebook_entries(
+            sid,
+            [
+                {
+                    "question_id": "q1",
+                    "question": "Identify the diagram.",
+                    "user_answer": "B",
+                    "is_correct": False,
+                    "user_answer_images": images,
+                }
+            ],
+        )
+    )
+    stored = asyncio.run(store.list_notebook_entries())
+    assert stored["total"] == 1
+    assert stored["items"][0]["user_answer_images"] == images
+
+    # Re-upsert the same key without sending images — stored images must
+    # survive (no-images branch must not clobber user_answer_images_json).
+    asyncio.run(
+        store.upsert_notebook_entries(
+            sid,
+            [
+                {
+                    "question_id": "q1",
+                    "question": "Identify the diagram.",
+                    "user_answer": "A",
+                    "is_correct": True,
+                }
+            ],
+        )
+    )
+    after = asyncio.run(store.list_notebook_entries())["items"][0]
+    assert after["is_correct"] is True
+    assert after["user_answer"] == "A"
+    assert after["user_answer_images"] == images
+    # The new column defaults are exposed by _serialize_notebook_entry.
+    assert after["bookmarked"] is False
+    assert after["followup_session_id"] == ""
+
+
 def test_upsert_skips_blank_questions(store: SQLiteSessionStore) -> None:
     session = asyncio.run(store.create_session())
     items = [
@@ -392,6 +457,51 @@ def test_upsert_skips_blank_questions(store: SQLiteSessionStore) -> None:
 def test_upsert_unknown_session_raises(store: SQLiteSessionStore) -> None:
     with pytest.raises(ValueError, match="Session not found"):
         asyncio.run(store.upsert_notebook_entries("nope", _make_items(("q1", "Q?", False))))
+
+
+def test_non_conversation_origin_upserts_without_a_session(
+    store: SQLiteSessionStore,
+) -> None:
+    item = {
+        "origin_type": "document_analysis",
+        "origin_ref": "book:algebra:page-12",
+        "question_id": "q1",
+        "question": "What is the slope?",
+        "source": "book",
+        "material_id": "algebra",
+        "is_correct": False,
+    }
+
+    assert asyncio.run(store.upsert_notebook_entries(None, [item])) == 1
+    item["user_answer"] = "3"
+    assert asyncio.run(store.upsert_notebook_entries(None, [item])) == 1
+
+    listing = asyncio.run(store.list_notebook_entries())
+    assert listing["total"] == 1
+    entry = listing["items"][0]
+    assert entry["session_id"] == ""
+    assert entry["origin_type"] == "document_analysis"
+    assert entry["origin_ref"] == "book:algebra:page-12"
+    assert entry["user_answer"] == "3"
+    assert asyncio.run(store.list_notebook_entries(session_ids=[]))["total"] == 0
+
+
+def test_non_conversation_origin_requires_a_stable_reference(
+    store: SQLiteSessionStore,
+) -> None:
+    with pytest.raises(ValueError, match="require origin_ref"):
+        asyncio.run(
+            store.upsert_notebook_entries(
+                None,
+                [
+                    {
+                        "origin_type": "external_import",
+                        "question_id": "q1",
+                        "question": "Imported?",
+                    }
+                ],
+            )
+        )
 
 
 def test_list_entries_filters_bookmarked(store: SQLiteSessionStore) -> None:
@@ -426,6 +536,34 @@ def test_list_entries_filters_is_correct(store: SQLiteSessionStore) -> None:
     wrong = asyncio.run(store.list_notebook_entries(is_correct=False))
     assert wrong["total"] == 1
     assert wrong["items"][0]["question_id"] == "q1"
+
+
+def test_ungraded_rows_are_not_listed_as_wrong(store: SQLiteSessionStore) -> None:
+    session = asyncio.run(store.create_session())
+    asyncio.run(
+        store.upsert_notebook_entries(
+            session["id"],
+            [
+                {
+                    "question_id": "wrong",
+                    "question": "Wrong?",
+                    "is_correct": False,
+                    "result": "incorrect",
+                },
+                {
+                    "question_id": "pending",
+                    "question": "Pending?",
+                    "is_correct": False,
+                    "result": "ungraded",
+                },
+            ],
+        )
+    )
+    wrong = asyncio.run(store.list_notebook_entries(is_correct=False))
+    assert [item["question_id"] for item in wrong["items"]] == ["wrong"]
+    stats = asyncio.run(store.question_bank_stats())
+    assert stats["wrong"] == 1
+    assert stats["unresolved"] == 1
 
 
 def test_notebook_review_metadata_filters_and_transitions(
@@ -603,12 +741,45 @@ def test_delete_notebook_entry(store: SQLiteSessionStore) -> None:
     assert asyncio.run(store.delete_notebook_entry(99999)) is False
 
 
-def test_entries_cascade_on_session_delete(store: SQLiteSessionStore) -> None:
+def test_entries_follow_a_session_into_and_out_of_the_recycle_bin(
+    store: SQLiteSessionStore,
+) -> None:
     session = asyncio.run(store.create_session())
     asyncio.run(store.upsert_notebook_entries(session["id"], _make_items(("q1", "Q?", False))))
     assert asyncio.run(store.list_notebook_entries())["total"] == 1
-    asyncio.run(store.delete_session(session["id"]))
+
+    # A recycled session takes its entries out of view without destroying
+    # them, which is what makes the restore below whole.
+    asyncio.run(store.soft_delete_session(session["id"]))
     assert asyncio.run(store.list_notebook_entries())["total"] == 0
+    assert asyncio.run(store.restore_session(session["id"]))
+    assert asyncio.run(store.list_notebook_entries())["total"] == 1
+
+    asyncio.run(store.soft_delete_session(session["id"]))
+    assert asyncio.run(store.hard_delete_session(session["id"]))
+    detached = asyncio.run(store.list_notebook_entries())
+    assert detached["total"] == 1
+    assert detached["items"][0]["session_id"] == ""
+    assert detached["items"][0]["origin_ref"] == session["id"]
+
+
+def test_entries_keep_provenance_when_a_session_is_deleted_outright(
+    store: SQLiteSessionStore,
+) -> None:
+    """Deleting a chat removes navigation without deleting learning evidence."""
+    session = asyncio.run(store.create_session())
+    asyncio.run(store.upsert_notebook_entries(session["id"], _make_items(("q1", "Q?", False))))
+    assert asyncio.run(store.list_notebook_entries())["total"] == 1
+
+    assert asyncio.run(store.delete_session(session["id"]))
+
+    listing = asyncio.run(store.list_notebook_entries())
+    assert listing["total"] == 1
+    assert listing["items"][0]["session_id"] == ""
+    assert listing["items"][0]["origin_type"] == "conversation"
+    assert listing["items"][0]["origin_ref"] == session["id"]
+    assert asyncio.run(store.list_deleted_sessions()) == []
+    assert asyncio.run(store.restore_session(session["id"])) is False
 
 
 # ── Categories ────────────────────────────────────────────────────

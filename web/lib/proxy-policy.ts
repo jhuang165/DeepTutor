@@ -7,6 +7,7 @@
 // can be unit-tested in the node harness without booting the Next runtime.
 
 export const LOGIN_PATH = "/login";
+export const HANDOFF_PATH = "/handoff";
 export const COOKIE_NAME = "dt_token";
 export const CODEX_CALLBACK_PATH = "/auth/callback";
 export const CODEX_CALLBACK_API_PATH = "/api/auth/openai-codex/callback";
@@ -28,10 +29,13 @@ export function isRetiredPagePath(pathname: string): boolean {
 export function isBackendPath(pathname: string): boolean {
   return (
     pathname.startsWith("/api/") ||
-    pathname === "/ws" ||
-    pathname.startsWith("/ws/") ||
+    isWebSocketPath(pathname) ||
     pathname.startsWith("/files/")
   );
+}
+
+export function isWebSocketPath(pathname: string): boolean {
+  return pathname === "/ws" || pathname.startsWith("/ws/");
 }
 
 // Static assets served straight out of `web/public` (logos, favicons, fonts,
@@ -42,7 +46,7 @@ export function isBackendPath(pathname: string): boolean {
 // (issue #599 — broken logo/banner after login). Public assets are
 // non-sensitive by design, so allowing them through is safe.
 const STATIC_ASSET =
-  /\.(?:png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|otf|txt|json|map|css|js)$/i;
+  /\.(?:png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|otf|txt|json|map|css|js|wasm)$/i;
 
 // Paths the auth gate must never block: the auth pages themselves, Next.js
 // internals, and public static assets (see STATIC_ASSET above).
@@ -50,6 +54,7 @@ export function isAuthExempt(pathname: string): boolean {
   return (
     pathname.startsWith(LOGIN_PATH) ||
     pathname.startsWith("/register") ||
+    pathname === HANDOFF_PATH ||
     pathname.startsWith("/_next") ||
     pathname.startsWith("/favicon") ||
     STATIC_ASSET.test(pathname)

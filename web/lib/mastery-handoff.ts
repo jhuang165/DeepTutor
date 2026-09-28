@@ -1,4 +1,6 @@
+import { masterySessionRoute, masterySessionsRoute } from "@/lib/learning-routes";
 import type { StreamEvent } from "@/features/chat/model/protocol";
+import { toolResultPayload } from "@/lib/tool-event";
 
 /**
  * Reading the mastery navigation tools' hand-off signals off a turn's stream.
@@ -76,13 +78,7 @@ export function masteryHandoffFrom(event: {
   const metadata = event.metadata;
   if (!metadata || typeof metadata !== "object") return null;
 
-  const outer = metadata as Record<string, unknown>;
-  const nested = outer.tool_metadata;
-  const source = (
-    nested && typeof nested === "object" ? nested : outer
-  ) as Record<string, unknown>;
-
-  const raw = source.mastery_handoff;
+  const raw = toolResultPayload(metadata, "mastery_handoff");
   if (!raw || typeof raw !== "object") return null;
   const payload = raw as Record<string, unknown>;
   if (!isKind(payload.kind)) return null;
@@ -149,8 +145,7 @@ export function extractMasteryHandoffs(
  * page opens.
  */
 export function masteryHandoffHref(payload: MasteryHandoffPayload): string {
-  const path = encodeURIComponent(payload.path_id);
   return payload.kind === "open"
-    ? `/mastery/${path}/sessions/${encodeURIComponent(payload.session_id)}`
-    : `/mastery/${path}/sessions`;
+    ? masterySessionRoute(payload.path_id, payload.session_id)
+    : masterySessionsRoute(payload.path_id);
 }

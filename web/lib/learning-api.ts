@@ -1,3 +1,4 @@
+import type { LearningOrigin } from "@/lib/learning-library";
 import { apiUrl, apiFetch } from "./api";
 
 export interface ModuleInit {
@@ -7,9 +8,14 @@ export interface ModuleInit {
   pass_threshold?: number;
   knowledge_points: {
     id: string;
+    client_ref?: string;
     name: string;
     type: string;
     module_id: string;
+    prerequisite_ids?: string[];
+    prerequisite_refs?: string[];
+    topic_source_ids?: string[];
+    topic_source_refs?: string[];
   }[];
 }
 
@@ -64,15 +70,24 @@ export interface MapKnowledgePoint {
   id: string;
   name: string;
   type: string;
+  prerequisite_ids: string[];
+  topic_source_ids: string[];
   status: ObjectiveStatus;
   mastery: number;
   mastery_source: "system" | "learner" | "";
   override_note: string;
+  deferred?: boolean;
 }
 
 export interface MapModule {
   id: string;
   name: string;
+  /**
+   * What this module is for, in one sentence, written when the outline was
+   * designed. Empty on outlines built before module objectives existed — every
+   * reader falls back to the module name.
+   */
+  objective: string;
   order: number;
   mastered: number;
   total: number;
@@ -98,6 +113,7 @@ export interface NextStep {
   mastery: number;
   threshold: number;
   reason: string;
+  forgetting_risk: number;
   /** The outstanding question's text, when `action` is `answer_pending`. */
   pending_prompt: string;
   /** Session that owns an outstanding question; empty for non-pending steps. */
@@ -112,6 +128,37 @@ export interface MasteryMapResult {
   map: MasteryMap;
 }
 
+// ── Visual learning board ─────────────────────────────────────────────────
+
+export interface BoardCard {
+  id: string;
+  name: string;
+  type: string;
+  module_id: string;
+  module_name: string;
+  status: ObjectiveStatus;
+  mastery_level: number;
+  next_review_at: number | null;
+  position: { column: number; row: number };
+}
+
+export interface BoardModule {
+  id: string;
+  name: string;
+  order: number;
+  mastered: number;
+  total: number;
+  cards: BoardCard[];
+}
+
+export interface BoardResult {
+  book_id: string;
+  name: string;
+  path_revision: number;
+  cards: BoardCard[];
+  modules: BoardModule[];
+}
+
 export async function fetchMasteryMap(
   pathId: string,
   init?: RequestInit,
@@ -122,6 +169,20 @@ export async function fetchMasteryMap(
   );
   if (!res.ok) throw new Error(`Failed to fetch mastery map: ${res.status}`);
   return res.json() as Promise<MasteryMapResult>;
+}
+
+export async function fetchLearningBoard(
+  pathId: string,
+  init?: RequestInit,
+): Promise<BoardResult> {
+  const res = await apiFetch(
+    apiUrl(
+      `/api/mastery-paths/progress/${encodeURIComponent(pathId)}/board`,
+    ),
+    init,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch learning board: ${res.status}`);
+  return res.json() as Promise<BoardResult>;
 }
 
 /** Rename a path. An empty name restores the derived display name. */
@@ -185,6 +246,28 @@ export interface ObjectiveReview {
   interval_index: number;
   consecutive_correct: number;
   consecutive_wrong: number;
+  stability: number;
+  retrievability: number;
+  desired_retention: number;
+  lapse_count: number;
+  forgetting_risk: number;
+  reason: string;
+  recent_failure?: boolean;
+}
+
+export interface LearningEvidence {
+  knowledge_point_id: string;
+  timestamp: number;
+  source: string;
+  assessment_type: "quiz" | "qualitative" | "review";
+  result: "correct" | "incorrect" | "partial";
+  quality: number | null;
+  hints_used: number;
+  attempt_count: number;
+  confidence: number | null;
+  response_time: number | null;
+  session_id: string;
+  turn_id: string;
 }
 
 export interface ObjectiveErrorRecord {
@@ -213,6 +296,11 @@ export interface ObjectiveReport {
   correct_count: number;
   explanation: string;
   review: ObjectiveReview | null;
+  // These fields were added after the initial objective report contract.
+  // Keep them optional so older API responses and embedded consumers remain
+  // readable while the current server includes both values.
+  evidence?: LearningEvidence[];
+  evidence_count?: number;
   errors: ObjectiveErrorRecord[];
 }
 
@@ -322,13 +410,17 @@ export async function generateModulesFromNotebook(
 
 // ── Mastery Path V2 product surface ──────────────────────────────────────
 
+// Mirrors deeptutor/learning/models.py TopicSourceKind.
 export type TopicSourceKind =
   | "goal"
   | "book"
   | "notebook"
   | "knowledge_base"
   | "file"
-  | "chat";
+  | "chat"
+  | "question_bank"
+  | "cowriter"
+  | "partner_group";
 
 export interface TopicSource {
   id: string;
@@ -344,6 +436,7 @@ export interface TopicSource {
 
 export interface TopicSourceInput {
   id?: string;
+  client_ref?: string;
   kind: TopicSourceKind;
   source_id?: string;
   label: string;
@@ -371,9 +464,23 @@ export interface TopicReview {
   due_at: number;
   priority: number;
   due: boolean;
+  forgetting_risk: number;
+  reason: string;
+  stability: number;
+  retrievability: number;
+  desired_retention: number;
+  lapse_count: number;
+  recent_failure: boolean;
+  evidence_source?: string;
+  evidence_id?: string;
 }
 
-export interface MasteryTopic {
+export interface MasteryReviewSettings {
+  desired_retention: number;
+  scope: "path";
+}
+
+export interface MasteryTopic extends LearningOrigin {
   path_id: string;
   name: string;
   metadata: TopicMetadata;
@@ -382,6 +489,9 @@ export interface MasteryTopic {
   next: NextStep;
   map: MasteryMap;
   reviews: TopicReview[];
+  review_settings?: MasteryReviewSettings;
+  /** Null until the tutor has asked the learner about themselves. */
+  learner_profile: LearnerProfile | null;
   session_count: number;
   updated_at: number;
 }
@@ -425,10 +535,27 @@ export interface GenerateTopicInput {
   must_cover?: string[];
 }
 
-export interface CreateTopicInput extends GenerateTopicInput {
+export interface CreateTopicInput extends Omit<GenerateTopicInput, "name"> {
+  /**
+   * Optional: a goal the learner did not name is named after its own goal
+   * text, server-side, and stays renameable afterwards.
+   */
+  name?: string;
   description?: string;
   emoji?: string;
+  /** Empty when the outline is to be designed in the goal's first session. */
   modules: ModuleInit[];
+}
+
+/** Mirrors deeptutor/learning/models.py LearnerProfile. */
+export interface LearnerProfile {
+  prior_knowledge: string;
+  target_level: string;
+  time_budget: string;
+  preferences: string;
+  teaching_strategy?: "probe_first" | "teach_first";
+  notes: string;
+  updated_at: number;
 }
 
 export interface TopicSession {
@@ -528,6 +655,39 @@ export function fetchMasteryTopic(
     `/api/mastery-paths/topics/${encodeURIComponent(pathId)}`,
     init,
     "load topic",
+  );
+}
+
+export function updateMasteryReviewSettings(
+  pathId: string,
+  desiredRetention: number,
+): Promise<MasteryTopic> {
+  return masteryJson(
+    `/api/mastery-paths/topics/${encodeURIComponent(pathId)}/review-settings`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ desired_retention: desiredRetention }),
+    },
+    "update review target",
+  );
+}
+
+/** Change what a conversation is doing, from the learner's own mode buttons. */
+export async function setMasterySessionMode(
+  pathId: string,
+  sessionId: string,
+  mode: string,
+): Promise<{ session_id: string; mode: string }> {
+  return masteryJson(
+    `/api/mastery-paths/topics/${encodeURIComponent(pathId)}/sessions/${encodeURIComponent(
+      sessionId,
+    )}/mode`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    },
   );
 }
 

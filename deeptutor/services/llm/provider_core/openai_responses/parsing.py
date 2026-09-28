@@ -12,7 +12,7 @@ import json_repair
 from loguru import logger
 
 from deeptutor.services.llm.provider_core.base import LLMResponse, ToolCallRequest
-from deeptutor.services.llm.usage_frame import token_counts
+from deeptutor.services.llm.usage_frame import usage_breakdown
 
 FINISH_REASON_MAP = {
     "completed": "stop",
@@ -38,6 +38,14 @@ _REPLAYABLE_OUTPUT_ITEM_TYPES = {
     "function_call",
     *_WEB_SEARCH_ITEM_TYPES,
 }
+
+#: Reports a function call's arguments *as they stream*, so a caller can put a
+#: partially written call on screen instead of waiting for the closing brace.
+#: Called with ``(call_id, tool_name, arguments_so_far)`` — the accumulated
+#: text, not the fragment, so a consumer never has to reassemble it. Purely a
+#: side channel: the dispatched call is still built from the finished
+#: arguments by :func:`_build_tool_call`.
+ToolArgsDeltaHook = Callable[[str, str, str], Awaitable[None]]
 
 
 def _dump_model(value: Any) -> Any:
@@ -76,8 +84,43 @@ def _citations_from_content_blocks(blocks: Any) -> list[dict[str, str]]:
     return citations
 
 
-def map_finish_reason(status: str | None) -> str:
-    return FINISH_REASON_MAP.get(status or "completed", "stop")
+def map_finish_reason(
+    status: str | None,
+    incomplete_reason: str | None = None,
+) -> str:
+    """Map a Responses terminal status to the chat-completions vocabulary.
+
+    ``response.incomplete`` is not always a token-limit event: DeepSeek also
+    uses it for content filtering.  The nested reason is therefore part of the
+    mapping instead of treating every incomplete response as ``length``.
+    """
+    normalized_status = str(status or "completed").strip().lower()
+    normalized_reason = str(incomplete_reason or "").strip().lower()
+    if normalized_status == "incomplete":
+        if normalized_reason == "content_filter":
+            return "content_filter"
+        return "length"
+    return FINISH_REASON_MAP.get(normalized_status, "stop")
+
+
+def _response_field(response: Any, key: str) -> Any:
+    if isinstance(response, dict):
+        return response.get(key)
+    return getattr(response, key, None)
+
+
+def _incomplete_reason(response: Any) -> str | None:
+    details = _response_field(response, "incomplete_details")
+    reason = _response_field(details, "reason")
+    return str(reason) if reason is not None else None
+
+
+def _response_usage(response: Any) -> dict[str, int]:
+    return usage_breakdown(
+        _response_field(response, "usage"),
+        prompt="input_tokens",
+        completion="output_tokens",
+    )
 
 
 @dataclass(slots=True)
@@ -154,20 +197,98 @@ class _ToolCallBuffers:
             buffer.arguments = value
 
 
+def _looks_truncated(arguments: Any) -> bool:
+    """Whether the arguments simply stop rather than close.
+
+    Worth separating from ordinary syntax errors: an unescaped quote inside a
+    string is repaired losslessly, but arguments that were *cut off* are
+    repaired into something plausible and wrong — the fragment closes as a
+    shorter value, so a card silently loses the options the model had not
+    written yet and the last one keeps whatever bytes followed the break. A
+    model that spends its token budget on thinking hits this, and the reply
+    still reads as a finished question.
+
+    Judged by the last character, not by the decoder's message: an
+    unterminated string and a stray quote mid-prose raise the same
+    ``Expecting ',' delimiter``, whereas a complete object always ends in
+    ``}`` however mangled its middle is.
+    """
+    if not isinstance(arguments, str):
+        return False
+    stripped = arguments.rstrip()
+    return bool(stripped) and not stripped.endswith(("}", "]"))
+
+
 def _parse_tool_arguments(arguments: Any, tool_name: str) -> dict[str, Any]:
-    """Parse function arguments consistently across all response modes."""
+    """Parse function arguments consistently across all response modes.
+
+    Strict JSON first, then ``json_repair``. A model writing prose into an
+    argument routinely leaves an unescaped quote in it (an option described
+    as ``路径名"1"``), which strict parsing rejects and repair recovers
+    losslessly — expected, and logged at debug.
+
+    Truncated arguments are a different story and stay at warning: repair
+    still returns an object, so the call proceeds with content the model
+    never finished writing. Only arguments repair cannot make an object of
+    reach the tool as ``{"raw": ...}``.
+    """
     try:
-        parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+        return _as_arguments_dict(
+            json.loads(arguments) if isinstance(arguments, str) else arguments
+        )
     except Exception:
+        pass
+    repaired: Any = arguments
+    if isinstance(arguments, str):
+        try:
+            repaired = json_repair.loads(arguments)
+        except Exception:
+            repaired = None
+    if not isinstance(repaired, dict):
         logger.warning(
-            "Failed to parse tool call arguments for '{}': {}",
+            "Could not parse tool call arguments for '{}': {}",
             tool_name,
             str(arguments)[:200],
         )
-        parsed = json_repair.loads(arguments) if isinstance(arguments, str) else arguments
-        if not isinstance(parsed, dict):
-            return {"raw": arguments}
+        return {"raw": arguments}
+    if _looks_truncated(arguments):
+        logger.warning(
+            "Tool call arguments for '{}' were cut off after {} chars; the "
+            "repaired call is missing whatever the model had not written yet: {}",
+            tool_name,
+            len(arguments) if isinstance(arguments, str) else 0,
+            str(arguments)[-200:],
+        )
+        return repaired
+    logger.debug(
+        "Repaired malformed tool call arguments for '{}': {}",
+        tool_name,
+        str(arguments)[:200],
+    )
+    return repaired
+
+
+def _as_arguments_dict(parsed: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
+
+
+async def _report_args_delta(
+    hook: ToolArgsDeltaHook,
+    buffers: _ToolCallBuffers,
+    *,
+    call_id: str | None,
+    item_id: str | None,
+) -> None:
+    """Hand the accumulated arguments of one in-flight call to *hook*.
+
+    Silent when the delta cannot be correlated to a buffer or the provider has
+    not named the tool yet: a preview no consumer can attribute is worth less
+    than the round it would interrupt.
+    """
+    buffer = buffers.get(call_id=call_id, item_id=item_id)
+    if buffer is None or not buffer.name:
+        return
+    await hook(buffer.call_id, buffer.name, buffer.arguments)
 
 
 def _build_tool_call(
@@ -238,6 +359,7 @@ async def consume_sse(
     response: httpx.Response,
     on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     on_provider_event: Callable[[str, dict[str, Any]], None] | None = None,
+    on_tool_args_delta: ToolArgsDeltaHook | None = None,
 ) -> tuple[str, list[ToolCallRequest], str]:
     """Consume a Responses API SSE stream."""
     content = ""
@@ -275,6 +397,13 @@ async def consume_sse(
                 call_id=event.get("call_id"),
                 item_id=event.get("item_id"),
             )
+            if on_tool_args_delta:
+                await _report_args_delta(
+                    on_tool_args_delta,
+                    tool_call_buffers,
+                    call_id=event.get("call_id"),
+                    item_id=event.get("item_id"),
+                )
         elif event_type == "response.function_call_arguments.done":
             tool_call_buffers.replace(
                 event.get("arguments") or "",
@@ -307,9 +436,17 @@ async def consume_sse(
                         arguments=(buf.arguments if buf else "") or item.get("arguments") or "{}",
                     )
                 )
-        elif event_type == "response.completed":
-            status = (event.get("response") or {}).get("status")
-            finish_reason = map_finish_reason(status)
+        elif event_type in {"response.completed", "response.incomplete"}:
+            # The documented shape nests the terminal payload under
+            # ``response``; a few gateways flatten it onto the event itself.
+            response = event.get("response") or event
+            status = _response_field(response, "status") or (
+                "incomplete" if event_type == "response.incomplete" else "completed"
+            )
+            finish_reason = map_finish_reason(status, _incomplete_reason(response))
+            usage = _response_usage(response)
+            if usage and on_provider_event:
+                on_provider_event("usage", usage)
         elif event_type in {"error", "response.failed"}:
             raise RuntimeError(f"Response failed: {_response_error_detail(event)[:500]}")
 
@@ -380,9 +517,12 @@ def parse_response_output(response: Any) -> LLMResponse:
             )
 
     # The Responses API names its counters input_/output_tokens.
-    usage = token_counts(response.get("usage"), prompt="input_tokens", completion="output_tokens")
+    usage = _response_usage(response)
 
-    finish_reason = map_finish_reason(response.get("status"))
+    finish_reason = map_finish_reason(
+        response.get("status"),
+        _incomplete_reason(response),
+    )
     if not any(item.get("type") == "reasoning" for item in native_output_items):
         # Preserve the established metadata contract for ordinary native web
         # search responses. Message/function-call items only need verbatim
@@ -411,6 +551,7 @@ async def consume_sdk_stream(
     on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
     on_provider_event: Callable[[str, dict[str, Any]], None] | None = None,
+    on_tool_args_delta: ToolArgsDeltaHook | None = None,
 ) -> tuple[str, list[ToolCallRequest], str, dict[str, int], str | None]:
     """Consume an SDK async stream from client.responses.create(stream=True)."""
     content = ""
@@ -450,6 +591,13 @@ async def consume_sdk_stream(
                 call_id=getattr(event, "call_id", None),
                 item_id=getattr(event, "item_id", None),
             )
+            if on_tool_args_delta:
+                await _report_args_delta(
+                    on_tool_args_delta,
+                    tool_call_buffers,
+                    call_id=getattr(event, "call_id", None),
+                    item_id=getattr(event, "item_id", None),
+                )
         elif event_type == "response.function_call_arguments.done":
             tool_call_buffers.replace(
                 getattr(event, "arguments", "") or "",
@@ -495,14 +643,23 @@ async def consume_sdk_stream(
             reasoning_content = (reasoning_content or "") + delta_text
             if on_reasoning_delta and delta_text:
                 await on_reasoning_delta(delta_text)
-        elif event_type == "response.completed":
-            response = getattr(event, "response", None)
-            status = getattr(response, "status", None) if response is not None else None
-            usage_obj = getattr(response, "usage", None) if response is not None else None
-            finish_reason = map_finish_reason(status)
+        elif event_type in {"response.completed", "response.incomplete"}:
+            response = getattr(event, "response", None) or event
+            status = _response_field(response, "status")
+            usage_obj = _response_field(response, "usage")
+            if status is None and event_type == "response.incomplete":
+                status = "incomplete"
+            finish_reason = map_finish_reason(status, _incomplete_reason(response))
             usage = (
-                token_counts(usage_obj, prompt="input_tokens", completion="output_tokens") or usage
+                usage_breakdown(
+                    usage_obj,
+                    prompt="input_tokens",
+                    completion="output_tokens",
+                )
+                or usage
             )
+            if usage and on_provider_event:
+                on_provider_event("usage", usage)
         elif event_type in {"error", "response.failed"}:
             raise RuntimeError(f"Response failed: {_response_error_detail(event)[:500]}")
 

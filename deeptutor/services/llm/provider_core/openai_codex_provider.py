@@ -19,6 +19,7 @@ from deeptutor.services.llm.provider_core.base import LLMProvider, LLMResponse, 
 from deeptutor.services.llm.provider_core.openai_responses import (
     consume_sse,
     convert_messages,
+    convert_tool_choice,
     convert_tools,
 )
 from deeptutor.services.llm.request_compat import is_transient_transport_error
@@ -64,7 +65,7 @@ class OpenAICodexProvider(LLMProvider):
             "text": {"verbosity": "medium"},
             "include": ["reasoning.encrypted_content"],
             "prompt_cache_key": _prompt_cache_key(messages),
-            "tool_choice": tool_choice or "auto",
+            "tool_choice": convert_tool_choice(tool_choice) or "auto",
             "parallel_tool_calls": True,
         }
         if reasoning_effort:
@@ -90,14 +91,19 @@ class OpenAICodexProvider(LLMProvider):
                     if exc.status_code == 401:
                         try:
                             await service.recover_after_unauthorized(token.generation)
-                        except CodexAuthError:
+                        except CodexAuthError as refresh_error:
                             # Only promise a retry when the session really was
                             # renewed; a dead refresh token needs a new sign-in.
                             logger.warning("Codex token renewal after HTTP 401 failed")
-                            raise CodexHTTPError(
-                                exc.status_code,
-                                "Codex login expired and could not be renewed. Sign in again.",
-                            ) from None
+                            if refresh_error.code in {
+                                "authentication_required",
+                                "token_refresh_rejected",
+                            }:
+                                raise CodexHTTPError(
+                                    exc.status_code,
+                                    "Codex login expired and could not be renewed. Sign in again.",
+                                ) from None
+                            raise
                     raise
                 return LLMResponse(
                     content=content,
@@ -219,7 +225,14 @@ async def _request_codex(
 
 
 def _prompt_cache_key(messages: list[dict[str, Any]]) -> str:
-    raw = json.dumps(messages, ensure_ascii=True, sort_keys=True)
+    # Routing affinity must survive ordinary history growth. The system prefix
+    # identifies reusable instructions; the provider still verifies all tokens.
+    prefix = []
+    for message in messages:
+        if message.get("role") != "system":
+            break
+        prefix.append({"role": "system", "content": message.get("content")})
+    raw = json.dumps(prefix, ensure_ascii=True, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 

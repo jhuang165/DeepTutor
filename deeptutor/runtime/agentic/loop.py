@@ -30,7 +30,10 @@ from typing import Any, Protocol
 
 from deeptutor.runtime.agentic.labeled_step import LabeledStepResult, run_labeled_step
 from deeptutor.runtime.agentic.labels import LABEL_UNKNOWN, find_inline_labels
-from deeptutor.runtime.agentic.messages import assistant_message_with_tool_calls
+from deeptutor.runtime.agentic.messages import (
+    assistant_message,
+    assistant_message_with_tool_calls,
+)
 from deeptutor.runtime.agentic.tool_dispatch import DispatchOutcome
 from deeptutor.runtime.agentic.usage import UsageTracker
 from deeptutor.runtime.stream_bus import StreamBus
@@ -170,6 +173,39 @@ class LoopHost(Protocol):
         return None
 
 
+def _with_transient_model_messages(
+    messages: list[dict[str, Any]], transient: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Place model-only images after their tool result without mutating history."""
+    if not transient:
+        return messages
+    anchored: dict[str, list[dict[str, Any]]] = {}
+    for item in transient:
+        tool_call_id = item.get("_after_tool_call_id")
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            continue
+        anchored.setdefault(tool_call_id, []).append({"role": "user", "content": item["content"]})
+    request_messages: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        request_messages.append(message)
+        if message.get("role") == "tool":
+            pending.extend(anchored.pop(str(message.get("tool_call_id") or ""), []))
+            # Providers require all replies to one assistant tool-call batch
+            # before another user message. Inject images after the batch.
+            if index + 1 == len(messages) or messages[index + 1].get("role") != "tool":
+                request_messages.extend(pending)
+                pending.clear()
+    return request_messages
+
+
+def _transient_image_count(message: dict[str, Any]) -> int:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return 0
+    return sum(1 for part in content if isinstance(part, dict) and part.get("type") == "image_url")
+
+
 async def run_agentic_loop(
     *,
     initial_messages: list[dict[str, Any]],
@@ -209,6 +245,11 @@ async def run_agentic_loop(
     iterations don't spawn empty "Reasoning…" cards.
     """
     messages = initial_messages
+    # Retrieved image bytes are request-local. They must never enter the
+    # durable conversation (where a synthetic user message would be persisted
+    # and displayed as if the person authored it).
+    transient_model_messages: list[dict[str, Any]] = []
+    max_transient_images = 2
     aggregated_sources: list[dict[str, Any]] = []
     final_text = ""
     final_label_seen = ""
@@ -217,7 +258,9 @@ async def run_agentic_loop(
     max_iter = max(1, max_iterations)
 
     for iteration in range(max_iter):
-        await host.guard_context_window(messages)
+        await host.guard_context_window(
+            _with_transient_model_messages(messages, transient_model_messages)
+        )
         before_iteration = getattr(host, "before_iteration", None)
         if before_iteration is not None:
             await before_iteration(
@@ -226,11 +269,12 @@ async def run_agentic_loop(
                 max_iterations=max_iter,
             )
         iter_meta, final_meta = host.build_iteration_trace_meta(iteration)
+        request_messages = _with_transient_model_messages(messages, transient_model_messages)
 
         step = await run_labeled_step(
             client=client,
             model=model,
-            messages=messages,
+            messages=request_messages,
             completion_kwargs=completion_kwargs,
             tool_schemas=tool_schemas,
             allowed_labels=protocol.allowed,
@@ -259,7 +303,7 @@ async def run_agentic_loop(
             )
             _append_repair_messages(
                 messages=messages,
-                iteration_text=step.text,
+                step=step,
                 violation=violation,
                 host=host,
             )
@@ -279,7 +323,7 @@ async def run_agentic_loop(
                     )
                     _append_repair_messages(
                         messages=messages,
-                        iteration_text=step.text,
+                        step=step,
                         violation=violation,
                         host=host,
                     )
@@ -295,13 +339,30 @@ async def run_agentic_loop(
             break
 
         if protocol.tool_label is not None and step.label == protocol.tool_label:
-            messages.append(assistant_message_with_tool_calls(step.text, step.tool_calls))
+            # The reasoning rides along. A thinking model's provider requires
+            # the round's own reasoning on the assistant turn that issued the
+            # tool calls, and this loop used to drop it — so the second round
+            # of any DeepSeek thinking turn was rejected outright.
+            messages.append(
+                assistant_message_with_tool_calls(
+                    step.text,
+                    step.tool_calls,
+                    reasoning_content=step.reasoning_content or None,
+                    thinking_blocks=list(step.thinking_blocks) or None,
+                )
+            )
             outcome = await host.dispatch_tools(
                 iteration=iteration,
                 tool_calls=step.tool_calls,
             )
             aggregated_sources.extend(outcome.sources)
             messages.extend(outcome.tool_messages)
+            transient_model_messages.extend(outcome.model_messages)
+            while (
+                sum(_transient_image_count(item) for item in transient_model_messages)
+                > max_transient_images
+            ):
+                transient_model_messages.pop(0)
             if outcome.pause:
                 resumed = await host.resolve_pause(outcome)
                 if not resumed:
@@ -324,7 +385,13 @@ async def run_agentic_loop(
             if step.label in protocol.final and step.text and not stream_body_live:
                 await host.emit_final(step.text, final_meta)
             if step.text:
-                messages.append({"role": "assistant", "content": step.text})
+                messages.append(
+                    assistant_message(
+                        step.text,
+                        reasoning_content=step.reasoning_content or None,
+                        thinking_blocks=list(step.thinking_blocks) or None,
+                    )
+                )
             # Optional hook for capabilities that attach side-effects to
             # intermediate labels (e.g. research's ``APPEND`` mutates the
             # topic queue). When the hook returns a non-empty string we
@@ -348,7 +415,7 @@ async def run_agentic_loop(
         )
         _append_repair_messages(
             messages=messages,
-            iteration_text=step.text,
+            step=step,
             violation="unknown_action",
             host=host,
         )
@@ -419,17 +486,30 @@ _REPAIR_PREVIEW_CHARS = 500
 def _append_repair_messages(
     *,
     messages: list[dict[str, Any]],
-    iteration_text: str,
+    step: LabeledStepResult,
     violation: str,
     host: LoopHost,
 ) -> None:
     """Preserve the model's unlabeled draft as assistant context, then add
-    a correction prompt that tells the next iteration what to do."""
-    clipped = str(iteration_text or "").strip()
-    if clipped:
+    a correction prompt that tells the next iteration what to do.
+
+    Takes the whole step rather than its text so the round's reasoning travels
+    with the draft: a repair round is still a round, and a thinking model's
+    provider rejects a history that lost it.
+    """
+    clipped = str(step.text or "").strip()
+    if clipped or step.reasoning_content or step.thinking_blocks:
         if len(clipped) > _REPAIR_PREVIEW_CHARS:
             clipped = clipped[:_REPAIR_PREVIEW_CHARS].rstrip() + "\n...[truncated]"
-        messages.append({"role": "assistant", "content": clipped})
+        # A reasoning-only response has no visible draft, but it still
+        # produced an assistant turn whose provider state belongs in history.
+        messages.append(
+            assistant_message(
+                clipped,
+                reasoning_content=step.reasoning_content or None,
+                thinking_blocks=list(step.thinking_blocks) or None,
+            )
+        )
     messages.append({"role": "user", "content": host.protocol_repair_message(violation)})
 
 

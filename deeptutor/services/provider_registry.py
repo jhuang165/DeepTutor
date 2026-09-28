@@ -44,8 +44,9 @@ class ProviderSpec:
     supports_prompt_caching: bool = False
     supports_stream_options: bool = True
     model_overrides: tuple[tuple[str, dict[str, Any]], ...] = ()
-    # Bare model ids too short or generic for substring-based vendor detection.
-    exact_model_ids: tuple[str, ...] = ()
+    # Bare model-id families too short or generic for substring-based vendor
+    # detection. See ``_matches_model_family`` for what a family covers.
+    model_id_families: tuple[str, ...] = ()
     is_oauth: bool = False
     is_direct: bool = False
     thinking_style: str = ""
@@ -154,6 +155,7 @@ PROVIDER_ALIASES = {
     "novita_ai": "novita",
     "orca_router": "orcarouter",
     "orca-router": "orcarouter",
+    "cheaper_inference": "cheaperinference",
 }
 
 
@@ -166,6 +168,19 @@ def canonical_provider_name(name: str | None) -> str | None:
         return None
     key = to_snake(key.replace("-", "_"))
     return PROVIDER_ALIASES.get(key, key)
+
+
+# These Claude families reject explicit temperature and use adaptive thinking.
+# Keep one family list for direct Anthropic calls and OpenAI-compatible gateways.
+# Older Opus/Sonnet families still accept temperature and budget-token thinking.
+ANTHROPIC_EFFORT_BASED_FAMILIES: tuple[str, ...] = (
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-fable-5",
+    "claude-mythos-5",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +290,26 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="https://api.atlascloud.ai/v1",
     ),
     ProviderSpec(
+        name="unifically",
+        keywords=("unifically",),
+        env_key="UNIFICALLY_API_KEY",
+        display_name="Unifically",
+        backend="openai_compat",
+        is_gateway=True,
+        detect_by_base_keyword="unifically",
+        default_api_base="https://api.unifically.com/v1",
+    ),
+    ProviderSpec(
+        name="cheaperinference",
+        keywords=("cheaperinference",),
+        env_key="CHEAPER_INFERENCE_API_KEY",
+        display_name="Cheaper Inference",
+        backend="openai_compat",
+        is_gateway=True,
+        detect_by_base_keyword="cheaperinference",
+        default_api_base="https://api.cheaperinference.com/v1",
+    ),
+    ProviderSpec(
         name="volcengine",
         keywords=("volcengine", "volces", "ark"),
         env_key="OPENAI_API_KEY",
@@ -328,6 +363,11 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         backend="anthropic",
         default_api_base="https://api.anthropic.com/v1",
         supports_prompt_caching=True,
+        # This model rule also applies when Claude is reached through a
+        # generic OpenAI-compatible binding or gateway.
+        model_overrides=tuple(
+            (family, {"temperature": None}) for family in ANTHROPIC_EFFORT_BASED_FAMILIES
+        ),
     ),
     ProviderSpec(
         name="openai",
@@ -420,12 +460,13 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         # Moonshot's own recommendation. The tunable moonshot-v1-* series does
         # not contain "kimi" and keeps the caller's temperature. The Kimi
         # coding endpoint (api.kimi.com/coding/v1) addresses these models by
-        # bare ids ("k3", ...) without the "kimi-" prefix, so match those too.
+        # bare ids ("k3", "k3-256k", ...) without the "kimi-" prefix, so
+        # match the whole family too.
         model_overrides=(
             ("kimi", {"temperature": None}),
-            ("=k3", {"temperature": None}),
+            ("^k3", {"temperature": None}),
         ),
-        exact_model_ids=("k3",),
+        model_id_families=("k3",),
     ),
     # MiniMax runs two separate platforms: global (platform.minimax.io /
     # api.minimax.io) and mainland China (platform.minimaxi.com /
@@ -692,7 +733,7 @@ def find_by_model(model: str | None) -> ProviderSpec | None:
         if model_prefix and normalized_prefix == spec.name:
             return spec
     for spec in standard_specs:
-        if model_lower in spec.exact_model_ids:
+        if any(_matches_model_family(family, model_lower) for family in spec.model_id_families):
             return spec
     for spec in standard_specs:
         if any(
@@ -702,14 +743,30 @@ def find_by_model(model: str | None) -> ProviderSpec | None:
     return None
 
 
+def _matches_model_family(family: str, model_lower: str) -> bool:
+    """Whether *model_lower* is the bare id ``family`` or a variant of it.
+
+    A vendor ships a family under one short id plus siblings distinguished by
+    a dash suffix — ``k3`` alongside ``k3-256k``. Enumerating each sibling is
+    how #1227 happened: ``k3`` had a rule, ``k3-256k`` shipped later, missed
+    it, and got exactly the HTTP 400 the rule exists to prevent. Naming the
+    family covers the siblings that do not exist yet, while a short id still
+    cannot capture an unrelated one — ``sk3``, ``k30`` and ``k3x`` are all
+    different models, and none of them is in this family.
+    """
+    return model_lower == family or model_lower.startswith(f"{family}-")
+
+
 def _matching_overrides(spec: ProviderSpec, model_lower: str) -> dict[str, Any]:
     for pattern, overrides in spec.model_overrides:
-        # ``=name`` is an exact bare model id. Most historical patterns are
-        # vendor-family substrings, but a short id such as ``k3`` must not also
-        # match unrelated ids like ``sk3`` or ``k30``.
-        if (pattern.startswith("=") and model_lower == pattern[1:]) or (
-            not pattern.startswith("=") and pattern in model_lower
-        ):
+        # ``^name`` is a bare model-id family; every other pattern is a
+        # vendor-family substring.
+        matched = (
+            _matches_model_family(pattern[1:], model_lower)
+            if pattern.startswith("^")
+            else pattern in model_lower
+        )
+        if matched:
             return dict(overrides)
     return {}
 
