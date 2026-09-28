@@ -5,6 +5,7 @@ PathService - centralized runtime storage layout for ``data/user``.
 Runtime data is constrained to:
 
 data/user/
+├── .runtime/
 ├── chat_history.db
 ├── logs/
 ├── settings/
@@ -19,7 +20,7 @@ data/user/
         ├── deep_question/
         ├── deep_research/
         ├── math_animator/
-        └── _detached_code_execution/
+        └── _detached_exec/
 """
 
 from pathlib import Path
@@ -35,7 +36,7 @@ AgentModule = Literal[
     "question",
     "research",
     "co-writer",
-    "run_code_workspace",
+    "exec_workspace",
     "logs",
     "math_animator",
 ]
@@ -46,7 +47,7 @@ ChatWorkspaceFeature = Literal[
     "deep_question",
     "deep_research",
     "math_animator",
-    "_detached_code_execution",
+    "_detached_exec",
 ]
 
 WorkspaceFeature = Literal[
@@ -77,7 +78,7 @@ class PathService:
         "research": ("chat", "deep_research"),
         "math_animator": ("chat", "math_animator"),
         "co-writer": ("co-writer", None),
-        "run_code_workspace": ("chat", "_detached_code_execution"),
+        "exec_workspace": ("chat", "_detached_exec"),
     }
     _PRIVATE_SUFFIXES = {".json", ".sqlite", ".db", ".md", ".yaml", ".yml", ".py", ".log"}
 
@@ -158,11 +159,25 @@ class PathService:
 
         if not candidate.is_file():
             return None
-        if candidate.suffix.lower() in self._PRIVATE_SUFFIXES:
+        # Markdown is a valid generated artifact (for example, an exec tool
+        # may write a report.md). Keep the private-suffix guard for settings,
+        # source, and runtime files, but let the explicit public-output
+        # allowlist below decide whether a .md artifact is readable.
+        if candidate.suffix.lower() in self._PRIVATE_SUFFIXES - {".md"}:
             return None
 
         parts = relative.parts
         if parts[:3] == ("workspace", "co-writer", "audio"):
+            return candidate
+
+        # Content-workspace runtimes write chat outputs beneath their selected
+        # workspace. Partner execution scopes therefore materialize the legacy
+        # chat shapes as ``workspace/outputs/chat/<session>/<turn>/<kind>/...``.
+        if (
+            len(parts) >= 6
+            and parts[:3] == ("workspace", "outputs", "chat")
+            and parts[5] in {"exec", "media", "cli"}
+        ):
             return candidate
 
         if (
@@ -196,7 +211,7 @@ class PathService:
         if len(parts) >= 5 and parts[:3] == ("workspace", "chat", "chat") and parts[4] == "cli":
             return candidate
 
-        if len(parts) >= 4 and parts[:3] == ("workspace", "chat", "_detached_code_execution"):
+        if len(parts) >= 4 and parts[:3] == ("workspace", "chat", "_detached_exec"):
             return candidate
 
         return None
@@ -209,6 +224,11 @@ class PathService:
 
     def get_settings_dir(self) -> Path:
         return self._user_data_dir / "settings"
+
+    def get_runtime_state_dir(self) -> Path:
+        """Private state for active runs, never part of a content workspace."""
+
+        return self._user_data_dir / ".runtime"
 
     def get_settings_file(self, name: str) -> Path:
         if "." not in name:
@@ -244,7 +264,7 @@ class PathService:
             "deep_question",
             "deep_research",
             "math_animator",
-            "_detached_code_execution",
+            "_detached_exec",
         }:
             return self.get_chat_feature_dir(cast(ChatWorkspaceFeature, feature))
         if feature in {"memory", "notebook", "co-writer", "book"}:
@@ -422,8 +442,8 @@ class PathService:
         (root / "assets").mkdir(parents=True, exist_ok=True)
         return root
 
-    def get_run_code_workspace_dir(self) -> Path:
-        return self.get_chat_feature_dir("_detached_code_execution")
+    def get_exec_workspace_dir(self) -> Path:
+        return self.get_chat_feature_dir("_detached_exec")
 
     def get_logs_dir(self) -> Path:
         return self.get_user_root() / "logs"
@@ -456,9 +476,13 @@ class PathService:
         path = self.get_settings_dir()
         return ensure_private_directory(path)
 
+    def ensure_runtime_state_dir(self) -> Path:
+        return ensure_private_directory(self.get_runtime_state_dir())
+
     def ensure_all_directories(self) -> None:
         ensure_private_directory(self.get_user_root())
         self.ensure_settings_dir()
+        self.ensure_runtime_state_dir()
         self.ensure_workspace_dir()
         self.ensure_memory_dir()
         self.ensure_notebook_dir()
@@ -473,7 +497,7 @@ class PathService:
                 "deep_question",
                 "deep_research",
                 "math_animator",
-                "_detached_code_execution",
+                "_detached_exec",
             ),
         ):
             self.get_chat_feature_dir(chat_feature).mkdir(parents=True, exist_ok=True)
@@ -483,18 +507,11 @@ class PathService:
 
 
 def get_path_service() -> PathService:
-    try:
-        from deeptutor.multi_user.paths import get_current_path_service
+    from deeptutor.multi_user.paths import get_current_path_service
 
-        return get_current_path_service()
-    except Exception:
-        import logging as _logging
-
-        _logging.getLogger(__name__).warning(
-            "get_path_service() fell back to default instance; multi-user path resolution failed",
-            exc_info=True,
-        )
-        return PathService.get_instance()
+    # Resolution failure is an error, never permission to read the admin's
+    # data. This also prevents an invalid workspace silently falling back.
+    return get_current_path_service()
 
 
 __all__ = [

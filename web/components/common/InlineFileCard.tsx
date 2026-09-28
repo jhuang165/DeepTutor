@@ -1,6 +1,7 @@
 "use client";
 
 import { createContext, useContext, useMemo, type ReactNode } from "react";
+import { fromMarkdown } from "mdast-util-from-markdown";
 
 import type { MessageAttachment } from "@/features/chat/ChatStateAdapter";
 import { docIconFor } from "@/lib/doc-attachments";
@@ -53,6 +54,19 @@ export function extractStreamedArtifacts(
     if (ev.type !== "tool_result") continue;
     const meta = (ev.metadata ?? {}) as {
       tool_metadata?: {
+        workspace_items?: Array<{
+          workspace_id?: string;
+          workspace_item_id?: string;
+          relative_path?: string;
+          filename?: string;
+          url?: string;
+          mime_type?: string;
+          size_bytes?: number;
+          sha256?: string;
+          title?: string;
+          caption?: string;
+          generated?: boolean;
+        }>;
         artifacts?: Array<{
           filename?: string;
           url?: string;
@@ -61,6 +75,26 @@ export function extractStreamedArtifacts(
         }>;
       };
     };
+    const workspaceItems = meta.tool_metadata?.workspace_items ?? [];
+    for (const item of workspaceItems) {
+      if (!item?.url || !item.workspace_item_id) continue;
+      out.push({
+        type: item.mime_type?.startsWith("image/") ? "image" : "document",
+        filename: item.filename,
+        url: item.url,
+        mime_type: item.mime_type,
+        size_bytes: item.size_bytes,
+        generated: item.generated ?? true,
+        origin: "workspace",
+        workspace_id: item.workspace_id,
+        workspace_item_id: item.workspace_item_id,
+        relative_path: item.relative_path,
+        sha256: item.sha256,
+        title: item.title,
+        caption: item.caption,
+      });
+    }
+    if (workspaceItems.length) continue;
     for (const a of meta.tool_metadata?.artifacts ?? []) {
       if (!a?.url) continue;
       out.push({
@@ -80,7 +114,9 @@ export function mergeGeneratedFiles(
   attachments: MessageAttachment[],
   events?: StreamEvent[],
 ): MessageAttachment[] {
-  const persisted = attachments.filter((a) => a.generated);
+  const persisted = attachments.filter(
+    (a) => a.generated || a.origin === "workspace",
+  );
   const seen = new Set(persisted.map((a) => a.url).filter(Boolean));
   const merged = [...persisted];
   for (const a of extractStreamedArtifacts(events)) {
@@ -138,9 +174,13 @@ export function makeFileLinkRemarkPlugin(files: MessageAttachment[]) {
   const entries: Array<{ needle: string; name: string }> = [];
   const seen = new Set<string>();
   for (const file of files) {
-    const name = file.filename;
+    const name =
+      file.origin === "workspace" ? file.relative_path : file.filename;
     if (!name) continue;
-    const variants = new Set([name, name.replace(/[_-]+/g, " ")]);
+    const variants =
+      file.origin === "workspace"
+        ? new Set([name, `./${name}`])
+        : new Set([name, name.replace(/[_-]+/g, " ")]);
     for (const needle of variants) {
       const key = `${needle}\u0000${name}`;
       if (needle && !seen.has(key)) {
@@ -153,27 +193,47 @@ export function makeFileLinkRemarkPlugin(files: MessageAttachment[]) {
   // Prefer the most specific (longest) needle when several could match.
   entries.sort((a, b) => b.needle.length - a.needle.length);
 
-  // Surface → real filename, for resolving a link the model wrote itself
-  // (e.g. `[Agentic_RAG_Guide.pdf](Agentic_RAG_Guide.pdf)`): match the link's
-  // url basename or its label against a known filename.
-  const surfaceToName = new Map<string, string>();
-  const addSurface = (surface: string, name: string) => {
-    for (const key of [surface.trim(), surface.trim().toLowerCase()]) {
-      if (key && !surfaceToName.has(key)) surfaceToName.set(key, name);
+  // Resolve model-written links against published attachments. Full paths win;
+  // filenames and presentation titles are accepted only when unique within
+  // this message. The model may mistype a directory even when the file was
+  // published correctly, so never navigate to that untrusted relative path.
+  const exactPaths = new Map<string, string>();
+  const aliases = new Map<string, string | null>();
+  const surfaceKeys = (surface: string) =>
+    new Set([surface.trim(), surface.trim().toLowerCase()]);
+  const addExactPath = (surface: string, name: string) => {
+    for (const key of surfaceKeys(surface)) {
+      if (key) exactPaths.set(key, name);
+    }
+  };
+  const addAlias = (surface: string, name: string) => {
+    for (const key of surfaceKeys(surface)) {
+      if (!key) continue;
+      const previous = aliases.get(key);
+      if (previous === undefined) aliases.set(key, name);
+      else if (previous !== name) aliases.set(key, null);
     }
   };
   const baseName = (s: string) => s.split(/[\\/]/).pop() ?? s;
   for (const file of files) {
-    const name = file.filename;
-    if (!name) continue;
-    addSurface(name, name);
-    addSurface(name.replace(/[_-]+/g, " "), name);
-    addSurface(baseName(name), name);
+    const target =
+      file.origin === "workspace" ? file.relative_path : file.filename;
+    if (!target) continue;
+    addExactPath(target, target);
+    addExactPath(`./${target}`, target);
+    addAlias(baseName(target), target);
+    if (file.origin === "workspace") {
+      if (file.title) addAlias(file.title, target);
+    } else {
+      addAlias(target.replace(/[_-]+/g, " "), target);
+    }
   }
   const lookupSurface = (s: string): string | undefined =>
-    surfaceToName.get(s) ??
-    surfaceToName.get(s.trim()) ??
-    surfaceToName.get(s.trim().toLowerCase());
+    exactPaths.get(s.trim()) ??
+    exactPaths.get(s.trim().toLowerCase()) ??
+    aliases.get(s.trim()) ??
+    aliases.get(s.trim().toLowerCase()) ??
+    undefined;
 
   const linkLabel = (node: Record<string, unknown>): string => {
     const parts: string[] = [];
@@ -196,8 +256,20 @@ export function makeFileLinkRemarkPlugin(files: MessageAttachment[]) {
   ): string | undefined => {
     const url = typeof node.url === "string" ? node.url : "";
     if (url.startsWith(ATTACHMENT_HREF_PREFIX)) return undefined; // already ours
+    // Only model-written relative paths may be repaired by a filename or
+    // label. An external URL can share a basename with a generated file.
+    if (/^[a-z][a-z\d+.-]*:/i.test(url) || url.startsWith("//")) {
+      return undefined;
+    }
+    if (url.startsWith("#") || url.startsWith("?")) return undefined;
+    if (url.startsWith("/")) {
+      const file = files.find((item) => item.url === decode(url));
+      return file?.origin === "workspace" ? file.relative_path : file?.filename;
+    }
     return (
-      lookupSurface(decode(baseName(url))) ?? lookupSurface(linkLabel(node))
+      lookupSurface(decode(url)) ??
+      lookupSurface(decode(baseName(url))) ??
+      lookupSurface(linkLabel(node))
     );
   };
 
@@ -244,10 +316,11 @@ export function makeFileLinkRemarkPlugin(files: MessageAttachment[]) {
     for (const child of children) {
       if (child.type === "text" && typeof child.value === "string") {
         out.push(...splitText(child.value));
-      } else if (child.type === "link") {
+      } else if (child.type === "link" || child.type === "image") {
         // The model often writes the file as a link itself, e.g.
-        // `[name.pdf](name.pdf)` — a broken relative href that would navigate.
-        // Redirect it to the file instead. Don't recurse (keep its label).
+        // `[name.pdf](name.pdf)` or `![chart](outputs/.../chart.png)` — a
+        // broken relative target that would navigate. Redirect it to the
+        // published snapshot instead. Don't recurse (keep its label/alt).
         const real = linkTargetFile(child);
         if (real) {
           child.url = `${ATTACHMENT_HREF_PREFIX}${encodeURIComponent(real)}`;
@@ -262,6 +335,39 @@ export function makeFileLinkRemarkPlugin(files: MessageAttachment[]) {
   };
 
   return () => (tree: Record<string, unknown>) => visit(tree);
+}
+
+/** Files with no visible inline link in the rendered Markdown. Reuse the
+ * renderer's remark transform so code examples never hide a download card. */
+export function unlinkedGeneratedFiles(
+  content: string,
+  files: MessageAttachment[],
+): MessageAttachment[] {
+  if (!files.length) return [];
+  const tree = fromMarkdown(content) as unknown as Record<string, unknown>;
+  makeFileLinkRemarkPlugin(files)?.()(tree);
+  const linked = new Set<string>();
+  const visit = (node: Record<string, unknown>): void => {
+    if (node.type === "link" || node.type === "image") {
+      const name = parseAttachmentHref(node.url as string | undefined);
+      if (name) {
+        const matching = files.filter(
+          (file) =>
+            (file.origin === "workspace" ? file.relative_path : file.filename) ===
+            name,
+        );
+        if (matching.length === 1 && matching[0].url) {
+          linked.add(matching[0].url);
+        }
+      }
+      return;
+    }
+    for (const child of (node.children as Record<string, unknown>[] | undefined) ?? []) {
+      visit(child);
+    }
+  };
+  visit(tree);
+  return files.filter((file) => !file.url || !linked.has(file.url));
 }
 
 // ---------------------------------------------------------------------------
@@ -310,16 +416,20 @@ export function InlineFileCardProvider({
     const lower = new Map<string, MessageAttachment>();
     const base = new Map<string, MessageAttachment>();
     for (const file of files) {
-      const name = file.filename;
+      const name =
+        file.origin === "workspace" ? file.relative_path : file.filename;
       if (!name) continue;
       if (!exact.has(name)) exact.set(name, file);
       if (!lower.has(norm(name))) lower.set(norm(name), file);
-      if (!base.has(norm(basename(name)))) base.set(norm(basename(name)), file);
+      if (file.origin !== "workspace") {
+        if (!base.has(norm(basename(name)))) base.set(norm(basename(name)), file);
+      }
     }
-    const resolve = (name: string): MessageAttachment | undefined =>
-      exact.get(name) ??
-      lower.get(norm(name)) ??
-      base.get(norm(basename(name)));
+    const resolve = (name: string): MessageAttachment | undefined => {
+      const direct = exact.get(name) ?? lower.get(norm(name));
+      if (direct) return direct;
+      return base.get(norm(basename(name)));
+    };
     return { files, resolve, onOpen };
   }, [files, onOpen]);
   return (
@@ -358,6 +468,51 @@ export function InlineFileCard({
     >
       <Icon className={`h-[14px] w-[14px] shrink-0 ${spec.tint}`} />
       <span className="truncate">{filename}</span>
+    </button>
+  );
+}
+
+/** Render a Markdown image that points at a published workspace item.
+ *
+ * The model only knows the item's relative workspace path. The remark plugin
+ * rewrites that path to ``attachment:...`` and this component resolves the
+ * opaque, authenticated snapshot URL. Clicking the image uses the same
+ * Preview Drawer action as a file card, so Markdown never gets a raw internal
+ * download URL.
+ */
+export function InlineWorkspaceImage({
+  name,
+  alt,
+  className,
+}: {
+  name: string;
+  alt?: string;
+  className?: string;
+}) {
+  const ctx = useContext(InlineFileCardContext);
+  const attachment = ctx?.resolve(name);
+  if (!attachment?.url) return <>{alt || attachment?.filename || name}</>;
+
+  const image = (
+    // Authenticated workspace snapshots use opaque runtime URLs, so Next's
+    // build-time image optimizer cannot resolve them.
+    // eslint-disable-next-line @next/next/no-img-element
+    <img
+      src={attachment.url}
+      alt={alt || attachment.title || attachment.filename || name}
+      loading="lazy"
+      className={className}
+    />
+  );
+  if (!ctx?.onOpen) return image;
+  return (
+    <button
+      type="button"
+      onClick={() => ctx.onOpen?.(attachment)}
+      className="inline-block max-w-full cursor-zoom-in text-left"
+      aria-label={`Open ${attachment.filename || name}`}
+    >
+      {image}
     </button>
   );
 }

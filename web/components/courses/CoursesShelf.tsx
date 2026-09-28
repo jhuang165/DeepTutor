@@ -6,6 +6,7 @@ import {
   Archive,
   ArrowRight,
   BookOpen,
+  CircleAlert,
   Layers,
   MessagesSquare,
   Plus,
@@ -36,6 +37,7 @@ export default function CoursesShelf() {
   const [courses, setCourses] = useState<StudyCourse[]>([]);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
 
   useEffect(() => {
@@ -48,6 +50,10 @@ export default function CoursesShelf() {
         if (cancelled) return;
         setCourses(nextCourses);
         setSessions(nextSessions);
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setLoadError(error instanceof Error ? error.message : "");
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -134,6 +140,21 @@ export default function CoursesShelf() {
             />
           ))}
         </div>
+      ) : loadError !== null ? (
+        <div
+          role="alert"
+          className="flex min-h-32 items-center gap-3 rounded-xl border border-[var(--border)] bg-[var(--card)] p-4 text-[12.5px] text-[var(--muted-foreground)]"
+        >
+          <CircleAlert size={16} strokeWidth={1.8} aria-hidden />
+          <span>
+            <span className="block font-medium text-[var(--foreground)]">
+              {t("Courses could not load")}
+            </span>
+            <span className="mt-1 block leading-relaxed">
+              {loadError || t("Courses could not load")}
+            </span>
+          </span>
+        </div>
       ) : (
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           {active.map((course) => (
@@ -167,16 +188,16 @@ export default function CoursesShelf() {
                 <div className="mt-3 flex items-center gap-3 text-[10.5px] text-[var(--muted-foreground)]/75">
                   <span
                     className="inline-flex items-center gap-1"
-                    title={t("Materials")}
                   >
                     <Layers size={11} strokeWidth={1.8} />
+                    {t("Materials")}
                     {course.resources.length}
                   </span>
                   <span
                     className="inline-flex items-center gap-1"
-                    title={t("Conversations")}
                   >
                     <MessagesSquare size={11} strokeWidth={1.8} />
+                    {t("Conversations")}
                     {counts.get(course.id) ?? 0}
                   </span>
                   {lastActive.has(course.id) ? (

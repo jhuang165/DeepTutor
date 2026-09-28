@@ -6,6 +6,7 @@ import asyncio
 from contextlib import asynccontextmanager, suppress
 import html
 import json
+import re
 import time
 import uuid
 
@@ -22,9 +23,15 @@ from deeptutor.learning.models import (
     LearningProgress,
     MasteryInteraction,
     MasteryTopic,
+    ReadingLearningRecords,
     TopicMetadata,
     TopicSource,
     TopicSourceKind,
+)
+from deeptutor.learning.objective_relations import (
+    ObjectiveRelationError,
+    RelationRefs,
+    normalize_refs,
 )
 from deeptutor.learning.service import LearningService
 from deeptutor.learning.storage import LearningStore
@@ -34,6 +41,12 @@ from deeptutor.utils.json_parser import parse_json_response
 
 router = APIRouter()
 ws_router = APIRouter()
+
+#: Signals that change what a topic screen shows without advancing the path's
+#: revision, so they are forwarded even when the durable event tail is empty.
+#: A conversation joining or leaving the topic changes its session list; a
+#: deleted topic changes everything.
+_SCREEN_ONLY_SIGNALS = frozenset({"session.bound", "session.released", "topic.deleted"})
 
 
 def get_learning_service() -> LearningService:
@@ -153,14 +166,41 @@ async def _exclusive_path_mutation(book_id: str):
 # ── Request models ───────────────────────────────────────────────────────────
 
 
+class KnowledgePointInput(BaseModel):
+    id: str | None = None
+    client_ref: str = ""
+    name: str = Field(..., min_length=1, max_length=200)
+    type: KnowledgeType = KnowledgeType.CONCEPT
+    module_id: str = ""
+    prerequisite_ids: list[str] = Field(default_factory=list)
+    prerequisite_refs: list[str] = Field(default_factory=list)
+    topic_source_ids: list[str] = Field(default_factory=list)
+    topic_source_refs: list[str] = Field(default_factory=list)
+
+
+class ModuleInput(BaseModel):
+    id: str | None = None
+    name: str = Field(..., min_length=1, max_length=200)
+    order: int | None = None
+    objective: str = Field(default="", max_length=300)
+    pass_threshold: float = 0.7
+    knowledge_points: list[KnowledgePointInput] = Field(default_factory=list)
+
+
 class InitModulesRequest(BaseModel):
-    modules: list[dict]  # list of LearningModule-compatible dicts
+    modules: list[ModuleInput]
 
 
 class RenamePathRequest(BaseModel):
     """An empty name is a valid request: it restores the derived display name."""
 
     name: str = ""
+
+
+class ReviewSettingsRequest(BaseModel):
+    """A per-path recall target; higher values schedule shorter intervals."""
+
+    desired_retention: float = Field(..., ge=0.7, le=0.99, allow_inf_nan=False)
 
 
 class ChapterImport(BaseModel):
@@ -174,6 +214,7 @@ class ImportFromBookRequest(BaseModel):
 
 class TopicSourceRequest(BaseModel):
     id: str = ""
+    client_ref: str = ""
     kind: TopicSourceKind
     source_id: str = ""
     label: str = Field(..., min_length=1, max_length=200)
@@ -193,16 +234,22 @@ class GenerateTopicDraftRequest(BaseModel):
 
 
 class ConfirmTopicRequest(GenerateTopicDraftRequest):
+    # The learner states a goal and picks materials; naming is not one more
+    # box to fill before they can start. An empty name is derived from the
+    # goal below, and stays renameable afterwards.
+    name: str = Field(default="", max_length=120)
     description: str = Field(default="", max_length=500)
     emoji: str = Field(default="🧭", max_length=16)
+    # Optional: a mastery goal is created *before* it has an outline, and the
+    # outline is then designed with the tutor in the goal's first session.
     # The region ceiling is the generator's, not a second opinion: a route
     # over a fourteen-document library legitimately has more than eight, and
     # this used to reject the very draft the server had just produced.
-    modules: list[dict] = Field(..., min_length=1, max_length=MAX_MODULE_LIMIT)
+    modules: list[ModuleInput] = Field(default_factory=list, max_length=MAX_MODULE_LIMIT)
 
 
 class EditTopicMapRequest(BaseModel):
-    modules: list[dict] = Field(..., min_length=1, max_length=MAX_MODULE_LIMIT)
+    modules: list[ModuleInput] = Field(..., min_length=1, max_length=MAX_MODULE_LIMIT)
 
 
 class LearnerOverrideRequest(BaseModel):
@@ -226,7 +273,50 @@ def _topic_sources(items: list[TopicSourceRequest]) -> list[TopicSource]:
     ]
 
 
-def _review_queue(progress) -> list[dict]:
+def _topic_source_aliases(
+    items: list[TopicSourceRequest], sources: list[TopicSource]
+) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for item, source in zip(items, sources, strict=True):
+        alias = item.client_ref.strip()
+        if alias:
+            if alias in aliases and aliases[alias] != source.id:
+                raise ObjectiveRelationError(f"Source reference {alias!r} is ambiguous")
+            aliases[alias] = source.id
+    return aliases
+
+
+def _module_payloads(modules: list[ModuleInput]) -> list[dict]:
+    return [module.model_dump(mode="json") for module in modules]
+
+
+def _relation_refs(
+    inputs: list[ModuleInput], modules: list[LearningModule]
+) -> dict[str, RelationRefs]:
+    refs: dict[str, RelationRefs] = {}
+    for input_module, module in zip(inputs, modules, strict=True):
+        for input_point, point in zip(
+            input_module.knowledge_points, module.knowledge_points, strict=True
+        ):
+            refs[point.id] = RelationRefs(
+                client_ref=input_point.client_ref.strip(),
+                prerequisite_refs=normalize_refs(
+                    [*input_point.prerequisite_refs, *input_point.prerequisite_ids],
+                    label="prerequisite",
+                ),
+                topic_source_refs=normalize_refs(
+                    [*input_point.topic_source_refs, *input_point.topic_source_ids],
+                    label="topic source",
+                ),
+            )
+    return refs
+
+
+def _review_queue(progress, *, now: float | None = None) -> list[dict]:
+    from deeptutor.learning.scheduler import SpacedRepetitionScheduler, review_sort_key
+
+    moment = time.time() if now is None else now
+    scheduler = SpacedRepetitionScheduler()
     names = {kp.id: kp.name for module in progress.modules for kp in module.knowledge_points}
     return [
         {
@@ -236,10 +326,38 @@ def _review_queue(progress) -> list[dict]:
             "knowledge_type": task.knowledge_type.value,
             "due_at": task.due_at,
             "priority": task.priority,
-            "due": task.due_at <= time.time(),
+            "due": task.due_at <= moment,
+            "forgetting_risk": round(task.forgetting_risk, 3),
+            "reason": task.reason,
+            "evidence_source": task.evidence_source,
+            "evidence_id": task.evidence_id,
+            "stability": round(task.state.stability, 3),
+            "retrievability": round(scheduler.retrievability(task.state, now=moment), 3),
+            "desired_retention": task.state.desired_retention,
+            "lapse_count": task.state.lapse_count,
+            "recent_failure": bool(
+                task.state.consecutive_wrong
+                or any(
+                    error.knowledge_point_id == task.knowledge_point_id
+                    and error.status in ("active", "retrying")
+                    for error in progress.error_records
+                )
+            ),
         }
-        for task in sorted(progress.review_queue, key=lambda item: item.due_at)
+        for task in sorted(
+            progress.review_queue, key=lambda item: review_sort_key(item, now=moment)
+        )
     ]
+
+
+def _read_projection(progress, *, now: float | None = None):
+    """Build a fresh queue for reads without persisting hydration or time drift."""
+    from deeptutor.learning.scheduler import SpacedRepetitionScheduler
+
+    projected = progress.model_copy(deep=True)
+    moment = time.time() if now is None else now
+    projected.review_queue = SpacedRepetitionScheduler().build_review_queue(projected, now=moment)
+    return projected
 
 
 def _next_step_payload(store: LearningStore, path_id: str, progress) -> dict:
@@ -266,15 +384,32 @@ def _topic_payload_from_snapshot(
     active_interaction: MasteryInteraction | None,
 ) -> dict:
     path_id = progress.book_id
+    moment = time.time()
+    projected = _read_projection(progress, now=moment)
     return {
         "path_id": path_id,
         "name": learning_policy.path_display_name(progress),
         "metadata": topic.metadata.model_dump(mode="json"),
         "sources": [source.model_dump(mode="json") for source in topic.sources],
         "path_revision": progress.version,
-        "next": _next_step_from_interaction(progress, active_interaction),
-        "map": learning_policy.map_summary(progress),
-        "reviews": _review_queue(progress),
+        "next": learning_policy.next_objective(
+            projected,
+            now=moment,
+            pending_session_id=active_interaction.session_id if active_interaction else "",
+        ).to_dict(),
+        "map": learning_policy.map_summary(projected, now=moment),
+        "reviews": _review_queue(projected, now=moment),
+        "review_settings": {
+            "desired_retention": progress.desired_retention,
+            "scope": "path",
+        },
+        # Who this goal is for. Null until intake has happened, which is also
+        # what the dashboard renders as "not asked yet".
+        "learner_profile": (
+            progress.learner_profile.model_dump(mode="json")
+            if progress.learner_profile is not None and not progress.learner_profile.is_empty()
+            else None
+        ),
         "session_count": session_count,
         "updated_at": progress.updated_at,
     }
@@ -343,6 +478,14 @@ async def list_topic_index():
     }
 
 
+@router.get("/reading/records", response_model=ReadingLearningRecords)
+async def list_reading_learning_records() -> ReadingLearningRecords:
+    """Reading progress and extension activity for the current account."""
+
+    store = LearningStore()
+    return await asyncio.to_thread(store.list_reading_records)
+
+
 @router.post("/topics/draft")
 async def generate_topic_route(body: GenerateTopicDraftRequest):
     from deeptutor.learning.topic_generation import TopicGenerationError, generate_topic_draft
@@ -359,6 +502,27 @@ async def generate_topic_route(body: GenerateTopicDraftRequest):
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+#: Longest provisional name derived from a goal. A goal is a paragraph; a name
+#: has to fit on a card.
+_PROVISIONAL_NAME_CHARS = 32
+
+
+def _provisional_name(goal: str) -> str:
+    """A card-sized name for a goal the learner did not name themselves.
+
+    The goal's own opening clause, because that is the sentence they wrote and
+    the one they will recognise in a list. Anything is better than the storage
+    id, which is what an unnamed path displayed before goals could be created
+    without an outline to borrow a module name from.
+    """
+    head = re.split(r"[\n。.!?！？;；]", str(goal or "").strip(), maxsplit=1)[0].strip()
+    if not head:
+        return ""
+    if len(head) <= _PROVISIONAL_NAME_CHARS:
+        return head
+    return head[:_PROVISIONAL_NAME_CHARS].rstrip() + "…"
+
+
 @router.post("/topics")
 async def create_topic(body: ConfirmTopicRequest):
     from deeptutor.learning.topic_generation import (
@@ -367,13 +531,19 @@ async def create_topic(body: ConfirmTopicRequest):
     )
 
     path_id = f"topic_{uuid.uuid4().hex}"
-    try:
-        modules = materialize_modules(
-            path_id, body.modules, strict=True, module_limit=MAX_MODULE_LIMIT
-        )
-    except TopicGenerationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    modules = []
+    if body.modules:
+        try:
+            modules = materialize_modules(
+                path_id,
+                _module_payloads(body.modules),
+                strict=True,
+                module_limit=MAX_MODULE_LIMIT,
+            )
+        except TopicGenerationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     sources = _topic_sources(body.sources)
+    source_aliases = _topic_source_aliases(body.sources, sources)
     store = LearningStore()
     metadata = TopicMetadata(
         path_id=path_id,
@@ -382,14 +552,31 @@ async def create_topic(body: ConfirmTopicRequest):
         emoji=body.emoji.strip() or "🧭",
         map_seed=store._default_map_seed(path_id),
     )
-    progress = await asyncio.to_thread(
-        LearningService(store).create_topic,
-        path_id,
-        name=body.name,
-        modules=modules,
-        metadata=metadata,
-        sources=sources,
-    )
+    # A name is a different object from a goal: the goal is the sentence they
+    # wrote, the name is the label they will recognise in a list months later.
+    # The task model writes it; the truncated goal stands in when it cannot.
+    resolved_name = body.name.strip()
+    if not resolved_name:
+        from deeptutor.learning.topic_naming import suggest_topic_name
+
+        resolved_name = await suggest_topic_name(
+            body.goal,
+            source_labels=[source.label for source in sources],
+        ) or _provisional_name(body.goal)
+    service = LearningService(store)
+    try:
+        progress = await asyncio.to_thread(
+            service.create_topic,
+            path_id,
+            name=resolved_name,
+            modules=modules,
+            metadata=metadata,
+            sources=sources,
+            relation_refs=_relation_refs(body.modules, modules),
+            source_aliases=source_aliases,
+        )
+    except ObjectiveRelationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     payload = await asyncio.to_thread(_topic_payload, store, path_id)
     payload["path_revision"] = progress.version
     return payload
@@ -398,6 +585,45 @@ async def create_topic(body: ConfirmTopicRequest):
 @router.get("/topics/{path_id}")
 async def get_topic(path_id: str):
     _validate_book_id(path_id)
+    return await asyncio.to_thread(_topic_payload, LearningStore(), path_id)
+
+
+@router.get("/topics/{path_id}/review-settings")
+async def get_review_settings(path_id: str):
+    _validate_book_id(path_id)
+    progress = await asyncio.to_thread(LearningStore().load, path_id)
+    if progress is None:
+        raise HTTPException(status_code=404, detail="Mastery topic not found")
+    return {"desired_retention": progress.desired_retention, "scope": "path"}
+
+
+@router.put("/topics/{path_id}/review-settings")
+async def update_review_settings(path_id: str, body: ReviewSettingsRequest):
+    _validate_book_id(path_id)
+    if not await asyncio.to_thread(LearningStore().exists, path_id):
+        raise HTTPException(status_code=404, detail="Mastery topic not found")
+    async with _exclusive_path_mutation(path_id):
+        store = LearningStore()
+
+        def update(tx):
+            from deeptutor.learning.scheduler import SpacedRepetitionScheduler
+
+            if tx.progress.desired_retention == body.desired_retention and all(
+                state.desired_retention == body.desired_retention
+                for state in tx.progress.repetition_states.values()
+            ):
+                return
+            SpacedRepetitionScheduler().set_desired_retention(tx.progress, body.desired_retention)
+            tx.touch()
+            tx.emit(
+                "review.settings_changed",
+                {"desired_retention": tx.progress.desired_retention},
+            )
+
+        try:
+            await asyncio.to_thread(store.mutate, path_id, update)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Mastery topic not found") from exc
     return await asyncio.to_thread(_topic_payload, LearningStore(), path_id)
 
 
@@ -421,7 +647,7 @@ async def edit_topic_map(path_id: str, body: EditTopicMapRequest):
         try:
             modules = materialize_modules(
                 path_id,
-                body.modules,
+                _module_payloads(body.modules),
                 strict=True,
                 existing_module_ids=existing_module_ids,
                 existing_objective_ids=existing_objective_ids,
@@ -429,12 +655,16 @@ async def edit_topic_map(path_id: str, body: EditTopicMapRequest):
             )
         except TopicGenerationError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        await asyncio.to_thread(
-            LearningService(store).replace_modules_for_path,
-            path_id,
-            modules,
-            event_type="topic.map_edited",
-        )
+        try:
+            await asyncio.to_thread(
+                LearningService(store).replace_modules_for_path,
+                path_id,
+                modules,
+                event_type="topic.map_edited",
+                relation_refs=_relation_refs(body.modules, modules),
+            )
+        except ObjectiveRelationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     return await asyncio.to_thread(_topic_payload, LearningStore(), path_id)
 
 
@@ -482,6 +712,47 @@ async def list_topic_sessions(path_id: str):
         "path_id": path_id,
         "sessions": await topic_sessions(path_id, store=learning_store),
     }
+
+
+class SetSessionModeRequest(BaseModel):
+    mode: str = Field(..., max_length=32)
+
+
+@router.put("/topics/{path_id}/sessions/{session_id}/mode")
+async def set_session_mode(path_id: str, session_id: str, body: SetSessionModeRequest):
+    """Change what a conversation is doing, from the learner's own buttons.
+
+    The same move the tutor makes with ``mastery_mode``, through the same
+    admission rule — so pressing "Study" on a goal with no outline is refused
+    with the sentence the tutor would have said, rather than silently putting
+    the conversation somewhere its tools will then refuse to work.
+    """
+    from deeptutor.capabilities.mastery.mode import MODES, admission_error, normalize_mode
+
+    _validate_book_id(path_id)
+    requested = str(body.mode or "").strip().lower()
+    if requested not in MODES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"mode must be one of: {', '.join(MODES)}",
+        )
+
+    store = LearningStore()
+    progress = await asyncio.to_thread(store.load, path_id)
+    has_outline = progress is not None and any(
+        module.knowledge_points for module in progress.modules
+    )
+    refusal = admission_error(requested, has_outline=has_outline)
+    if refusal:
+        raise HTTPException(status_code=409, detail=refusal)
+
+    from deeptutor.services.session import get_session_store
+
+    session_store = get_session_store()
+    if await session_store.get_session(session_id) is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    await session_store.update_session_preferences(session_id, {"mastery_session_mode": requested})
+    return {"session_id": session_id, "mode": normalize_mode(requested)}
 
 
 @router.get("/topics/{path_id}/ask-hint")
@@ -541,10 +812,7 @@ async def mastery_topic_websocket(ws: WebSocket) -> None:
             )
             if events:
                 cursor = max(cursor, max(event.revision for event in events))
-            elif signal.revision <= cursor and signal.reason not in {
-                "session.bound",
-                "topic.deleted",
-            }:
+            elif signal.revision <= cursor and signal.reason not in _SCREEN_ONLY_SIGNALS:
                 continue
             cursor = max(cursor, signal.revision)
             await send(
@@ -644,12 +912,67 @@ async def get_progress_map(book_id: str):
     _validate_book_id(book_id)
     service = get_learning_service()
     progress = service.get_or_create(book_id)
+    moment = time.time()
+    progress = _read_projection(progress, now=moment)
     return {
         "book_id": book_id,
         "name": learning_policy.path_display_name(progress),
         "path_revision": progress.version,
-        "next": _next_step_payload(service.store, book_id, progress),
-        "map": learning_policy.map_summary(progress),
+        "next": learning_policy.next_objective(progress, now=moment).to_dict(),
+        "map": learning_policy.map_summary(progress, now=moment),
+    }
+
+
+@router.get("/progress/{book_id}/board")
+async def get_progress_board(book_id: str):
+    """The visual learning board: every knowledge point as a card, enriched
+    with its next review time and a deterministic grid position derived from
+    the module order. A read-only projection of the same mastery data the
+    tutor and the map view use."""
+    _validate_book_id(book_id)
+    service = get_learning_service()
+    progress = service.get_or_create(book_id)
+    moment = time.time()
+    progress = _read_projection(progress, now=moment)
+    summary = learning_policy.map_summary(progress, now=moment)
+
+    due_by_kp = {task.knowledge_point_id: task.due_at for task in progress.review_queue}
+
+    cards: list[dict] = []
+    modules: list[dict] = []
+    for module in summary["modules"]:
+        module_cards: list[dict] = []
+        for index, kp in enumerate(module["knowledge_points"]):
+            card = {
+                "id": kp["id"],
+                "name": kp["name"],
+                "type": kp["type"],
+                "module_id": module["id"],
+                "module_name": module["name"],
+                "status": kp["status"],
+                "mastery_level": kp["mastery"],
+                "next_review_at": due_by_kp.get(kp["id"]),
+                "position": {"column": module["order"], "row": index},
+            }
+            cards.append(card)
+            module_cards.append(card)
+        modules.append(
+            {
+                "id": module["id"],
+                "name": module["name"],
+                "order": module["order"],
+                "mastered": module["mastered"],
+                "total": module["total"],
+                "cards": module_cards,
+            }
+        )
+
+    return {
+        "book_id": book_id,
+        "name": summary["name"],
+        "path_revision": progress.version,
+        "cards": cards,
+        "modules": modules,
     }
 
 
@@ -663,10 +986,14 @@ async def get_objective_report(book_id: str, kp_id: str):
     """
     _validate_book_id(book_id)
     store = LearningStore()
-    progress = await asyncio.to_thread(store.load, book_id)
+    progress, evidence, evidence_count = await asyncio.to_thread(
+        store.load_with_learning_evidence, book_id, kp_id, limit=20
+    )
     if progress is None:
         raise HTTPException(status_code=404, detail="Progress not found")
-    report = learning_policy.objective_report(progress, kp_id)
+    moment = time.time()
+    progress = _read_projection(progress, now=moment)
+    report = learning_policy.objective_report(progress, kp_id, now=moment)
     if report is None:
         raise HTTPException(status_code=404, detail="Objective not found")
 
@@ -679,6 +1006,8 @@ async def get_objective_report(book_id: str, kp_id: str):
     }
     for attempt in report["attempts"]:
         attempt["prompt"] = prompts.get(attempt["question_id"], "")
+    report["evidence"] = [item.model_dump(mode="json") for item in evidence]
+    report["evidence_count"] = evidence_count
     return {"book_id": book_id, "path_revision": progress.version, "objective": report}
 
 
@@ -715,7 +1044,7 @@ async def get_progress_sessions(book_id: str):
 @router.post("/progress/{book_id}/init-modules")
 async def init_modules(book_id: str, body: InitModulesRequest):
     _validate_book_id(book_id)
-    modules = _parse_modules(body.modules)
+    modules = _parse_modules(_module_payloads(body.modules))
     _validate_runnable_modules(modules)
     async with _exclusive_path_mutation(book_id):
         service = get_learning_service()

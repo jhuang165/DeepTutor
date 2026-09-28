@@ -5,7 +5,10 @@ from types import SimpleNamespace
 import pytest
 
 from deeptutor.agents.chat.agentic_pipeline import AgenticChatPipeline
-from deeptutor.agents.chat.prompt_blocks import ChatPromptAssembler
+from deeptutor.agents.loop.prompt_blocks import ChatPromptAssembler
+from deeptutor.capabilities.mastery.pipeline import MasteryLoopPipeline
+from deeptutor.core.context import UnifiedContext
+from deeptutor.runtime.agentic.tool_dispatch import MAX_PARALLEL_TOOL_CALLS
 
 
 @pytest.fixture(autouse=True)
@@ -18,10 +21,31 @@ def _fake_llm_config(monkeypatch: pytest.MonkeyPatch) -> None:
         api_version=None,
     )
     monkeypatch.setattr(
-        "deeptutor.agents.chat.agentic_pipeline.get_llm_config",
+        "deeptutor.agents.loop.pipeline.get_llm_config",
         lambda: cfg,
     )
     monkeypatch.setattr("deeptutor.agents.base_agent.get_llm_config", lambda: cfg)
+
+
+@pytest.mark.parametrize("language", ["en", "zh"])
+@pytest.mark.parametrize("mode", ["chat", "immersive_reading", "mastery_path"])
+def test_tool_call_limit_reaches_each_loop_prompt(language: str, mode: str) -> None:
+    pipeline_type = MasteryLoopPipeline if mode == "mastery_path" else AgenticChatPipeline
+    pipeline = pipeline_type(language=language)
+    context = UnifiedContext(active_capability=mode)
+    prompt = pipeline._build_system_prompt([], context)
+
+    assert MAX_PARALLEL_TOOL_CALLS == 15
+    assert prompt.count("## tool_call_policy\n") == 1
+    assert "{limit}" not in prompt
+    if language == "zh":
+        assert "最多请求 15 次工具调用" in prompt
+        assert "不是用户整个请求的总次数" in prompt
+        assert "超出上限的调用不会执行" in prompt
+    else:
+        assert "at most 15 tool calls" in prompt
+        assert "not a total for the user's request" in prompt
+        assert "Calls beyond the limit\nare not executed" in prompt
 
 
 def test_agentic_chat_final_prompt_uses_selected_language(
@@ -32,7 +56,7 @@ def test_agentic_chat_final_prompt_uses_selected_language(
             return "- tool"
 
     monkeypatch.setattr(
-        "deeptutor.agents.chat.agentic_pipeline.get_tool_registry",
+        "deeptutor.agents.loop.pipeline.get_tool_registry",
         lambda: FakeRegistry(),
     )
 
@@ -60,7 +84,7 @@ def test_mastery_plugin_system_prompt_uses_localized_fallback(
             return "- tool"
 
     monkeypatch.setattr(
-        "deeptutor.agents.chat.agentic_pipeline.get_tool_registry",
+        "deeptutor.agents.loop.pipeline.get_tool_registry",
         lambda: FakeRegistry(),
     )
 
@@ -71,9 +95,9 @@ def test_mastery_plugin_system_prompt_uses_localized_fallback(
     en_prompt = AgenticChatPipeline(language="en")._build_system_prompt([], ctx)
 
     assert "## mastery_tutor" in zh_prompt
-    assert "精通导师模式" in zh_prompt
+    assert "掌握式导师" in zh_prompt
     assert "## mastery_tutor" in en_prompt
-    assert "Mastery Tutor mode" in en_prompt
+    assert "mastery tutor" in en_prompt
 
 
 def test_ask_questions_plugin_system_prompt_uses_localized_fallback(
@@ -84,7 +108,7 @@ def test_ask_questions_plugin_system_prompt_uses_localized_fallback(
             return "- tool"
 
     monkeypatch.setattr(
-        "deeptutor.agents.chat.agentic_pipeline.get_tool_registry",
+        "deeptutor.agents.loop.pipeline.get_tool_registry",
         lambda: FakeRegistry(),
     )
 

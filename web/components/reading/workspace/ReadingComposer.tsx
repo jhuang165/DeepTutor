@@ -13,20 +13,30 @@
  */
 
 import { useCallback } from "react";
+import { X } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 import StandaloneComposer, {
   type StandaloneComposerSubmission,
 } from "@/components/chat/home/StandaloneComposer";
 import { useChatStateAdapter } from "@/features/chat/ChatStateAdapter";
+import { useChatWorkspaces } from "@/hooks/useChatWorkspaces";
+import { useComposerResources } from "@/hooks/useComposerResources";
 import { useWorkspaceChatActions } from "@/hooks/useWorkspaceChatActions";
-import { hasPendingAskUser } from "@/lib/ask-user-state";
+import {
+  hasPendingAskUser,
+  REPLY_SENT_AS_NEW_MESSAGE,
+} from "@/lib/ask-user-state";
+import { notify } from "@/lib/notifications";
 import { setReadingViewport } from "@/lib/reading-turn-state";
+import Tooltip from "@/shared/ui/Tooltip";
 
 export function ReadingComposer({
   placeholder,
   placeholderCompletion,
   selection,
   onSent,
+  onRemoveSelection,
   linkedSessionIds,
   prefillInputRef,
 }: {
@@ -34,8 +44,10 @@ export function ReadingComposer({
   /** Offered question the composer lets the learner take with Tab. */
   placeholderCompletion?: string;
   selection: { quote: string; locator: number } | null;
-  /** Clears the pending-selection banner once the message is on its way. */
+  /** Clears the pending selection once the message is on its way. */
   onSent: () => void;
+  /** The learner dropped the quoted passage before sending. */
+  onRemoveSelection: () => void;
   /** Reading-specific "reference these other reading conversations" links. */
   linkedSessionIds: string[];
   /** Lets the reader pane drop a quoted selection's focus into the box. */
@@ -49,9 +61,13 @@ export function ReadingComposer({
     setKBs,
     setLLMSelection,
     setPersonaSelection,
+    setResourceSelection,
   } = useChatStateAdapter();
+  const { workspaces } = useChatWorkspaces();
+  const resourceCatalog = useComposerResources(state.workspaceId, workspaces);
   const { capabilities, activeCapabilityValue, selectCapability } =
     useWorkspaceChatActions();
+  const { t } = useTranslation();
 
   const awaitingUserReply = hasPendingAskUser(
     state.messages[state.messages.length - 1]?.events,
@@ -59,46 +75,54 @@ export function ReadingComposer({
 
   const handleSubmit = useCallback(
     (submission: StandaloneComposerSubmission) => {
-      // A turn paused on a question: what the user typed is their answer,
-      // not a new message. See page.tsx's handleSend for the same routing.
-      if (awaitingUserReply) {
-        if (submission.content.trim()) {
-          submitUserReply({ text: submission.content });
+      const sendAsNewMessage = () => {
+        if (selection) {
+          setReadingViewport({
+            locator: selection.locator,
+            selection: selection.quote,
+          });
         }
+        // The composer's own "@ reference an earlier session" picker and this
+        // surface's persistent linked-conversations list share one wire slot;
+        // union them rather than letting either silently win.
+        const historyReferences = Array.from(
+          new Set([...linkedSessionIds, ...submission.historyReferences]),
+        );
+        sendMessage(
+          submission.content,
+          submission.attachments,
+          // How many times the companion may consult the selected agent this
+          // turn. Absent when no agent is picked, which is the ordinary case.
+          submission.subagentBudget
+            ? {
+                ...(submission.config ?? {}),
+                subagent_consult_budget: submission.subagentBudget,
+              }
+            : submission.config,
+          submission.notebookReferences,
+          historyReferences,
+          { bookReferences: submission.bookReferences },
+          submission.questionNotebookReferences,
+          submission.persona ?? undefined,
+          submission.memoryReferences,
+        );
+        onSent();
+        window.setTimeout(() => setReadingViewport({ selection: "" }), 0);
+      };
+
+      // A turn paused on a question: what the reader typed is their answer,
+      // not a new message. See ChatWorkspace's handleSend for the same routing
+      // — including the fall-through on a refusal, which is what keeps a dead
+      // question from swallowing the text they just wrote.
+      if (awaitingUserReply && submission.content.trim()) {
+        void submitUserReply({ text: submission.content }).then((sent) => {
+          if (sent) return;
+          notify(t(REPLY_SENT_AS_NEW_MESSAGE));
+          sendAsNewMessage();
+        });
         return;
       }
-      if (selection) {
-        setReadingViewport({
-          locator: selection.locator,
-          selection: selection.quote,
-        });
-      }
-      // The composer's own "@ reference an earlier session" picker and this
-      // surface's persistent linked-conversations list share one wire slot;
-      // union them rather than letting either silently win.
-      const historyReferences = Array.from(
-        new Set([...linkedSessionIds, ...submission.historyReferences]),
-      );
-      sendMessage(
-        submission.content,
-        submission.attachments,
-        // How many times the companion may consult the selected agent this
-        // turn. Absent when no agent is picked, which is the ordinary case.
-        submission.subagentBudget
-          ? {
-              ...(submission.config ?? {}),
-              subagent_consult_budget: submission.subagentBudget,
-            }
-          : submission.config,
-        submission.notebookReferences,
-        historyReferences,
-        { bookReferences: submission.bookReferences },
-        submission.questionNotebookReferences,
-        submission.persona ?? undefined,
-        submission.memoryReferences,
-      );
-      onSent();
-      window.setTimeout(() => setReadingViewport({ selection: "" }), 0);
+      sendAsNewMessage();
     },
     [
       awaitingUserReply,
@@ -107,6 +131,7 @@ export function ReadingComposer({
       selection,
       sendMessage,
       submitUserReply,
+      t,
     ],
   );
 
@@ -125,11 +150,55 @@ export function ReadingComposer({
       onLLMSelectionChange={setLLMSelection}
       personaSelection={state.personaSelection}
       onPersonaSelectionChange={setPersonaSelection}
+      resourceCatalog={resourceCatalog}
+      resourceSelection={state.resourceSelection}
+      onResourceSelectionChange={setResourceSelection}
       onSubmit={handleSubmit}
       onCancelStreaming={cancelStreamingTurn}
       inputPlaceholder={placeholder}
       inputPlaceholderCompletion={placeholderCompletion}
+      inputHeader={
+        selection ? (
+          <QuotedPassage
+            quote={selection.quote}
+            onRemove={onRemoveSelection}
+          />
+        ) : null
+      }
       prefillInputRef={prefillInputRef}
     />
+  );
+}
+
+/**
+ * The passage the next message is about, inside the box it will be sent from.
+ *
+ * Drawn the way the sent bubble draws it (a rule and the words, no card), so
+ * the quote looks the same before and after it goes.
+ */
+function QuotedPassage({
+  quote,
+  onRemove,
+}: {
+  quote: string;
+  onRemove: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="flex items-start gap-1.5 px-4 pt-3">
+      <p className="line-clamp-2 min-w-0 flex-1 border-l-2 border-[color-mix(in_srgb,var(--primary)_45%,transparent)] pl-2.5 text-[12.5px] leading-relaxed text-[var(--muted-foreground)]">
+        {quote}
+      </p>
+      <Tooltip label={t("Remove quoted passage")}>
+        <button
+          type="button"
+          aria-label={t("Remove quoted passage")}
+          onClick={onRemove}
+          className="-mr-1 inline-flex size-6 shrink-0 items-center justify-center rounded-md text-[var(--muted-foreground)] transition hover:bg-[var(--muted)] hover:text-[var(--foreground)]"
+        >
+          <X size={12} />
+        </button>
+      </Tooltip>
+    </div>
   );
 }

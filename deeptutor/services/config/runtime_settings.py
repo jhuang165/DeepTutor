@@ -29,7 +29,7 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     "disable_ssl_verify": False,
     "chat_attachment_dir": "",
     # Enable the restricted-subprocess code-execution sandbox (the `exec` /
-    # `code_execution` tools the office skills — docx/pdf/pptx/xlsx — run on).
+    # unified `exec` tool the office skills — docx/pdf/pptx/xlsx — run on).
     # Default on so document generation works out of the box across all
     # deployment shapes; a stronger backend (runner sidecar / bwrap) still
     # takes precedence when available. Set false to disable host-side exec.
@@ -45,6 +45,9 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
         "enabled": True,
         "blocked_domains": [],
         "trusted_domains": [],
+        "content_filtering": True,
+        "use_educational_trusted_domains": False,
+        "use_moderation": False,
     },
     # Chat attachment policy. Size caps gate what the composer accepts and
     # what the turn runtime / partner upload endpoints extract; the char
@@ -57,6 +60,11 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     "chat_attachment_max_total_mb": 25,
     "chat_attachment_max_chars_per_doc": 200_000,
     "chat_attachment_max_chars_total": 150_000,
+    # Images the manifest cannot carry across turns are re-attached by the
+    # turn executor instead (#1438). This bounds how many of a conversation's
+    # earlier images ride along on every later turn — a re-sent payload, so
+    # it is a policy like the caps above, not an LLM budget.
+    "chat_prior_image_reinject_max": 4,
 }
 
 # Clamp bounds for the chat attachment knobs. The MB ceilings are deliberately
@@ -65,6 +73,9 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
 CHAT_ATTACHMENT_MAX_FILE_MB_RANGE = (1, 1024)
 CHAT_ATTACHMENT_MAX_TOTAL_MB_RANGE = (1, 2048)
 CHAT_ATTACHMENT_CHARS_RANGE = (10_000, 5_000_000)
+# Zero is a real choice here — it turns prior-image re-injection off for a
+# deployment whose model or bandwidth cannot afford it.
+CHAT_PRIOR_IMAGE_REINJECT_RANGE = (0, 20)
 
 DEFAULT_AUTH_SETTINGS: dict[str, Any] = {
     "version": 1,
@@ -73,6 +84,7 @@ DEFAULT_AUTH_SETTINGS: dict[str, Any] = {
     "password_hash": "",
     "token_expire_hours": 24,
     "cookie_secure": False,
+    "private_login_hosts": [],
 }
 
 DEFAULT_INTEGRATIONS_SETTINGS: dict[str, Any] = {
@@ -232,6 +244,9 @@ _MINERU_ENGINE_KEYS = frozenset(_DEFAULT_MINERU_ENGINE.keys())
 DEFAULT_DOCUMENT_PARSING_SETTINGS: dict[str, Any] = {
     "version": 2,
     "engine": _DEFAULT_DOCUMENT_PARSING_ENGINE,
+    # Caption embedded figures with a vision model at ingest, so a text-only
+    # model reading the material can still describe its images.
+    "image_caption": False,
     "engines": {
         DOCUMENT_PARSING_ENGINE_TEXT_ONLY: _DEFAULT_TEXT_ONLY_ENGINE,
         DOCUMENT_PARSING_ENGINE_MINERU: _DEFAULT_MINERU_ENGINE,
@@ -339,12 +354,15 @@ DEFAULT_GRAPHRAG_SETTINGS: dict[str, Any] = {
 # Stable catalog references let LightRAG use a dedicated LLM while the global
 # active chat model remains unchanged for ordinary chat.
 DEFAULT_LIGHTRAG_SETTINGS: dict[str, Any] = {
-    "version": 1,
+    "version": 2,
     "top_k": 60,
     "response_type": "Multiple Paragraphs",
     "max_concurrent_files": 1,
     "llm_model_max_async": 4,
     "entity_extract_max_gleaning": 1,
+    # Maps to LightRAG's ``default_llm_timeout`` (seconds). LightRAG derives its
+    # worker execution cap as 2x this value, so 240 -> a 480s per-call ceiling.
+    "llm_timeout": 240,
     "llm_profile_id": "",
     "llm_model_id": "",
 }
@@ -359,6 +377,14 @@ DEFAULT_LIGHTRAG_SERVER_SETTINGS: dict[str, Any] = {
 }
 
 IGNORE_PROCESS_OVERRIDES_ENV = "DEEPTUTOR_IGNORE_PROCESS_ENV_OVERRIDES"
+
+# Names of the variables a parent DeepTutor process rendered out of the settings
+# files, handed to its children so they can tell "our own launcher derived this
+# from system.json" from "an operator set this in the deployment". Without it the
+# launcher's export looks like a deployment override to the backend and the file
+# can never win again: toggling "check for updates" wrote system.json while the
+# live API kept answering with the value captured at startup (#1536).
+SETTINGS_DERIVED_ENV_KEYS = "DEEPTUTOR_SETTINGS_DERIVED_ENV_KEYS"
 TRUTHY = {"1", "true", "yes", "on"}
 FALSY = {"0", "false", "no", "off"}
 
@@ -413,6 +439,17 @@ def _string(value: Any) -> str:
     return "" if value is None else str(value).strip()
 
 
+def _host_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [item for raw in value if (item := _string(raw).lower().rstrip("."))]
+    raw = _string(value)
+    return [
+        item
+        for piece in raw.replace(";", ",").split(",")
+        if (item := piece.strip().lower().rstrip("."))
+    ]
+
+
 def _string_or_list(value: Any) -> str | list[str]:
     if isinstance(value, list):
         return [item for raw in value if (item := _string(raw))]
@@ -439,6 +476,10 @@ class RuntimeSettingsService:
         self.process_env = process_env if process_env is not None else os.environ
         self._external_process_keys: set[str] = set()
         self._internal_exported_values: dict[str, str] = {}
+        derived = self.process_env.get(SETTINGS_DERIVED_ENV_KEYS, "") or ""
+        self._settings_derived_keys: frozenset[str] = frozenset(
+            part.strip() for part in derived.split(",") if part.strip()
+        )
 
     @classmethod
     def get_instance(
@@ -610,6 +651,20 @@ class RuntimeSettingsService:
         return payload
 
     def load_lightrag(self) -> dict[str, Any]:
+        path = self.path_for("lightrag")
+        if path.exists():
+            # Invalid role settings must never become legacy chat-model fallback.
+            with path.open(encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if not isinstance(loaded, dict):
+                raise ValueError("LightRAG settings must be an object.")
+            # Existing files without a version predate independent roles.
+            normalized = self._normalize_lightrag(
+                {**DEFAULT_LIGHTRAG_SETTINGS, "version": 1, **loaded}
+            )
+            if normalized != loaded:
+                _atomic_write_json(path, normalized)
+            return normalized
         return self._load_or_create("lightrag", DEFAULT_LIGHTRAG_SETTINGS, self._normalize_lightrag)
 
     def save_lightrag(self, settings: dict[str, Any]) -> dict[str, Any]:
@@ -663,6 +718,7 @@ class RuntimeSettingsService:
             "AUTH_PASSWORD_HASH": auth["password_hash"],
             "AUTH_TOKEN_EXPIRE_HOURS": str(auth["token_expire_hours"]),
             "AUTH_COOKIE_SECURE": _bool_env(auth["cookie_secure"]),
+            "AUTH_PRIVATE_LOGIN_HOSTS": ",".join(auth["private_login_hosts"]),
             "NEXT_PUBLIC_AUTH_ENABLED": _bool_env(auth["enabled"]),
             # Consumed server-side by the Next.js middleware (web/proxy.ts) at
             # request time — NOT inlined into the browser bundle. The proxy
@@ -694,8 +750,14 @@ class RuntimeSettingsService:
     def export_environment(self, *, overwrite: bool = True) -> dict[str, str]:
         env = self.render_environment()
         for key, value in env.items():
-            current = os.environ.get(key)
-            if current and self._internal_exported_values.get(key) != current:
+            # Read through the same view the override policy reads, so "the
+            # operator set this" means one thing in both places.
+            current = self.process_env.get(key)
+            if (
+                current
+                and key not in self._settings_derived_keys
+                and self._internal_exported_values.get(key) != current
+            ):
                 self._external_process_keys.add(key)
             if overwrite or key not in os.environ:
                 os.environ[key] = value
@@ -703,8 +765,23 @@ class RuntimeSettingsService:
                     self._internal_exported_values[key] = value
         return env
 
+    def settings_derived_keys(self) -> frozenset[str]:
+        """Variables this process exported out of the settings files.
+
+        What a child needs in order to read its inherited environment correctly
+        (see :data:`SETTINGS_DERIVED_ENV_KEYS`). Anything the operator had
+        already set is excluded: there the environment is the authority and the
+        child must keep honouring it, exactly as this process does.
+        """
+        return frozenset(self._internal_exported_values)
+
     def _process_env_value(self, key: str) -> str:
         if self._ignore_process_overrides():
+            return ""
+        if key in self._settings_derived_keys:
+            # A parent DeepTutor process rendered this out of the settings files,
+            # so the files stay in charge and a later save takes effect live
+            # (#1536). An operator-set variable is never on that list.
             return ""
         value = self.process_env.get(key, "")
         if not value:
@@ -794,6 +871,8 @@ class RuntimeSettingsService:
             payload["chat_attachment_max_chars_per_doc"] = value
         if value := self._process_env_value("CHAT_ATTACHMENT_MAX_CHARS_TOTAL"):
             payload["chat_attachment_max_chars_total"] = value
+        if value := self._process_env_value("CHAT_PRIOR_IMAGE_REINJECT_MAX"):
+            payload["chat_prior_image_reinject_max"] = value
         return self._normalize_system(payload)
 
     def _apply_auth_process_overrides(self, settings: dict[str, Any]) -> dict[str, Any]:
@@ -811,6 +890,8 @@ class RuntimeSettingsService:
             payload["token_expire_hours"] = value
         if value := self._process_env_value("AUTH_COOKIE_SECURE"):
             payload["cookie_secure"] = value
+        if value := self._process_env_value("AUTH_PRIVATE_LOGIN_HOSTS"):
+            payload["private_login_hosts"] = value
         return self._normalize_auth(payload)
 
     def _apply_integrations_process_overrides(self, settings: dict[str, Any]) -> dict[str, Any]:
@@ -952,8 +1033,22 @@ class RuntimeSettingsService:
         }
 
     def _normalize_lightrag(self, settings: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "version": 1,
+        from .lightrag_roles import LightRagRoleModels
+
+        version = settings.get("version", 1)
+        if type(version) is not int or version not in {1, 2}:
+            raise ValueError("Unsupported LightRAG settings version.")
+
+        # Missing means a released, legacy setting. Never turn malformed new
+        # configuration back into a legacy model fallback.
+        role_models = settings.get("role_models")
+        roles = (
+            LightRagRoleModels.model_validate(role_models).model_dump()
+            if "role_models" in settings
+            else None
+        )
+        result = {
+            "version": 2 if roles is not None or settings.get("version") == 2 else 1,
             "top_k": _coerce_clamped_int(settings.get("top_k"), 60, 1, 200),
             "response_type": self._normalize_response_type(settings.get("response_type")),
             "max_concurrent_files": _coerce_clamped_int(
@@ -965,9 +1060,13 @@ class RuntimeSettingsService:
             "entity_extract_max_gleaning": _coerce_clamped_int(
                 settings.get("entity_extract_max_gleaning"), 1, 0, 5
             ),
+            "llm_timeout": _coerce_clamped_int(settings.get("llm_timeout"), 240, 60, 3600),
             "llm_profile_id": _string(settings.get("llm_profile_id"))[:128],
             "llm_model_id": _string(settings.get("llm_model_id"))[:128],
         }
+        if roles is not None:
+            result["role_models"] = roles
+        return result
 
     def _normalize_lightrag_server(self, settings: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -1024,7 +1123,12 @@ class RuntimeSettingsService:
         if engine not in _DOCUMENT_PARSING_ENGINES:
             engine = _DEFAULT_DOCUMENT_PARSING_ENGINE
 
-        return {"version": 2, "engine": engine, "engines": engines_out}
+        return {
+            "version": 2,
+            "engine": engine,
+            "image_caption": _coerce_bool(settings.get("image_caption"), False),
+            "engines": engines_out,
+        }
 
     def _normalize_mineru_engine(self, settings: dict[str, Any]) -> dict[str, Any]:
         mode = _string(settings.get("mode")).lower()
@@ -1164,9 +1268,19 @@ class RuntimeSettingsService:
                 "enabled": _coerce_bool(source_filter.get("enabled"), True),
                 "blocked_domains": _string_or_list(source_filter.get("blocked_domains")),
                 "trusted_domains": _string_or_list(source_filter.get("trusted_domains")),
+                "content_filtering": _coerce_bool(source_filter.get("content_filtering"), True),
+                "use_educational_trusted_domains": _coerce_bool(
+                    source_filter.get("use_educational_trusted_domains"), False
+                ),
+                "use_moderation": _coerce_bool(source_filter.get("use_moderation"), False),
             },
             "chat_attachment_max_file_mb": max_file_mb,
             "chat_attachment_max_total_mb": max_total_mb,
+            "chat_prior_image_reinject_max": _coerce_clamped_int(
+                settings.get("chat_prior_image_reinject_max"),
+                DEFAULT_SYSTEM_SETTINGS["chat_prior_image_reinject_max"],
+                *CHAT_PRIOR_IMAGE_REINJECT_RANGE,
+            ),
             "chat_attachment_max_chars_per_doc": _coerce_clamped_int(
                 settings.get("chat_attachment_max_chars_per_doc"),
                 DEFAULT_SYSTEM_SETTINGS["chat_attachment_max_chars_per_doc"],
@@ -1187,6 +1301,7 @@ class RuntimeSettingsService:
             "password_hash": _string(settings.get("password_hash")),
             "token_expire_hours": max(1, _coerce_int(settings.get("token_expire_hours"), 24)),
             "cookie_secure": _coerce_bool(settings.get("cookie_secure"), False),
+            "private_login_hosts": _host_list(settings.get("private_login_hosts")),
         }
 
     def _normalize_integrations(self, settings: dict[str, Any]) -> dict[str, Any]:
@@ -1301,6 +1416,23 @@ def compute_ws_max_size(max_total_bytes: int) -> int:
     return max(_WS_MAX_SIZE_FLOOR, inflated + 8 * 1024 * 1024)
 
 
+def get_prior_image_reinject_limit() -> int:
+    """How many earlier images a later turn re-attaches.
+
+    Read at call time like the attachment policy above, so a deployment can
+    change it without a restart, and 0 turns the behaviour off entirely.
+
+    Resolved with the seeded default rather than by subscript: a system.json
+    written before this key existed is the normal state of every upgraded
+    install, and a missing knob must not take image re-injection down with it.
+    """
+    return _coerce_clamped_int(
+        load_system_settings().get("chat_prior_image_reinject_max"),
+        DEFAULT_SYSTEM_SETTINGS["chat_prior_image_reinject_max"],
+        *CHAT_PRIOR_IMAGE_REINJECT_RANGE,
+    )
+
+
 def get_ws_max_size() -> int:
     """Frame ceiling for the current settings — wire into every uvicorn launch."""
     return compute_ws_max_size(get_chat_attachment_limits().max_total_bytes)
@@ -1384,6 +1516,7 @@ __all__ = [
     "LITEPARSE_IMAGE_MODES",
     "MINERU_MODE_CLOUD",
     "MINERU_MODE_LOCAL",
+    "SETTINGS_DERIVED_ENV_KEYS",
     "ChatAttachmentLimits",
     "RuntimeSettingsService",
     "compute_ws_max_size",

@@ -141,6 +141,25 @@ const nextConfig = {
   // Transpile mermaid and related packages for proper ESM handling
   transpilePackages: ["mermaid"],
 
+  // Compatibility lives here; every rendered link uses learning-routes.ts.
+  async redirects() {
+    return [
+      // The workspace root has one destination; sessions live under /chat.
+      // Kept out of a page component on purpose: a page that only calls
+      // redirect() throws mid-render, and React 19.2's dev performance track
+      // then measures that aborted render with a negative end time — the
+      // "cannot have a negative time stamp" overlay (vercel/next.js#86060).
+      { source: "/", destination: "/chat", permanent: false },
+      { source: "/mastery/:pathId/study", destination: "/learning/mastery/:pathId/sessions", statusCode: 301 },
+      { source: "/mastery/:pathId/study/:sessionId", destination: "/learning/mastery/:pathId/sessions/:sessionId", statusCode: 301 },
+      ...["books", "mastery", "reading", "watching"].map((surface) => ({
+        source: `/${surface}/:path*`,
+        destination: `/learning/${surface}/:path*`,
+        statusCode: 301,
+      })),
+    ];
+  },
+
   // Next.js 16 blocks cross-origin access to /_next/* dev resources (HMR
   // WebSocket, fonts, dev-only scripts) unless the request host is on this
   // allow-list. Without it, browsing http://127.0.0.1:<port>/ against a dev
@@ -166,6 +185,11 @@ const nextConfig = {
   // Webpack configuration (used for production builds - next build)
   webpack: (config) => {
     const path = require("path");
+    config.module.rules.push({
+      test: /locales[/\\]en[/\\]app\.json$/,
+      type: "javascript/auto",
+      use: path.resolve(__dirname, "scripts/compact-locale-loader.cjs"),
+    });
     config.resolve.alias = {
       ...config.resolve.alias,
       cytoscape: path.resolve(

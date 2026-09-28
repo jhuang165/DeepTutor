@@ -57,9 +57,53 @@ def test_tunable_moonshot_series_keeps_the_callers_temperature(model: str) -> No
     assert _payload("moonshot", model)["temperature"] == pytest.approx(0.7)
 
 
-@pytest.mark.parametrize("model", ["gpt-4o", "claude-sonnet-5", "deepseek-chat"])
+@pytest.mark.parametrize(
+    "model", ["gpt-4o", "claude-haiku-4-5-20251001", "claude-3-5-sonnet", "deepseek-chat"]
+)
 def test_unrelated_models_are_untouched(model: str) -> None:
     assert _payload("openai", model)["temperature"] == pytest.approx(0.7)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-mythos-5",
+    ],
+)
+@pytest.mark.parametrize("binding", ["openai", "openrouter", "anthropic", "no-such-provider"])
+def test_claude_effort_families_never_send_temperature(binding: str, model: str) -> None:
+    """The direct and gateway routes share the vendor's model restriction."""
+    assert "temperature" not in _payload(binding, model)
+    assert model_overrides_for(model, find_by_name(binding)) == {"temperature": None}
+
+
+def test_gateway_responses_body_applies_intrinsic_model_overrides() -> None:
+    provider = OpenAICompatProvider(
+        api_key="test-key",
+        api_base="https://openrouter.ai/api/v1",
+        default_model="anthropic/claude-opus-4-7",
+        spec=find_by_name("openrouter"),
+        provider_name="openrouter",
+    )
+
+    def body(model: str) -> dict:
+        return provider._build_responses_body(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+            model=model,
+            max_tokens=256,
+            temperature=0.7,
+            reasoning_effort=None,
+            tool_choice=None,
+        )
+
+    assert "temperature" not in body("anthropic/claude-opus-4-7")
+    assert body("anthropic/claude-opus-4-6")["temperature"] == pytest.approx(0.7)
 
 
 def test_configured_binding_wins_over_the_vendor_fallback() -> None:
@@ -85,10 +129,22 @@ def test_vendor_prefixed_routing_still_finds_the_model() -> None:
     }
 
 
-def test_bare_k3_is_exact_and_does_not_capture_unrelated_short_ids() -> None:
+def test_the_k3_family_covers_its_variants_without_capturing_short_ids() -> None:
+    """One family name, not one rule per released id.
+
+    ``k3-256k`` was added to the Kimi coding endpoint after ``k3`` and got
+    HTTP 400 on every call (#1227), because the rule named the one id that
+    existed when it was written. A sibling that ships tomorrow is covered
+    here; an unrelated short id still is not.
+    """
     moonshot = find_by_name("moonshot")
     assert model_overrides_for("k3", moonshot) == {"temperature": None}
+    assert model_overrides_for("k3-256k", moonshot) == {"temperature": None}
+    assert model_overrides_for("k3-1m", moonshot) == {"temperature": None}
     assert model_overrides_for("sk3", moonshot) == {}
     assert model_overrides_for("k30", moonshot) == {}
+    assert model_overrides_for("k3x", moonshot) == {}
     assert find_by_model("k3") is moonshot
+    assert find_by_model("k3-256k") is moonshot
+    assert find_by_model("k3-1m") is moonshot
     assert find_by_model("sk3") is None

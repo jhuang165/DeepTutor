@@ -54,6 +54,7 @@ def test_temperature_omitted_for_effort_based_models() -> None:
         "claude-sonnet-5",
         "claude-opus-4-7",
         "claude-fable-5",
+        "claude-mythos-5",
     ):
         assert "temperature" not in _kwargs(provider, model), model
 
@@ -154,6 +155,7 @@ def test_effort_based_families_map_real_effort_to_adaptive_thinking() -> None:
         "claude-sonnet-5",
         "claude-opus-4-7",
         "claude-fable-5",
+        "claude-mythos-5",
     ):
         kwargs = _kwargs_with_effort(provider, model, "high")
         assert kwargs["thinking"] == {"type": "adaptive"}, model
@@ -161,11 +163,24 @@ def test_effort_based_families_map_real_effort_to_adaptive_thinking() -> None:
         assert kwargs["max_tokens"] == 1024, model  # no budget headroom inflation
 
 
-def test_effort_based_families_omit_thinking_for_off_sentinels() -> None:
+@pytest.mark.parametrize(
+    "model",
+    [
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-mythos-5",
+    ],
+)
+@pytest.mark.parametrize("effort", ["none", "minimal", "minimum"])
+def test_effort_based_families_omit_thinking_for_off_sentinels(model: str, effort: str) -> None:
     provider = _provider()
-    kwargs = _kwargs_with_effort(provider, "claude-opus-4-8", "minimal")
+    kwargs = _kwargs_with_effort(provider, model, effort)
     assert "thinking" not in kwargs
     assert "temperature" not in kwargs
+    assert "temperature" not in kwargs.get("extra_body", {})
 
 
 def test_older_models_keep_budget_tokens_thinking() -> None:
@@ -211,3 +226,70 @@ def test_off_sentinels_leave_tool_choice_to_the_caller() -> None:
         tool_choice="required",
     )
     assert kwargs["tool_choice"] == {"type": "any"}
+
+
+def _signed_block(signature: str = "sig-1") -> dict[str, Any]:
+    return {"type": "thinking", "thinking": "weighing it", "signature": signature}
+
+
+def test_assistant_blocks_replay_thinking_from_the_message() -> None:
+    """A round still in this turn's working set carries the blocks directly."""
+    blocks = AnthropicProvider._assistant_blocks(
+        {
+            "role": "assistant",
+            "content": "the answer",
+            "thinking_blocks": [_signed_block()],
+        }
+    )
+
+    assert blocks[0] == {
+        "type": "thinking",
+        "thinking": "weighing it",
+        "signature": "sig-1",
+    }
+    assert blocks[1] == {"type": "text", "text": "the answer"}
+
+
+def test_assistant_blocks_replay_thinking_rebuilt_from_history() -> None:
+    """A round rebuilt from history carries them in the private state.
+
+    That is where they are persisted, so reading only the message field meant
+    every reloaded conversation replayed without its signatures.
+    """
+    blocks = AnthropicProvider._assistant_blocks(
+        {
+            "role": "assistant",
+            "content": "the answer",
+            "_provider_response_state": {"thinking_blocks": [_signed_block("sig-2")]},
+        }
+    )
+
+    assert blocks[0]["signature"] == "sig-2"
+
+
+def test_assistant_blocks_prefer_the_live_message_over_history() -> None:
+    blocks = AnthropicProvider._assistant_blocks(
+        {
+            "role": "assistant",
+            "content": "the answer",
+            "thinking_blocks": [_signed_block("live")],
+            "_provider_response_state": {"thinking_blocks": [_signed_block("stale")]},
+        }
+    )
+
+    assert blocks[0]["signature"] == "live"
+
+
+def test_assistant_blocks_omit_unsigned_history_blocks() -> None:
+    """An unsigned replay is rejected by the API, so it is not sent."""
+    blocks = AnthropicProvider._assistant_blocks(
+        {
+            "role": "assistant",
+            "content": "the answer",
+            "_provider_response_state": {
+                "thinking_blocks": [{"type": "thinking", "thinking": "weighing it"}]
+            },
+        }
+    )
+
+    assert all(block.get("type") != "thinking" for block in blocks)

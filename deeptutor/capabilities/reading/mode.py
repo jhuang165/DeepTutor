@@ -4,7 +4,7 @@ There is no bespoke pipeline: the standard agentic chat loop IS the reader. This
 capability only marks the turn and runs that pipeline. Everything specific to
 reading is contributed by the loop capability
 (:class:`deeptutor.capabilities.reading.capability.ReadingCapability`), which
-mounts the five reading tools, binds the open material server-side, injects the
+mounts the reading tools, binds the open material server-side, injects the
 reading playbook and runs the deterministic locate pre-pass.
 
 The split matters for a practical reason: the *mode* is what the user picks in
@@ -47,7 +47,7 @@ class ImmersiveReadingCapability(TurnCapability):
             "page or section behind every claim."
         ),
         stages=["responding"],
-        tools_used=[*READING_TOOL_NAMES, "web_search", "code_execution", "reason"],
+        tools_used=[*READING_TOOL_NAMES, "web_search", "exec", "reason"],
         cli_aliases=["reading", "read"],
     )
 

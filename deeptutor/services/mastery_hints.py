@@ -40,6 +40,7 @@ import logging
 import time
 from typing import Any
 
+from deeptutor.services.prompt.language import is_chinese as _is_zh
 from deeptutor.services.singleflight_cache import AsyncSingleFlightTTLCache
 
 logger = logging.getLogger(__name__)
@@ -234,10 +235,6 @@ _SYSTEM_ZH = """你要写出学习者此刻**可以问导师的一个问题**。
 差："路由是按意图选工具，对吧？"  <- 把答案说出来了"""
 
 
-def _is_zh(language: str) -> bool:
-    return str(language or "en").lower().startswith("zh")
-
-
 def _render(material: _Material, zh: bool) -> str:
     lines: list[str] = []
     if zh:
@@ -325,11 +322,11 @@ async def _generate(path_id: str, session_id: str, key_hint: str) -> AskHint:
 
     try:
         from deeptutor.services.llm import complete
-        from deeptutor.services.model_selection.tasks import task_llm_scope
+        from deeptutor.services.model_selection.tasks import TaskKind, task_llm_scope
 
         # Same call class as titles and starter lines — short, frequent, and
         # nobody asked for it — so it runs on the task model when one is set.
-        with task_llm_scope():
+        with task_llm_scope(TaskKind.MASTERY_ASK_HINT):
             raw = await asyncio.wait_for(
                 complete(
                     prompt=_render(material, zh),

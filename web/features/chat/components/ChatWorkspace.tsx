@@ -1,5 +1,20 @@
 "use client";
 
+import { ResourceReuseContext, useResourceReusePolicy } from "@/components/chat/home/ResourceReuse";
+import { retainedKnowledgeBases } from "@/lib/resource-reuse";
+import { knowledgeBaseRef } from "@/lib/knowledge-helpers";
+import { scopedUrl } from "@/lib/workspace-scope";
+import { WATCHING_HOME, watchingRoute } from "@/lib/learning-routes";
+
+import {
+  WatchingSessionBridge,
+  WatchingSurface,
+} from "@/components/watching/WatchingWorkspace";
+
+import { useChatWorkspaces } from "@/hooks/useChatWorkspaces";
+import { useComposerResources } from "@/hooks/useComposerResources";
+import { useWorkspaceBinding } from "@/hooks/useWorkspaceBinding";
+import { useSearchParams } from "next/navigation";
 import dynamic from "next/dynamic";
 import {
   type KeyboardEvent,
@@ -10,8 +25,10 @@ import {
   useState,
 } from "react";
 import { useChatRouteSession } from "@/features/chat/controllers/useChatRouteSession";
+import { waitForReplyLanguageSave } from "@/features/chat/controllers/reply-language-save";
 
 import {
+  AlertCircle,
   GraduationCap,
   NotebookPen,
   PenLine,
@@ -22,7 +39,6 @@ import type { SelectedRecord } from "@/lib/notebook-selection-types";
 import type { SelectedHistorySession } from "@/components/chat/HistorySessionPicker";
 import type { SelectedQuestionEntry } from "@/components/chat/QuestionBankPicker";
 import ChatComposer from "@/components/chat/home/ChatComposer";
-import type { ContextBudget } from "@/components/chat/home/ContextBudgetChip";
 import { ChatMessageList } from "@/features/chat/messages";
 import { TurnNavigator } from "@/components/chat/home/TurnNavigator";
 import SessionLoadingView from "@/components/chat/home/SessionLoadingView";
@@ -36,10 +52,10 @@ import StarterSuggestions from "@/components/chat/home/StarterSuggestions";
 // render. The heavy renderers inside still load lazily.
 import FilePreviewDrawer from "@/components/chat/preview/FilePreviewDrawer";
 import { buildSessionActivity } from "@/components/chat/home/SessionActivityPanel";
-import Tooltip from "@/components/common/Tooltip";
+import Tooltip from "@/shared/ui/Tooltip";
 import SessionViewerPanel, {
   type SessionViewerPanelHandle,
-} from "@/components/chat/home/SessionViewerPanel";
+} from "@/components/chat/home/LazySessionViewerPanel";
 import {
   QuizFollowupProvider,
   useQuizFollowupController,
@@ -48,20 +64,21 @@ import {
   GeogebraTabProvider,
   useGeogebraTabOpener,
 } from "@/context/GeogebraTabContext";
-import { BookmarkPlus, Download, PanelRight } from "lucide-react";
+import { BookmarkPlus, ChevronRight, Download, FolderOpen, PanelRight } from "lucide-react";
+import Link from "next/link";
 import {
   useChatStateAdapter,
   type MessageAttachment,
   type MessageRequestSnapshot,
 } from "@/features/chat/ChatStateAdapter";
 import { useAppShell } from "@/context/AppShellContext";
+import { readStoredResponseLanguage } from "@/context/app-shell-storage";
+import { RESPONSE_LANGUAGE_OPTIONS } from "@/features/settings/store";
 
-import {
-  WATCHING_ASK_EVENT,
-  WatchingPane,
-} from "@/components/watching/WatchingPane";
+import { WATCHING_ASK_EVENT } from "@/components/watching/WatchingPane";
 import type { FilePreviewSource } from "@/components/chat/preview/previewerFor";
 import type { LLMSelection, StreamEvent } from "@/features/chat/model/protocol";
+import { selectAttachmentProcessing } from "@/features/chat/selectors/attachment-processing";
 import {
   extractBase64FromDataUrl,
   readFileAsDataUrl,
@@ -73,8 +90,15 @@ import {
 } from "@/features/chat/controllers/pending-attachments";
 import { readChatLaunchIntent } from "@/lib/chat-launch-intent";
 import { useAttachmentLimits } from "@/lib/attachment-limits";
-import { hasPendingAskUser } from "@/lib/ask-user-state";
+import {
+  hasPendingAskUser,
+  hasPendingUserCard,
+  REPLY_SENT_AS_NEW_MESSAGE,
+} from "@/lib/ask-user-state";
+import { notify } from "@/lib/notifications";
+import { copyText } from "@/lib/clipboard";
 import { useChatAutoScroll } from "@/hooks/useChatAutoScroll";
+import { useContextBudget } from "@/hooks/useContextBudget";
 import { useMeasuredHeight } from "@/hooks/useMeasuredHeight";
 import { useSetupSync } from "@/hooks/useSetupSync";
 import { listCourses, type StudyCourse } from "@/lib/courses-api";
@@ -228,40 +252,19 @@ interface KnowledgeBase {
 /*  Helpers                                                           */
 /* ------------------------------------------------------------------ */
 
-/**
- * Read the context-window measurement a finished turn attached to its
- * `result` event. Scanned newest-first because one turn can emit several
- * results (a consulted subagent emits its own) and only the chat loop's
- * closing one carries the budget; older backends emit none at all, and the
- * measurement is allowed to degrade to "absent" rather than fail a turn.
- */
-function readContextBudget(
-  events: StreamEvent[] | undefined,
-): ContextBudget | null {
-  if (!events) return null;
-  for (let i = events.length - 1; i >= 0; i -= 1) {
-    const ev = events[i];
-    if (ev.type !== "result") continue;
-    const meta = ev.metadata?.metadata as Record<string, unknown> | undefined;
-    const budget = meta?.context_budget as ContextBudget | undefined;
-    if (
-      budget &&
-      typeof budget.window === "number" &&
-      typeof budget.used_tokens === "number" &&
-      Array.isArray(budget.segments)
-    ) {
-      return budget;
-    }
-  }
-  return null;
-}
 
 /* ------------------------------------------------------------------ */
 /*  Chat page                                                         */
 /* ------------------------------------------------------------------ */
 
-export default function ChatWorkspace() {
+export default function ChatWorkspace({
+  watching = false,
+}: {
+  watching?: boolean;
+}) {
   const { router, sessionId: sessionIdParam } = useChatRouteSession();
+  const searchParams = useSearchParams();
+  const requestedWorkspaceId = searchParams.get("dt_workspace") ?? searchParams.get("workspace") ?? null;
   const { t } = useTranslation();
   const {
     capabilities,
@@ -274,27 +277,55 @@ export default function ChatWorkspace() {
     state,
     setTools,
     setCapability,
+    configureSession,
     setKBs,
     setLLMSelection,
     setPersonaSelection,
+    setResourceSelection,
+    setReplyLanguageOverride,
     sendMessage,
     cancelStreamingTurn,
     submitUserReply,
     regenerateLastMessage,
+    resendLastMessage,
     deleteTurn,
     editMessage,
     switchBranch,
     newSession,
     loadSession,
     showCachedSession,
+    loadMessageTrace,
+    releaseMessageTrace,
     renameSessionTitle,
     setCourseId,
   } = useChatStateAdapter();
 
+  const entrySessionId = useRef(state.sessionId);
+  const [replyLanguageSavingKey, setReplyLanguageSavingKey] = useState<string | null>(null);
+  const replyLanguageSaveRef = useRef<{ key: string; pending: Promise<void> } | null>(null);
+  const handleReplyLanguageChange = useCallback((value: string) => {
+    const language = value || null;
+    const key = state.sessionKey;
+    const pending = setReplyLanguageOverride(language);
+    replyLanguageSaveRef.current = { key, pending };
+    setReplyLanguageSavingKey(key);
+    void pending
+      .catch((error: unknown) => {
+        notify(error instanceof Error ? error.message : t("Action failed"));
+      })
+      .finally(() => {
+        if (replyLanguageSaveRef.current?.pending === pending) {
+          replyLanguageSaveRef.current = null;
+          setReplyLanguageSavingKey(null);
+        }
+      });
+  }, [setReplyLanguageOverride, state.sessionKey, t]);
+
+  const resourceReuse = useResourceReusePolicy(state.sessionKey || "draft", state.messages[0]?.id);
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([]);
   const [knowledgeBasesLoaded, setKnowledgeBasesLoaded] = useState(false);
   const availableKbNames = useMemo(
-    () => new Set(knowledgeBases.map((kb) => kb.name)),
+    () => new Set(knowledgeBases.map(knowledgeBaseRef)),
     [knowledgeBases],
   );
   // A connected agent to preselect once it loads, from `?agent=<name>` on the
@@ -316,6 +347,23 @@ export default function ChatWorkspace() {
   // session preferences are the truth whenever an existing session is opened.
   const courseId = state.courseId;
   const [courses, setCourses] = useState<StudyCourse[]>([]);
+  // Which workspace's files this conversation shares. The list is shared with
+  // the sidebar groups and the settings page through one hook, so a workspace
+  // created or renamed elsewhere shows up here without a reload.
+  const { workspaces, error: workspaceListError } = useChatWorkspaces();
+  const { selectWorkspace: handleSelectWorkspace, error: workspaceError, pending: workspacePending } = useWorkspaceBinding(state, configureSession);
+  // What the composer's skill / MCP pickers may offer, clipped to what this
+  // conversation's workspace already allows.
+  const resourceCatalog = useComposerResources(state.workspaceId, workspaces);
+  const activeWorkspace = useMemo(
+    () =>
+      state.workspaceId
+        ? (workspaces.find(
+            (row) => row.workspace_id === state.workspaceId,
+          ) ?? null)
+        : null,
+    [state.workspaceId, workspaces],
+  );
   // The course this conversation was *launched* into, and whether its defaults
   // have been applied. A course declares the mode and persona its conversations
   // start in; applying them to an existing transcript would silently rewrite
@@ -627,7 +675,19 @@ export default function ChatWorkspace() {
   const isQuizMode = activeCap.value === "deep_question";
   const isVisualizeMode = activeCap.value === "visualize";
   const isResearchMode = activeCap.value === "deep_research";
-  const isWatchingMode = activeCap.value === "immersive_watching";
+  const isWatchingMode = watching;
+  useEffect(() => {
+    if (!sessionIdParam || state.sessionId !== sessionIdParam) return;
+    if (!watching && state.workspaceMode === "immersive_watching") {
+      router.replace(watchingRoute(sessionIdParam), {
+        scroll: false,
+      });
+    } else if (watching && state.workspaceMode !== "immersive_watching") {
+      router.replace(scopedUrl(`/chat/${encodeURIComponent(sessionIdParam)}`), {
+        scroll: false,
+      });
+    }
+  }, [watching, state.workspaceMode, state.sessionId, sessionIdParam, router]);
   const capabilityNeedsConfig = isQuizMode || isVisualizeMode || isResearchMode;
   const returnedResearchTurnRef = useRef<string | null>(null);
 
@@ -717,6 +777,10 @@ export default function ChatWorkspace() {
   // "done" while nothing visibly changes.
   useSetupSync(state.messages);
   const hasMessages = state.messages.length > 0;
+  const attachmentProcessing = useMemo(
+    () => selectAttachmentProcessing(state.messages, state.isStreaming),
+    [state.isStreaming, state.messages],
+  );
   // A line the user might type next, written by the task model against the
   // conversation's own tail — general prediction, not a question to ask,
   // unlike the mastery/reading composers' hint. Empty conversations already
@@ -999,33 +1063,37 @@ export default function ChatWorkspace() {
      precedes it normally scrolls up, which releases the streaming pin — so a
      quiz card would appear below the fold, under the composer, and the
      conversation looked stalled. Re-arm the pin and land on the card. */
+  /* Two questions, and a mastery card answers them differently. It must be on
+     screen — it is the learner's move — but it did not pause its turn, so
+     their next message is a new turn, not a reply into a finished one. Hence
+     the wider predicate for the pin and the pause-only one for routing. */
+  const awaitingUserCard = hasPendingUserCard(lastMessage?.events);
   const awaitingUserReply = hasPendingAskUser(lastMessage?.events);
   // Read inside ``handleSend`` without adding a dependency that would rebuild
   // the callback (and so the composer) on every streamed event.
   const awaitingUserReplyRef = useRef(awaitingUserReply);
   awaitingUserReplyRef.current = awaitingUserReply;
   useEffect(() => {
-    if (!awaitingUserReply) return;
+    if (!awaitingUserCard) return;
     shouldAutoScrollRef.current = true;
     // One frame later: the card has to be laid out before the bottom it
     // defines exists.
     const frame = requestAnimationFrame(() => scrollToBottom("instant"));
     return () => cancelAnimationFrame(frame);
-  }, [awaitingUserReply, scrollToBottom, shouldAutoScrollRef]);
+  }, [awaitingUserCard, scrollToBottom, shouldAutoScrollRef]);
 
-  const copyAssistantMessage = useCallback(async (content: string) => {
-    if (!content.trim()) return;
-    try {
-      await navigator.clipboard.writeText(content);
-    } catch (error) {
-      console.error("Failed to copy assistant message:", error);
-    }
-  }, []);
+  // Deliberately does not catch. `CopyActionButton` renders 已复制 off this
+  // promise resolving, so swallowing the failure here is what made the button
+  // announce a success that never happened — to screen readers included.
+  const copyAssistantMessage = useCallback(
+    (content: string) => copyText(content),
+    [],
+  );
   /* ---- URL-driven session loading ---- */
 
   const navigateToHome = useCallback(() => {
-    router.replace("/chat", { scroll: false });
-  }, [router]);
+    router.replace(scopedUrl(watching ? WATCHING_HOME : "/chat"), { scroll: false });
+  }, [router, watching]);
 
   /** Abort in-flight load + navigate home. */
   const cancelSessionLoad = useCallback(() => {
@@ -1130,7 +1198,15 @@ export default function ChatWorkspace() {
     if (sessionIdParam) {
       startSessionLoad(sessionIdParam);
     } else {
-      newSession();
+      newSession(
+        watching
+          ? {
+              capability: "immersive_watching",
+              workspaceMode: "immersive_watching",
+              workspaceId: requestedWorkspaceId,
+            }
+          : { workspaceId: requestedWorkspaceId },
+      );
     }
     return () => {
       initialLoadRef.current = false;
@@ -1138,6 +1214,15 @@ export default function ChatWorkspace() {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // When URL param changes (sidebar navigation), load the corresponding session
+  const prevWorkspaceParam = useRef(requestedWorkspaceId);
+  useEffect(() => {
+    if (prevWorkspaceParam.current === requestedWorkspaceId) return;
+    prevWorkspaceParam.current = requestedWorkspaceId;
+    if (!sessionIdParam && !watching && state.workspaceId !== requestedWorkspaceId) {
+      newSession({ workspaceId: requestedWorkspaceId });
+    }
+  }, [requestedWorkspaceId, sessionIdParam, watching, newSession, state.workspaceId]);
+
   const prevSessionIdParam = useRef(sessionIdParam);
   useEffect(() => {
     if (sessionIdParam === prevSessionIdParam.current) return;
@@ -1153,18 +1238,32 @@ export default function ChatWorkspace() {
       }
       startSessionLoad(sessionIdParam);
     } else {
-      newSession();
+      newSession(
+        watching
+          ? {
+              capability: "immersive_watching",
+              workspaceMode: "immersive_watching",
+              workspaceId: requestedWorkspaceId,
+            }
+          : { workspaceId: requestedWorkspaceId },
+      );
       setSessionLoading(false);
       setSessionLoadFailed(false);
     }
-  }, [sessionIdParam, startSessionLoad, newSession, state.sessionId]);
+  }, [sessionIdParam, startSessionLoad, newSession, state.sessionId, watching, requestedWorkspaceId]);
 
   // When a new session_id is assigned by the server, update the URL
   useEffect(() => {
-    if (state.sessionId && !sessionIdParam) {
-      router.replace(`/chat/${state.sessionId}`, { scroll: false });
+    if (
+      state.sessionId &&
+      !sessionIdParam &&
+      state.sessionId !== entrySessionId.current
+    ) {
+      router.replace(scopedUrl(watching ? watchingRoute(state.sessionId) : `/chat/${encodeURIComponent(state.sessionId)}`, state.workspaceId || ""), {
+        scroll: false,
+      });
     }
-  }, [state.sessionId, sessionIdParam, router]);
+  }, [state.sessionId, state.workspaceId, sessionIdParam, router, watching]);
 
   useEffect(() => {
     setActiveSessionId(state.sessionId || sessionIdParam || null);
@@ -1381,6 +1480,11 @@ export default function ChatWorkspace() {
 
   const handleSelectCapability = useCallback(
     (value: string) => {
+      if (value === "immersive_watching" && !watching) {
+        router.push(scopedUrl(WATCHING_HOME));
+        return;
+      }
+      if (watching && value !== "immersive_watching") return;
       const cap =
         capabilities.find((capability) => capability.value === value) ??
         capabilities[0] ??
@@ -1400,7 +1504,7 @@ export default function ChatWorkspace() {
       setCapabilityConfigConfirmed(false);
       setCapMenuOpen(false);
     },
-    [capabilities, setCapability, setTools, userEnabledTools],
+    [capabilities, setCapability, setTools, userEnabledTools, watching, router],
   );
 
   const fileToAttachment = fileToPendingAttachment;
@@ -1490,15 +1594,7 @@ export default function ChatWorkspace() {
   // while a new turn streams — the in-flight assistant message has no result
   // event yet, so the walk falls through to the last completed turn and the
   // chip flips exactly once, when the new measurement lands.
-  const contextBudget = useMemo(() => {
-    for (let i = state.messages.length - 1; i >= 0; i -= 1) {
-      const msg = state.messages[i];
-      if (msg.role !== "assistant") continue;
-      const budget = readContextBudget(msg.events);
-      if (budget) return budget;
-    }
-    return null;
-  }, [state.messages]);
+  const contextBudget = useContextBudget(state.messages);
 
   /**
    * Capability-config card rendered at the bottom of the Activity panel.
@@ -1770,7 +1866,7 @@ export default function ChatWorkspace() {
     () =>
       new Set(
         knowledgeBases
-          .filter((kb) => kb.metadata?.type === "subagent")
+          .filter((kb) => kb.metadata?.type === "subagent" && kb.metadata?.agent_kind !== "partner")
           .map((kb) => kb.name),
       ),
     [knowledgeBases],
@@ -1782,6 +1878,9 @@ export default function ChatWorkspace() {
   // How many times DeepTutor may consult the selected agent this turn. Seeded
   // from the configured default; the composer's stepper overrides it per turn.
   const [subagentBudget, setSubagentBudget] = useState<number | null>(null);
+  const [selectedPartner, setSelectedPartner] = useState<string | null>(null);
+  const [selectedPartnerGroup, setSelectedPartnerGroup] = useState<string | null>(null);
+
   useEffect(() => {
     void getSubagentSettings()
       .then((settings) => setSubagentBudget(settings.consult_budget))
@@ -1790,13 +1889,28 @@ export default function ChatWorkspace() {
 
   const handleSend = useCallback(
     async (content: string) => {
+      // An existing session saves its selector before the next turn starts.
+      // The composer may be used immediately after changing the dropdown.
+      if (!(await waitForReplyLanguageSave(
+        replyLanguageSaveRef.current?.key === state.sessionKey
+          ? replyLanguageSaveRef.current.pending
+          : null,
+        content,
+        (draft) => prefillInputRef.current?.(draft),
+      ))) return;
       // A turn paused on a question: what the user typed is their answer, not
       // a new message. Routing it here means the card is one way to answer,
       // not the only one — and a card that never rendered no longer strands
       // the learner with a turn they can only cancel.
       if (awaitingUserReplyRef.current) {
-        if (content.trim()) submitUserReply({ text: content });
-        return;
+        if (!content.trim()) return;
+        if (await submitUserReply({ text: content })) return;
+        // Refused: the turn that asked is gone. Do NOT stop here. The
+        // composer has already cleared the box, so returning discarded what
+        // they typed — while the error told them to "send a new message",
+        // which is exactly what this branch was preventing them from doing.
+        // Fall through and send it as one.
+        notify(t(REPLY_SENT_AS_NEW_MESSAGE));
       }
       if (
         (!content &&
@@ -1876,11 +1990,16 @@ export default function ChatWorkspace() {
       if (selectedAgent && subagentBudget) {
         config = { ...(config ?? {}), subagent_consult_budget: subagentBudget };
       }
+      if (selectedPartner) config = { ...(config ?? {}), consult_partner_id: selectedPartner };
+      if (selectedPartnerGroup) config = { ...(config ?? {}), partner_discussion_group_id: selectedPartnerGroup };
       // Sent on every turn, including empty to mean "not in a course". The
       // server treats the key's presence as explicit and writes it to the
       // session's preferences, so the pill's state and the conversation's real
       // binding can never drift apart — and detaching actually detaches.
-      config = { ...(config ?? {}), _course_id: courseId };
+      config = { ...(config ?? {}), _course_id: courseId,
+        _resource_reuse: resourceReuse.policy,
+        _persistent_knowledge_bases: retainedKnowledgeBases(state.knowledgeBases, agentNameSet, resourceReuse.policy),
+      };
 
       const memoryPayload = [...memoryReferencesPayload];
       const messageContent =
@@ -1914,17 +2033,23 @@ export default function ChatWorkspace() {
         undefined,
         memoryPayload,
       );
+      setKBs(retainedKnowledgeBases(state.knowledgeBases, agentNameSet, resourceReuse.policy));
+      if (!resourceReuse.policy.persona) setPersonaSelection("");
+      setResourceSelection({skills: resourceReuse.policy.skills ? state.resourceSelection.skills : [], mcp: resourceReuse.policy.mcp ? state.resourceSelection.mcp : []});
       shouldAutoScrollRef.current = true;
-      setAttachments([]);
-      setSelectedBookReferences([]);
-      setSelectedReadingReferences([]);
-      setSelectedNotebookRecords([]);
-      setSelectedHistorySessions([]);
-      setSelectedAgentSessions([]);
-      setSelectedQuestionEntries([]);
-      setSelectedMemoryFiles([]);
+      if (!resourceReuse.policy.partner) setSelectedPartner(null);
+      if (!resourceReuse.policy.partner_group) setSelectedPartnerGroup(null);
+      if (!resourceReuse.policy.attachments) setAttachments([]);
+      if (!resourceReuse.policy.books) setSelectedBookReferences([]);
+      if (!resourceReuse.policy.reading) setSelectedReadingReferences([]);
+      if (!resourceReuse.policy.notebooks) setSelectedNotebookRecords([]);
+      if (!resourceReuse.policy.chat_history) setSelectedHistorySessions([]);
+      if (!resourceReuse.policy.my_agents) setSelectedAgentSessions([]);
+      if (!resourceReuse.policy.question_bank) setSelectedQuestionEntries([]);
+      if (!resourceReuse.policy.memory) setSelectedMemoryFiles([]);
     },
     [
+      resourceReuse, state.knowledgeBases, state.resourceSelection, agentNameSet, setKBs, setPersonaSelection, setResourceSelection,
       attachments,
       bookReferencesPayload,
       courseId,
@@ -1952,7 +2077,10 @@ export default function ChatWorkspace() {
       sendMessage,
       shouldAutoScrollRef,
       state.isStreaming,
+      state.sessionKey,
       subagentBudget,
+      selectedPartnerGroup,
+      selectedPartner,
       submitUserReply,
       t,
       visualizeConfig,
@@ -2004,15 +2132,67 @@ export default function ChatWorkspace() {
     [researchConfig, sendMessage, shouldAutoScrollRef],
   );
 
+  // Answering a mastery card starts the next turn rather than resuming a
+  // paused one: posing the question ended its turn. The learner's pick is the
+  // message (a bare "C" reads fine directly under the card that offered it),
+  // and ``masteryAnswer`` tells the backend which question it settles so the
+  // engine has the answer committed before the tutor reads anything.
+  const answerMasteryQuestion = useCallback(
+    (answer: { questionId: string; text: string }) => {
+      const text = answer.text.trim();
+      // One live turn per path: submitting into a running one is refused, and
+      // ``false`` reopens the card rather than surfacing that refusal.
+      if (!text || state.isStreaming) return false;
+      sendMessage(
+        text,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        {
+          masteryAnswer: { question_id: answer.questionId, text },
+        },
+      );
+      shouldAutoScrollRef.current = true;
+      return true;
+    },
+    [sendMessage, shouldAutoScrollRef, state.isStreaming],
+  );
+
+  // Declining one is the same kind of move, and has to be a turn for the same
+  // reason: the engine holds one open question per path, so a question left
+  // open is the one the tutor's next ``mastery_quiz`` re-presents. The message
+  // says out loud what the learner did, so the transcript still reads.
+  const skipMasteryQuestion = useCallback(
+    (questionId: string) => {
+      if (!questionId || state.isStreaming) return false;
+      sendMessage(
+        t("Let's skip this question."),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { masterySkip: { question_id: questionId } },
+      );
+      shouldAutoScrollRef.current = true;
+      return true;
+    },
+    [sendMessage, shouldAutoScrollRef, state.isStreaming, t],
+  );
+
   const handleRegenerateMessage = useCallback(() => {
     regenerateLastMessage();
   }, [regenerateLastMessage]);
+
+  const handleResendMessage = useCallback(() => {
+    resendLastMessage();
+  }, [resendLastMessage]);
 
   const handleToggleKB = useCallback(
     (name: string) => {
       const current = state.knowledgeBases;
       const providerOf = (kbName: string) => {
-        const kb = knowledgeBases.find((item) => item.name === kbName);
+        const kb = knowledgeBases.find((item) => knowledgeBaseRef(item) === kbName);
         return kb?.metadata?.rag_provider || kb?.statistics?.rag_provider || "";
       };
       const selectingOss = providerOf(name) === "pageindex-oss";
@@ -2039,7 +2219,7 @@ export default function ChatWorkspace() {
   const agentOptions = useMemo(
     () =>
       knowledgeBases
-        .filter((kb) => kb.metadata?.type === "subagent")
+        .filter((kb) => kb.metadata?.type === "subagent" && kb.metadata?.agent_kind !== "partner")
         .map((kb) => ({ name: kb.name, kind: kb.metadata?.agent_kind })),
     [knowledgeBases],
   );
@@ -2057,6 +2237,15 @@ export default function ChatWorkspace() {
     },
     [setKBs, state.knowledgeBases, agentNameSet],
   );
+  const handleSelectPartnerGroup = useCallback((id: string | null) => {
+    setSelectedPartnerGroup(id);
+    if (id) { setSelectedPartner(null); handleSelectAgent(null); }
+  }, [handleSelectAgent]);
+  const handleSelectPartner = useCallback((id: string | null) => {
+    setSelectedPartner(id);
+    if (id) { setSelectedPartnerGroup(null); handleSelectAgent(null); }
+  }, [handleSelectAgent]);
+
   // Honor `?agent=<name>` once its connection KB has loaded: preselect it so a
   // partner opened from the partner list starts the chat already targeting it.
   useEffect(() => {
@@ -2135,12 +2324,15 @@ export default function ChatWorkspace() {
 
   const handleCloseNotebookPicker = useCallback(() => {
     setShowNotebookPicker(false);
+    setSpaceMenuOpen(true);
   }, []);
   const handleCloseBookPicker = useCallback(() => {
     setShowBookPicker(false);
+    setSpaceMenuOpen(true);
   }, []);
   const handleCloseReadingPicker = useCallback(() => {
     setShowReadingPicker(false);
+    setSpaceMenuOpen(true);
   }, []);
   const handleApplyBookReferences = useCallback(
     (references: SelectedBookReference[]) => {
@@ -2162,6 +2354,7 @@ export default function ChatWorkspace() {
   );
   const handleCloseHistoryPicker = useCallback(() => {
     setShowHistoryPicker(false);
+    setSpaceMenuOpen(true);
   }, []);
   const handleApplyHistorySessions = useCallback(
     (sessions: SelectedHistorySession[]) => {
@@ -2171,6 +2364,7 @@ export default function ChatWorkspace() {
   );
   const handleCloseAgentsPicker = useCallback(() => {
     setShowAgentsPicker(false);
+    setSpaceMenuOpen(true);
   }, []);
   const handleApplyAgentSessions = useCallback(
     (sessions: SelectedHistorySession[]) => {
@@ -2180,6 +2374,7 @@ export default function ChatWorkspace() {
   );
   const handleCloseQuestionBankPicker = useCallback(() => {
     setShowQuestionBankPicker(false);
+    setSpaceMenuOpen(true);
   }, []);
   const handleApplyQuestionEntries = useCallback(
     (entries: SelectedQuestionEntry[]) => {
@@ -2189,6 +2384,7 @@ export default function ChatWorkspace() {
   );
   const handleCloseMemoryPicker = useCallback(() => {
     setShowMemoryPicker(false);
+    setSpaceMenuOpen(true);
   }, []);
   const handleApplyMemoryFiles = useCallback((files: SpaceMemoryFile[]) => {
     setSelectedMemoryFiles(files);
@@ -2208,6 +2404,7 @@ export default function ChatWorkspace() {
   }, [state.messages]);
 
   return (
+    <ResourceReuseContext.Provider value={resourceReuse}>
     <QuizFollowupProvider>
       <GeogebraTabProvider>
         <QuizFollowupBridge viewerPanelRef={viewerPanelRef} />
@@ -2216,20 +2413,21 @@ export default function ChatWorkspace() {
           messages={state.messages}
           viewerPanelRef={viewerPanelRef}
         />
-        <div className="relative h-full overflow-hidden">
-          {/* The video panel slides in from the left and the chat column shrinks to
-            make room. Rendered as a sibling with its own transform rather than
-            wrapping the chat, so switching modes never remounts the chat tree —
-            a remount would refetch every piece of session metadata and stall the
-            UI for seconds (the regression behind the slow session-open bug). */}
-          <div
-            data-watching-open={isWatchingMode ? "true" : "false"}
-            className="dt-watching-shell"
-          >
-            {isWatchingMode && (
-              <WatchingPane onClose={() => setCapability("")} />
+        <div
+          className="relative h-full overflow-hidden"
+          data-watching-workspace={watching ? "true" : undefined}
+        >
+          {watching &&
+            state.workspaceMode === "immersive_watching" &&
+            (!sessionIdParam || state.sessionId === sessionIdParam) && (
+              <WatchingSessionBridge
+                sessionKey={state.sessionId || "draft"}
+                sourceUrl={!sessionIdParam ? searchParams.get("video") : null}
+                materialId={state.timedMediaId}
+                onMaterial={configureSession}
+              />
             )}
-          </div>
+          {watching && <WatchingSurface />}
           <div
             // When the preview drawer is open AND the viewport is wide enough,
             // push the chat content to the left by the drawer's width so the two
@@ -2245,6 +2443,28 @@ export default function ChatWorkspace() {
           >
             <div className="mx-auto flex w-full max-w-[960px] flex-wrap items-center justify-between gap-x-3 gap-y-1.5 px-6 pt-3 pb-0">
               <div className="group/title min-w-0 flex flex-1 items-center gap-2">
+                {/* Where this conversation lives, ahead of its title — the same
+                    breadcrumb the composer pill writes, so an opened
+                    conversation says which workspace's files it can see without
+                    the learner opening a menu to find out. */}
+                {activeWorkspace ? (
+                  <Tooltip label={activeWorkspace.path} side="bottom">
+                    <Link
+                      href="/settings/workspace"
+                      className="inline-flex shrink-0 items-center gap-1 rounded-lg px-1.5 py-1 text-[12.5px] text-[var(--muted-foreground)] transition hover:bg-[var(--muted)]/55 hover:text-[var(--foreground)]"
+                    >
+                      <FolderOpen size={13} strokeWidth={1.7} />
+                      <span className="max-w-[140px] truncate">
+                        {activeWorkspace.display_name}
+                      </span>
+                      <ChevronRight
+                        size={12}
+                        strokeWidth={2}
+                        className="-mr-1 opacity-60"
+                      />
+                    </Link>
+                  </Tooltip>
+                ) : null}
                 {sessionTitleEditing ? (
                   <input
                     ref={titleInputRef}
@@ -2260,22 +2480,24 @@ export default function ChatWorkspace() {
                     maxLength={100}
                   />
                 ) : (
-                  <button
-                    type="button"
-                    onClick={startSessionTitleEdit}
-                    disabled={!canRenameSession}
-                    title={
-                      canRenameSession
-                        ? t("Click to rename session")
-                        : t("Start a conversation to rename")
-                    }
-                    className="inline-flex min-w-0 max-w-full items-center gap-2 rounded-xl px-2 py-1 text-left font-serif text-[17px] font-semibold tracking-[-0.01em] text-[var(--foreground)] transition hover:bg-[var(--muted)]/55 disabled:cursor-default disabled:hover:bg-transparent"
+                  <Tooltip
+                    label={canRenameSession
+                      ? t("Click to rename session")
+                      : t("Start a conversation to rename")}
+                    side="bottom"
                   >
-                    <span className="truncate">{displaySessionTitle}</span>
-                    {canRenameSession ? (
-                      <PenLine className="h-3.5 w-3.5 shrink-0 text-[var(--muted-foreground)] opacity-0 transition-opacity group-hover/title:opacity-100" />
-                    ) : null}
-                  </button>
+                    <button
+                      type="button"
+                      onClick={startSessionTitleEdit}
+                      disabled={!canRenameSession}
+                      className="inline-flex min-w-0 max-w-full items-center gap-2 rounded-xl px-2 py-1 text-left font-serif text-[17px] font-semibold tracking-[-0.01em] text-[var(--foreground)] transition hover:bg-[var(--muted)]/55 disabled:cursor-default disabled:hover:bg-transparent"
+                    >
+                      <span className="truncate">{displaySessionTitle}</span>
+                      {canRenameSession ? (
+                        <PenLine className="h-3.5 w-3.5 shrink-0 text-[var(--muted-foreground)] opacity-0 transition-opacity group-hover/title:opacity-100" />
+                      ) : null}
+                    </button>
+                  </Tooltip>
                 )}
                 {sessionTitleSaving ? (
                   <span className="shrink-0 text-xs text-[var(--muted-foreground)]">
@@ -2399,13 +2621,34 @@ export default function ChatWorkspace() {
                         language={state.language}
                         onCopyAssistantMessage={copyAssistantMessage}
                         onRegenerateMessage={handleRegenerateMessage}
+                        canResendLastTurn={state.lastTurnFailed}
+                        onResendLastTurn={handleResendMessage}
                         onConfirmOutline={handleConfirmOutline}
                         onPreviewAttachment={handlePreviewMessageAttachment}
+                        onOpenConsultation={(events) => {
+                          const meta = events[0]?.metadata ?? {};
+                          const key = String(meta.turn_id || meta.call_id || meta.trace_id || "");
+                          if (key) viewerPanelRef.current?.openSubagentTab(
+                            key, String(meta.subagent_name || t("Subagent")), events, true,
+                          );
+                        }}
                         onDeleteTurn={deleteTurn}
                         selectedBranches={state.selectedBranches}
                         onEditMessage={editMessage}
                         onSwitchBranch={switchBranch}
                         onSubmitUserReply={submitUserReply}
+                        onAnswerMasteryQuestion={answerMasteryQuestion}
+                        onSkipMasteryQuestion={skipMasteryQuestion}
+                        onLoadMessageTrace={(messageId) =>
+                          state.sessionId
+                            ? loadMessageTrace(state.sessionId, messageId)
+                            : Promise.resolve()
+                        }
+                        onReleaseMessageTrace={(messageId) => {
+                          if (state.sessionId) {
+                            releaseMessageTrace(state.sessionId, messageId);
+                          }
+                        }}
                         availableKbNames={
                           knowledgeBasesLoaded ? availableKbNames : undefined
                         }
@@ -2441,6 +2684,40 @@ export default function ChatWorkspace() {
                 </div>
               )}
 
+              {/* Submission failure banner (#1594): the server never received
+                 the message, so the error belongs next to the composer — not
+                 rendered as an assistant reply — with the message's text kept
+                 above, marked unsent, and retryable. */}
+              {state.submissionFailed ? (
+                <div
+                  role="alert"
+                  data-submission-error="true"
+                  className="mx-auto w-full max-w-[960px] px-6 pb-1"
+                >
+                  <div className="flex w-full items-center gap-2 rounded-xl border border-[var(--destructive)]/30 bg-[var(--destructive)]/5 px-3 py-2">
+                    <AlertCircle
+                      className="h-4 w-4 shrink-0 text-[var(--destructive)]"
+                      aria-hidden="true"
+                    />
+                    <span className="min-w-0 flex-1 text-[12px] leading-[1.5] text-[var(--foreground)]">
+                      {state.submissionNotSaved
+                        ? t("This unsent message could not be saved in your browser. Copy it before leaving this page.")
+                        : state.submissionNeedsReview
+                        ? t("Message text was saved, but its attachments or settings could not be restored. Copy it and send again.")
+                        : t("Couldn't reach the server. Please check your connection and retry.")}
+                    </span>
+                    {!state.submissionNeedsReview ? (
+                      <button
+                        type="button"
+                        onClick={handleResendMessage}
+                        className="shrink-0 rounded-md px-2 py-1 text-[11.5px] font-medium text-[var(--foreground)] hover:bg-[var(--muted)]"
+                      >
+                        {t("Resend")}
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
               <ChatComposer
                 composerRef={composerRef}
                 capMenuRef={capMenuRef}
@@ -2455,15 +2732,31 @@ export default function ChatWorkspace() {
                 // onSelectCourse intentionally omitted: hides the CoursePill
                 // entry point while courseId keeps flowing to the backend for
                 // conversations already bound (e.g. via a course deep link).
+                workspaces={workspaces}
+                workspaceId={state.workspaceId || ""}
+                workspaceError={workspaceError || workspaceListError}
+                workspacePending={workspacePending}
+                // Immersive modes own their own material; a workspace binding
+                // there would compete with it, so they get no pill.
+                onSelectWorkspace={
+                  !watching && !state.workspaceMode
+                    ? handleSelectWorkspace
+                    : undefined
+                }
                 spaceMenuOpen={spaceMenuOpen}
                 hasMessages={hasMessages}
                 attachments={attachments}
                 attachmentError={attachmentError}
+                attachmentProcessing={attachmentProcessing}
                 activeCap={activeCap}
                 knowledgeBases={kbOptions}
                 connectedAgents={agentOptions}
-                selectedAgent={selectedAgent}
-                onSelectAgent={handleSelectAgent}
+                selectedAgent={selectedPartnerGroup || selectedPartner ? null : selectedAgent}
+                onSelectAgent={(name) => { if (name) { setSelectedPartnerGroup(null); setSelectedPartner(null); } handleSelectAgent(name); }}
+        selectedPartnerGroup={selectedPartnerGroup}
+        onSelectPartnerGroup={handleSelectPartnerGroup}
+        selectedPartner={selectedPartner}
+        onSelectPartner={handleSelectPartner}
                 subagentBudget={subagentBudget}
                 onSubagentBudgetChange={setSubagentBudget}
                 llmOptions={llmOptions}
@@ -2490,7 +2783,13 @@ export default function ChatWorkspace() {
                 capabilityNeedsConfig={capabilityNeedsConfig}
                 capabilityConfigConfirmed={capabilityConfigConfirmed}
                 onRequestConfigConfirm={ensureActivityPanelOpen}
-                capabilities={visibleCapabilities}
+                capabilities={
+                  watching
+                    ? visibleCapabilities.filter(
+                        (cap) => cap.value === "immersive_watching",
+                      )
+                    : visibleCapabilities
+                }
                 onSetCapMenuOpen={setCapMenuOpen}
                 onSetSpaceMenuOpen={setSpaceMenuOpen}
                 onToggleKB={handleToggleKB}
@@ -2508,6 +2807,16 @@ export default function ChatWorkspace() {
                 onPersonaSelectionChange={setPersonaSelection}
                 personaSelectorOpen={personaSelectorOpen}
                 onPersonaSelectorOpenChange={setPersonaSelectorOpen}
+                replyLanguageOverride={state.replyLanguageOverride}
+                replyLanguageOptions={RESPONSE_LANGUAGE_OPTIONS}
+                replyLanguageDefaultLabel={RESPONSE_LANGUAGE_OPTIONS.find(
+                  (option) => option.value === readStoredResponseLanguage(),
+                )?.label ?? "English"}
+                replyLanguageDisabled={replyLanguageSavingKey === state.sessionKey || state.isStreaming}
+                onReplyLanguageChange={handleReplyLanguageChange}
+                resourceCatalog={resourceCatalog}
+                resourceSelection={state.resourceSelection}
+                onResourceSelectionChange={setResourceSelection}
                 onToggleMemoryFile={handleToggleMemoryFile}
                 onSend={handleSend}
                 awaitingUserReply={awaitingUserReply}
@@ -2539,6 +2848,7 @@ export default function ChatWorkspace() {
                 session and starts it on the topic. */}
               {!hasMessages ? (
                 <StarterSuggestions
+                  workspaceId={state.workspaceId || ""}
                   onPick={(prompt) => void handleSend(prompt)}
                   disabled={state.isStreaming}
                 />
@@ -2614,6 +2924,7 @@ export default function ChatWorkspace() {
         </div>
       </GeogebraTabProvider>
     </QuizFollowupProvider>
+    </ResourceReuseContext.Provider>
   );
 }
 
@@ -2706,9 +3017,9 @@ function SubagentTabWatcher({
 /**
  * Header action button that auto-collapses to icon-only when the chat
  * column gets squeezed (Viewer panel open, narrow viewport, etc.). The
- * label stays as the button's `title` so hovering an icon still reveals
- * what it does. Optional `active` flag paints the button with a primary
- * tint, used by the panel-toggle buttons to surface their on/off state.
+ * The shared tooltip keeps the full hint available on pointer, keyboard and
+ * touch. Optional `active` paints the button with a primary tint, used by the
+ * panel-toggle buttons to surface their on/off state.
  */
 // Claude-style icon-only header action: bare 16px glyph, function revealed
 // by an instant tooltip; active state gets a primary tint.

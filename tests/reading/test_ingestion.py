@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
 import pytest
 
+from deeptutor.reading import ingestion as ingestion_module
 from deeptutor.reading.catalog_models import IngestionStatus, SourceKind
 from deeptutor.reading.catalog_store import ReadingCatalogStore
 from deeptutor.reading.extract import (
@@ -23,10 +25,16 @@ from deeptutor.reading.ingestion import (
     parse_bilibili_url,
     parse_youtube_url,
 )
-from deeptutor.reading.models import ReadingError
+from deeptutor.reading.models import (
+    Annotation,
+    ReadingError,
+    TextPositionSelector,
+    TextQuoteSelector,
+)
 from deeptutor.reading.store import ReadingStore
 from deeptutor.services.web_source.snapshot_assets import SnapshotAsset
 from deeptutor.tools.web_fetch import FetchOutcome, _extract_readable
+from deeptutor.video_learning import service as video_learning_service
 
 _ARTICLE_FIXTURE = Path(__file__).parents[1] / "fixtures" / "web" / "vector_article.html"
 
@@ -115,6 +123,209 @@ async def test_web_import_is_rich_localizes_images_and_preserves_old_revision(st
     revisions = reading.revisions(ready.material_id)
     assert [row.revision for row in revisions] == [1]
     assert "# Old snapshot" in reading.revision_unit_text(ready.material_id, 1, 1)
+
+
+def test_revision_migration_reanchors_reliable_quote(stores) -> None:
+    reading, _catalog = stores
+    material_id = "abcdef0123456789"
+
+    reading.ingest_units(
+        material_id,
+        filename="article.md",
+        units=["# First section\n\nThe quick brown fox jumps over the lazy dog."],
+        source_type="url_snapshot",
+    )
+    annotation = reading.save_annotation(
+        material_id,
+        Annotation(
+            annotation_id="test001",
+            locator=1,
+            quote="quick brown fox",
+            selectors=(
+                TextQuoteSelector(
+                    exact="quick brown fox",
+                    prefix="The ",
+                    suffix=" jumps",
+                ),
+                TextPositionSelector(start=21, end=36),
+            ),
+        ),
+    )
+    assert annotation.material_revision == 1
+
+    reading.ingest_units(
+        material_id,
+        filename="article-v2.md",
+        units=["# Revised\n\nIntro. The quick brown fox jumps over the lazy dog. End."],
+        source_type="url_snapshot",
+    )
+    stored = reading.annotations(material_id)
+    assert len(stored) == 1
+    migrated = stored[0]
+    assert migrated.resolution == "resolved"
+    assert migrated.material_revision == 2
+    assert "quick brown fox" in migrated.quote
+    quote_selector = next(s for s in migrated.selectors if isinstance(s, TextQuoteSelector))
+    position_selector = next(s for s in migrated.selectors if isinstance(s, TextPositionSelector))
+    unit_text = reading.unit_text(material_id, migrated.locator)
+    assert unit_text[position_selector.start : position_selector.end] == quote_selector.exact
+
+
+def test_revision_migration_checks_each_material_annotation_file(stores) -> None:
+    reading, _catalog = stores
+    material_id = "abcdef0123456789"
+    reading.ingest_units(
+        material_id,
+        filename="article.md",
+        units=["The quick brown fox jumps. A second claim stays here."],
+        source_type="url_snapshot",
+    )
+    reading.save_annotation(
+        material_id,
+        Annotation(
+            annotation_id="first",
+            locator=1,
+            quote="quick brown fox",
+            selectors=(TextQuoteSelector(exact="quick brown fox"),),
+        ),
+    )
+    second_path = reading._dir(material_id) / "annotations" / "another-material.json"
+    second_path.write_text(
+        json.dumps(
+            [
+                Annotation(
+                    annotation_id="second",
+                    locator=1,
+                    quote="second claim",
+                    selectors=(TextQuoteSelector(exact="second claim"),),
+                ).to_dict(),
+                Annotation(
+                    annotation_id="position-only",
+                    locator=1,
+                    selectors=(TextPositionSelector(start=5, end=10),),
+                ).to_dict(),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    reading.ingest_units(
+        material_id,
+        filename="article-v2.md",
+        units=["An introduction. The quick brown fox jumps. A second claim stays here."],
+        source_type="url_snapshot",
+    )
+
+    assert reading.annotations(material_id)[0].material_revision == 2
+    second_rows = [Annotation.from_dict(row) for row in json.loads(second_path.read_text())]
+    assert second_rows[0].material_revision == 2
+    assert second_rows[0].resolution == "resolved"
+    assert second_rows[1].material_revision == 1
+    assert second_rows[1].resolution == "unresolved"
+
+
+def test_revision_migration_marks_gone_quote_unresolved(stores) -> None:
+    reading, _catalog = stores
+    material_id = "abcdef0123456789"
+
+    reading.ingest_units(
+        material_id,
+        filename="article.md",
+        units=["# Section\n\nThe unique phrase is here."],
+        source_type="url_snapshot",
+    )
+    reading.save_annotation(
+        material_id,
+        Annotation(
+            annotation_id="test002",
+            locator=1,
+            quote="unique phrase",
+            selectors=(TextQuoteSelector(exact="unique phrase", prefix="The ", suffix=" is"),),
+        ),
+    )
+
+    reading.ingest_units(
+        material_id,
+        filename="article-v2.md",
+        units=["# Rewritten\n\nEntirely different content."],
+        source_type="url_snapshot",
+    )
+    stored = reading.annotations(material_id)
+    assert len(stored) == 1
+    assert stored[0].resolution == "unresolved"
+    assert stored[0].material_revision == 1  # kept pinned to old revision
+    assert stored[0].quote == "unique phrase"
+
+
+def test_revision_migration_marks_repeated_quote_ambiguous(stores) -> None:
+    reading, _catalog = stores
+    material_id = "abcdef0123456789"
+
+    reading.ingest_units(
+        material_id,
+        filename="article.md",
+        units=["# Section\n\nA key claim with unique context."],
+        source_type="url_snapshot",
+    )
+    reading.save_annotation(
+        material_id,
+        Annotation(
+            annotation_id="test003",
+            locator=1,
+            quote="key claim",
+            selectors=(TextQuoteSelector(exact="key claim", prefix="A ", suffix=" with"),),
+        ),
+    )
+
+    reading.ingest_units(
+        material_id,
+        filename="article-v2.md",
+        units=["# Duplicated\n\nA key claim here.\n\nAnother key claim there."],
+        source_type="url_snapshot",
+    )
+    stored = reading.annotations(material_id)
+    assert len(stored) == 1
+    assert stored[0].resolution == "ambiguous"
+    assert stored[0].material_revision == 1
+
+
+def test_revision_migration_preserves_old_annotations_for_audit(stores) -> None:
+    reading, _catalog = stores
+    material_id = "abcdef0123456789"
+
+    reading.ingest_units(
+        material_id,
+        filename="article.md",
+        units=["# Section\n\nThe original phrase."],
+        source_type="url_snapshot",
+    )
+    reading.save_annotation(
+        material_id,
+        Annotation(
+            annotation_id="test004",
+            locator=1,
+            quote="original phrase",
+            selectors=(TextQuoteSelector(exact="original phrase"),),
+        ),
+    )
+
+    reading.ingest_units(
+        material_id,
+        filename="article-v2.md",
+        units=["# Changed\n\nA new phrase entirely."],
+        source_type="url_snapshot",
+    )
+
+    revision_dir = reading._dir(material_id) / "revisions" / "000001"
+    assert revision_dir.is_dir()
+    saved_annotations = revision_dir / "annotations" / f"{material_id}.json"
+    assert saved_annotations.is_file()
+    import json
+
+    saved_rows = json.loads(saved_annotations.read_text(encoding="utf-8"))
+    assert len(saved_rows) == 1
+    assert saved_rows[0]["quote"] == "original phrase"
+    assert saved_rows[0]["resolution"] == "resolved"
 
 
 @pytest.mark.asyncio
@@ -219,6 +430,114 @@ async def test_youtube_import_prefers_timed_captions(stores) -> None:
     assert reading.manifest(ready.material_id).unit == "segment"
     assert reading.manifest(ready.material_id).render_mode == "video"
     assert reading.unit_references(ready.material_id)[1].source_href == "#t=12"
+
+
+@pytest.mark.asyncio
+async def test_youtube_ingestion_default_uses_native_provider(
+    stores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reading, catalog = stores
+    monkeypatch.setattr(
+        video_learning_service,
+        "load_video_learning_settings",
+        lambda: video_learning_service.DEFAULT_VIDEO_LEARNING_SETTINGS,
+    )
+
+    async def metadata(_request):
+        return {"title": "Native lecture", "thumbnail_url": "https://img/native.jpg"}
+
+    async def transcript(_video_id, _language):
+        return (
+            [{"start": 0, "end": 14, "text": "Native caption."}],
+            "en",
+            "youtube_transcript_api",
+        )
+
+    monkeypatch.setattr(video_learning_service, "_youtube_metadata", metadata)
+    monkeypatch.setattr(video_learning_service, "_youtube_transcript", transcript)
+
+    service = ReadingIngestionService(reading, catalog)
+    queued = service.queue_url("https://youtu.be/abc123xyz00")
+    ready = await service.process_url(queued.material_id)
+    manifest = reading.manifest(ready.material_id)
+
+    assert ready.status is IngestionStatus.READY
+    assert manifest.title == "Native lecture"
+    assert ready.cover_url == "https://img/native.jpg"
+    assert manifest.extractor == "youtube-captions"
+    assert reading.unit_text(ready.material_id, 1) == "Native caption."
+
+
+@pytest.mark.asyncio
+async def test_youtube_ingestion_uses_configured_invidious_captions(
+    stores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reading, catalog = stores
+    monkeypatch.setattr(
+        video_learning_service,
+        "load_video_learning_settings",
+        lambda: {
+            "version": 1,
+            "default_provider": "invidious",
+            "youtube": {"transcript_provider": "youtube_transcript_api"},
+            "invidious": {"api_base_url": "http://localhost:3000", "public_base_url": ""},
+        },
+    )
+
+    async def metadata(_client, _base, _video_id):
+        return {
+            "title": "Mirrored lecture",
+            "thumbnail_url": "https://img/mirror.jpg",
+            "captions": [{"label": "English", "languageCode": "en"}],
+        }
+
+    async def transcript(_client, _base, _video_id, _captions, _language, **_kwargs):
+        assert _language == ["zh-CN", "zh", "en"]
+        return ([{"start": 0, "end": 14, "text": "Mirrored caption."}], "en", "invidious")
+
+    monkeypatch.setattr(video_learning_service, "_invidious_metadata", metadata)
+    monkeypatch.setattr(video_learning_service, "_invidious_transcript", transcript)
+
+    service = ReadingIngestionService(reading, catalog)
+    queued = service.queue_url("https://youtu.be/abc123xyz00")
+    ready = await service.process_url(queued.material_id)
+    manifest = reading.manifest(ready.material_id)
+
+    assert ready.status is IngestionStatus.READY
+    assert manifest.title == "Mirrored lecture"
+    assert ready.cover_url == "https://img/mirror.jpg"
+    assert manifest.extractor == "youtube-captions"
+    assert reading.unit_text(ready.material_id, 1) == "Mirrored caption."
+
+
+@pytest.mark.asyncio
+async def test_youtube_ingestion_keeps_playback_when_invidious_provider_fails(
+    stores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reading, catalog = stores
+    monkeypatch.setattr(
+        video_learning_service,
+        "load_video_learning_settings",
+        lambda: {
+            "version": 1,
+            "default_provider": "invidious",
+            "youtube": {"transcript_provider": "youtube_transcript_api"},
+            "invidious": {"api_base_url": "http://localhost:3000", "public_base_url": ""},
+        },
+    )
+
+    async def metadata(_client, _base, _video_id):
+        raise video_learning_service.TimedMediaError("Invidious request failed with HTTP 503.")
+
+    monkeypatch.setattr(video_learning_service, "_invidious_metadata", metadata)
+    service = ReadingIngestionService(reading, catalog)
+    queued = service.queue_url("https://youtu.be/abc123xyz00")
+    ready = await service.process_url(queued.material_id)
+
+    assert ready.status is IngestionStatus.READY
+    assert ready.cover_url.endswith("hqdefault.jpg")
+    assert reading.manifest(ready.material_id).extractor == "youtube-no-captions"
+    assert reading.unit_text(ready.material_id, 1) == TRANSCRIPT_UNAVAILABLE_TEXT
 
 
 @pytest.mark.parametrize(
@@ -412,10 +731,85 @@ async def test_local_video_keeps_playable_raw_and_transcribes_chunks(
 
 
 @pytest.mark.asyncio
+async def test_media_without_a_configured_provider_fails_before_running_ffmpeg(
+    stores, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Name the missing setting, and do not spend ffmpeg proving it is missing."""
+    reading, catalog = stores
+    source = tmp_path / "lecture.mp4"
+    source.write_bytes(b"video bytes")
+    ran = {"chunker": False}
+
+    async def chunker(_path: Path):
+        ran["chunker"] = True
+        return []
+
+    monkeypatch.setattr(
+        ingestion_module,
+        "_probe_stt_configuration",
+        lambda: "No active STT model is configured. Set it in Settings > Voice.",
+    )
+    service = ReadingIngestionService(reading, catalog, media_chunker=chunker)
+    service._probes_stt = True
+
+    queued = await service.queue_media(source, filename="lecture.mp4")
+    failed = await service.process_media(queued.material_id)
+
+    assert failed.status is IngestionStatus.FAILED
+    assert failed.error_code == "stt_not_configured"
+    assert "Settings > Voice" in failed.error_detail
+    assert ran["chunker"] is False
+    # The upload survives the failure, so configuring a provider and retrying
+    # is all the user has to do.
+    assert reading.raw_path(queued.material_id).read_bytes() == b"video bytes"
+
+
+@pytest.mark.asyncio
+async def test_media_retry_reruns_transcription_from_the_stored_original(
+    stores, tmp_path: Path
+) -> None:
+    """A failed transcription must not cost the user the upload.
+
+    The original is stored before speech-to-text is attempted, so retrying is
+    a server-side re-run — not "please find that two-gigabyte lecture again".
+    """
+    reading, catalog = stores
+    source = tmp_path / "lecture.mp4"
+    source.write_bytes(b"stable video bytes")
+    attempts = {"n": 0}
+
+    async def chunker(_path: Path):
+        return [(0.0, 600.0, b"audio-one")]
+
+    async def transcriber(_audio: bytes, **_kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("No endpoint URL configured for STT.")
+        return "the transcript, second time around"
+
+    service = ReadingIngestionService(
+        reading, catalog, media_chunker=chunker, transcriber=transcriber
+    )
+    queued = await service.queue_media(source, filename="lecture.mp4")
+    failed = await service.process_media(queued.material_id)
+
+    assert failed.status is IngestionStatus.FAILED
+    # Still playable while it is broken: the bytes never depended on the text.
+    assert reading.raw_path(queued.material_id).read_bytes() == b"stable video bytes"
+
+    recovered = await service.retry(queued.material_id)
+
+    assert recovered.status is IngestionStatus.READY
+    assert reading.unit_text(queued.material_id, 1) == "the transcript, second time around"
+    assert reading.raw_path(queued.material_id).read_bytes() == b"stable video bytes"
+
+
+@pytest.mark.asyncio
 async def test_media_ingestion_failure_is_logged_and_persisted(
     stores,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _reading, catalog = stores
     source = tmp_path / "broken.mp4"
@@ -424,6 +818,7 @@ async def test_media_ingestion_failure_is_logged_and_persisted(
     async def failing_chunker(_path: Path):
         raise RuntimeError("decoder crashed")
 
+    monkeypatch.setattr(ingestion_module, "_probe_stt_configuration", lambda: "")
     service = ReadingIngestionService(*stores, media_chunker=failing_chunker)
     with caplog.at_level(logging.ERROR, logger="deeptutor.reading.ingestion"):
         with pytest.raises(RuntimeError, match="decoder crashed"):

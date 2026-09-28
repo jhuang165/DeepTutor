@@ -460,7 +460,13 @@ def _static_capability(
 
     # 1. Check model-specific overrides first
     if model:
-        model_lower = model.lower()
+        # Google's model list returns resource names ("models/gemini-2.5-flash")
+        # while every MODEL_OVERRIDES key is a bare id, so a catalog-supplied id
+        # missed each vendor rule and fell through to the binding default. The
+        # embedding layer already strips this prefix (see embedding_endpoint.py
+        # and embedding/adapters/gemini.py); match the same normalized form here
+        # so "Vision: Auto" resolves identically for both spellings (#1579).
+        model_lower = model.lower().removeprefix("models/")
         # Sort by pattern length descending to match most specific first
         for pattern, overrides in sorted(MODEL_OVERRIDES.items(), key=lambda x: -len(x[0])):
             if model_lower.startswith(pattern):
@@ -508,6 +514,31 @@ def is_response_format_disabled_at_runtime(binding: str | None, model: str | Non
     if not binding or not model:
         return False
     return (binding.lower(), model.lower()) in _RUNTIME_DISABLED_RESPONSE_FORMAT
+
+
+# Runtime cache for providers that refuse to be told *which* tool to call.
+# Keyed by (binding_lower, model_lower), populated when a request naming a
+# function is rejected (DeepSeek V4 with thinking: "Thinking mode does not
+# support this tool_choice"). Recorded so the next forced round asks for
+# ``"required"`` up front instead of paying for a failed request first.
+_RUNTIME_DISABLED_FORCED_TOOL_CHOICE: set[tuple[str, str]] = set()
+
+
+def disable_forced_tool_choice_at_runtime(binding: str | None, model: str | None) -> None:
+    """Mark a (binding, model) pair as unable to have one tool forced."""
+    if not binding or not model:
+        return
+    _RUNTIME_DISABLED_FORCED_TOOL_CHOICE.add((binding.lower(), model.lower()))
+
+
+def is_forced_tool_choice_disabled_at_runtime(
+    binding: str | None,
+    model: str | None,
+) -> bool:
+    """Whether this pair was recorded by :func:`disable_forced_tool_choice_at_runtime`."""
+    if not binding or not model:
+        return False
+    return (binding.lower(), model.lower()) in _RUNTIME_DISABLED_FORCED_TOOL_CHOICE
 
 
 def supports_response_format(binding: str, model: str | None = None) -> bool:
@@ -692,4 +723,6 @@ __all__ = [
     "get_effective_temperature",
     "disable_response_format_at_runtime",
     "is_response_format_disabled_at_runtime",
+    "disable_forced_tool_choice_at_runtime",
+    "is_forced_tool_choice_disabled_at_runtime",
 ]

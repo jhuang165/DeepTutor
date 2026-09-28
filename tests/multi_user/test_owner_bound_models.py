@@ -30,11 +30,27 @@ def _catalog(*, owner_bound: bool) -> dict:
     profile: dict = {
         "id": CODEX_PROFILE,
         "name": "OpenAI Codex",
-        "models": [{"id": "m-sol", "name": "GPT-5.6-Sol", "model": "gpt-5.6-sol"}],
+        "binding": "openai",
+        "models": [
+            {
+                "id": "m-sol",
+                "name": "GPT-5.6-Sol",
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "high",
+            }
+        ],
     }
     if owner_bound:
         profile["owner_bound"] = True
-    return {"services": {"llm": {"profiles": [profile]}}}
+    return {
+        "services": {
+            "llm": {
+                "active_profile_id": CODEX_PROFILE,
+                "active_model_id": "m-sol",
+                "profiles": [profile],
+            }
+        }
+    }
 
 
 def _grant(_user_id=None) -> dict:
@@ -47,7 +63,9 @@ def test_owner_bound_profile_is_withheld_from_granted_users(tmp_path, monkeypatc
     token = set_current_user(make_user(tmp_path))
     try:
         assert model_access.redacted_model_access()["llm"] == []
-        assert model_access.allowed_llm_options()["options"] == []
+        allowed = model_access.allowed_llm_options()
+        assert allowed["options"] == []
+        assert allowed["active"] is None
         assert model_access.has_capability_access("llm") is False
         with pytest.raises(PermissionError):
             model_access.apply_allowed_llm_selection(
@@ -83,6 +101,14 @@ def test_ordinary_shared_profiles_stay_grantable(tmp_path, monkeypatch):
     try:
         granted = model_access.redacted_model_access()["llm"]
         assert [item["model_id"] for item in granted] == ["m-sol"]
+        option = model_access.allowed_llm_options()["options"][0]
+        assert option["provider"] == "openai"
+        assert option["reasoning_effort"] == "high"
+        assert option["is_active_default"] is True
+        assert model_access.allowed_llm_options()["active"] == {
+            "profile_id": CODEX_PROFILE,
+            "model_id": "m-sol",
+        }
         assert model_access.has_capability_access("llm") is True
         assert model_access.apply_allowed_llm_selection(
             {"profile_id": CODEX_PROFILE, "model_id": "m-sol"}
@@ -105,3 +131,23 @@ def test_a_codebuddy_profile_is_owner_bound_by_its_binding() -> None:
     assert model_access.is_owner_bound({"binding": "openai"}) is False
     # The explicit flag still wins for anything else that sets it.
     assert model_access.is_owner_bound({"binding": "openai", "owner_bound": True}) is True
+
+
+def test_individual_provider_references_keep_subscription_models_private(tmp_path, monkeypatch):
+    catalog = _catalog(owner_bound=False)
+    profile = catalog["services"]["llm"]["profiles"][0]
+    profile["models"][0]["provider_ref"] = {"connection_id": "private", "binding": "codebuddy"}
+    catalog["connections"] = [{"id": "private", "name": "My IDE login", "provider": "codebuddy"}]
+    monkeypatch.setattr(model_access, "admin_catalog", lambda: catalog)
+    monkeypatch.setattr(model_access, "load_grant", _grant)
+    token = set_current_user(make_user(tmp_path))
+    try:
+        assert model_access.redacted_model_access()["llm"] == []
+        catalog["connections"][0]["provider"] = "custom"
+        profile["models"][0]["provider_ref"]["binding"] = "custom"
+        rows = model_access.redacted_model_access()["llm"]
+        assert rows[0]["provider"] == "custom"
+        assert rows[0]["profile_name"] == "My IDE login"
+        assert rows[0]["model_id"] == "m-sol"
+    finally:
+        reset_current_user(token)

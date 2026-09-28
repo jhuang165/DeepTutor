@@ -18,6 +18,7 @@ class ToolParameter:
     """One parameter in a tool's function-calling schema.
 
     Attributes:
+        sensitive: Withhold the value from the trace event (see the field).
         items: Inner JSON Schema for ``type="array"`` parameters. **Required
             by strict providers (Gemini, Anthropic)** even though OpenAI
             silently tolerates its absence — leaving it out causes a 400
@@ -33,6 +34,13 @@ class ToolParameter:
     default: Any = None
     enum: list[str] | None = None
     items: dict[str, Any] | None = None
+    #: Keep this argument's value out of the ``tool_call`` event the trace
+    #: renders. The model still sends it and the tool still receives it — this
+    #: only stops it from being shown back to the person the tool is acting
+    #: for. Set it where the value is something they must not see: the
+    #: ``expected_answer`` of a question they are about to be asked is on
+    #: screen, one disclosure triangle away, for as long as that trace exists.
+    sensitive: bool = False
 
     def to_schema(self) -> dict[str, Any]:
         """Convert to JSON Schema property dict."""
@@ -143,6 +151,9 @@ class ToolResult:
             ``ask_user`` to keep the turn alive across the user's
             answer instead of ending and starting a new turn.
             Shape mirrors ``AskUserPayload.to_dict()``.
+        model_message: Request-local multimodal context attached after this
+            tool result. The loop must never add it to durable messages or
+            user-facing stream metadata.
     """
 
     content: str = ""
@@ -151,6 +162,9 @@ class ToolResult:
     success: bool = True
     terminate_turn: bool = False
     pause_for_user: dict[str, Any] | None = None
+    # Private model-only follow-up (for example verified source image parts).
+    # Never copy this into stream events, citation rows, or persisted metadata.
+    model_message: dict[str, Any] | None = field(default=None, repr=False)
 
     def __str__(self) -> str:
         return self.content

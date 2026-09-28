@@ -1,6 +1,7 @@
 """API endpoint tests for the mastery_path router."""
 
 import json
+import time
 from unittest.mock import AsyncMock, patch
 
 from fastapi import FastAPI
@@ -8,7 +9,13 @@ from fastapi.testclient import TestClient
 import pytest
 
 from deeptutor.api.routers.mastery_path import router, ws_router
-from deeptutor.learning.models import LearningProgress, PendingQuestion, QuizAttempt
+from deeptutor.learning.models import (
+    KnowledgeType,
+    LearningProgress,
+    PendingQuestion,
+    QuizAttempt,
+)
+from deeptutor.learning.scheduler import SpacedRepetitionScheduler
 from deeptutor.learning.service import LearningService
 from deeptutor.learning.storage import LearningStore
 
@@ -48,7 +55,92 @@ def _module_payload(module_id: str = "m1", kp_id: str = "kp1") -> dict:
     }
 
 
+def test_path_retention_setting_persists_and_reschedules_review(client, tmp_path):
+    store = LearningStore(root=tmp_path)
+    progress = LearningProgress(book_id="srs-path", name="SRS path")
+    progress.knowledge_types["kp1"] = KnowledgeType.CONCEPT
+    scheduler = SpacedRepetitionScheduler()
+    state = scheduler.get_initial_state(KnowledgeType.CONCEPT, now=time.time())
+    state.last_review_at = time.time()
+    state.next_review_at = state.last_review_at + 4 * 86400
+    progress.repetition_states["kp1"] = state
+    store.save(progress)
+    old_due = state.next_review_at
+
+    response = client.put(
+        "/api/mastery-paths/topics/srs-path/review-settings",
+        json={"desired_retention": 0.97},
+    )
+    assert response.status_code == 200
+    assert response.json()["review_settings"] == {
+        "desired_retention": 0.97,
+        "scope": "path",
+    }
+    reloaded = LearningStore(root=tmp_path).load("srs-path")
+    assert reloaded is not None
+    assert reloaded.desired_retention == 0.97
+    assert reloaded.repetition_states["kp1"].desired_retention == 0.97
+    assert reloaded.repetition_states["kp1"].next_review_at < old_due
+    assert client.get("/api/mastery-paths/topics/srs-path/review-settings").json() == {
+        "desired_retention": 0.97,
+        "scope": "path",
+    }
+
+
+@pytest.mark.parametrize("invalid", [0.5, 1.0, "NaN"])
+def test_path_retention_setting_rejects_invalid_values(client, tmp_path, invalid):
+    store = LearningStore(root=tmp_path)
+    store.save(LearningProgress(book_id="srs-path"))
+    response = client.put(
+        "/api/mastery-paths/topics/srs-path/review-settings",
+        json={"desired_retention": invalid},
+    )
+    assert response.status_code == 422
+    assert store.load("srs-path").desired_retention == 0.9
+
+
+def test_path_retention_setting_requires_existing_path(client):
+    response = client.put(
+        "/api/mastery-paths/topics/missing/review-settings",
+        json={"desired_retention": 0.92},
+    )
+    assert response.status_code == 404
+
+
 # -- GET /progress (list_all) --------------------------------------------
+
+
+class TestReadingLearningRecords:
+    def test_summary_returns_progress_and_activity(self, app, client):
+        store = LearningStore(root=app.state.learning_root)
+        store.record_reading_position("rm_one", locator=3, percentage=0.3)
+        store.record_reading_activity(
+            "rm_one",
+            extension_id="sample",
+            action="open",
+            locator=3,
+            result_type="card",
+        )
+
+        response = client.get("/api/mastery-paths/reading/records")
+
+        assert response.status_code == 200, response.text
+        data = response.json()
+        assert data["progress"] == [
+            {
+                "material_id": "rm_one",
+                "latest_locator": 3,
+                "latest_percentage": 0.3,
+                "furthest_locator": 3,
+                "furthest_percentage": 0.3,
+                "updated_at": data["progress"][0]["updated_at"],
+            }
+        ]
+        assert len(data["activities"]) == 1
+        assert data["activities"][0]["material_id"] == "rm_one"
+        assert data["activities"][0]["extension_id"] == "sample"
+        assert data["activities"][0]["action"] == "open"
+        assert data["activities"][0]["result_type"] == "card"
 
 
 class TestListProgress:
@@ -132,6 +224,81 @@ class TestListProgress:
 
 
 class TestTopicProductApi:
+    def test_topic_relations_round_trip_through_create_and_reorder_edit(self, client):
+        created = client.post(
+            "/api/mastery-paths/topics",
+            json={
+                "name": "Structured route",
+                "goal": "Keep objective provenance",
+                "sources": [
+                    {
+                        "client_ref": "notes",
+                        "kind": "notebook",
+                        "label": "Study notes",
+                    }
+                ],
+                "modules": [
+                    {
+                        "name": "Region",
+                        "knowledge_points": [
+                            {"client_ref": "first", "name": "First objective"},
+                            {
+                                "client_ref": "second",
+                                "name": "Second objective",
+                                "prerequisite_refs": ["first"],
+                                "topic_source_refs": ["notes"],
+                            },
+                        ],
+                    }
+                ],
+            },
+        ).json()
+        module = created["map"]["modules"][0]
+        first, second = module["knowledge_points"]
+        source_id = created["sources"][0]["id"]
+        assert second["prerequisite_ids"] == [first["id"]]
+        assert second["topic_source_ids"] == [source_id]
+
+        response = client.put(
+            f"/api/mastery-paths/topics/{created['path_id']}/map",
+            json={
+                "modules": [
+                    {
+                        "id": module["id"],
+                        "name": "Reordered region",
+                        "knowledge_points": [
+                            {
+                                "id": second["id"],
+                                "name": "Second objective, renamed",
+                                "type": second["type"],
+                                "module_id": module["id"],
+                                "prerequisite_ids": second["prerequisite_ids"],
+                                "topic_source_ids": second["topic_source_ids"],
+                            },
+                            {
+                                "id": first["id"],
+                                "name": first["name"],
+                                "type": first["type"],
+                                "module_id": module["id"],
+                                "prerequisite_ids": first["prerequisite_ids"],
+                                "topic_source_ids": first["topic_source_ids"],
+                            },
+                        ],
+                    }
+                ]
+            },
+        )
+
+        assert response.status_code == 200
+        edited = response.json()["map"]["modules"][0]["knowledge_points"]
+        # A renamed objective gets fresh identity so previous mastery evidence
+        # cannot silently follow a changed learning target.
+        assert edited[0]["id"] != second["id"]
+        assert edited[1]["id"] == first["id"]
+        assert edited[0]["name"] == "Second objective, renamed"
+        assert edited[0]["prerequisite_ids"] == [first["id"]]
+        assert edited[0]["topic_source_ids"] == [source_id]
+
     def test_edit_topic_map_preserves_reordered_evidence_by_entity_id(self, client, app):
         created = client.post(
             "/api/mastery-paths/topics",
@@ -683,6 +850,74 @@ class TestGetProgress:
         assert path_map["path_revision"] == progress["version"]
 
 
+# -- GET /progress/{book_id}/board ----------------------------------------
+
+
+class TestProgressBoard:
+    def test_board_empty(self, client):
+        resp = client.get("/api/mastery-paths/progress/boardempty/board")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["book_id"] == "boardempty"
+        assert data["cards"] == []
+        assert data["modules"] == []
+
+    def test_board_card_shape_and_position(self, client):
+        client.post(
+            "/api/mastery-paths/progress/boardbook/init-modules",
+            json={
+                "modules": [
+                    {
+                        "id": "m1",
+                        "name": "M1",
+                        "order": 0,
+                        "knowledge_points": [
+                            {"id": "kp1", "name": "KP1", "type": "concept", "module_id": "m1"},
+                            {"id": "kp2", "name": "KP2", "type": "procedure", "module_id": "m1"},
+                        ],
+                    },
+                    {
+                        "id": "m2",
+                        "name": "M2",
+                        "order": 1,
+                        "knowledge_points": [
+                            {"id": "kp3", "name": "KP3", "type": "memory", "module_id": "m2"},
+                        ],
+                    },
+                ]
+            },
+        )
+        resp = client.get("/api/mastery-paths/progress/boardbook/board")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["cards"]) == 3
+        assert len(data["modules"]) == 2
+
+        first = data["cards"][0]
+        assert first["id"] == "kp1"
+        assert first["name"] == "KP1"
+        assert first["type"] == "concept"
+        assert first["module_id"] == "m1"
+        assert first["module_name"] == "M1"
+        assert first["status"] == "new"
+        assert first["mastery_level"] == 0.0
+        assert first["next_review_at"] is None
+        assert first["position"] == {"column": 0, "row": 0}
+
+        third = data["cards"][2]
+        assert third["position"] == {"column": 1, "row": 0}
+
+        module = data["modules"][0]
+        assert module["name"] == "M1"
+        assert module["mastered"] == 0
+        assert module["total"] == 2
+        assert len(module["cards"]) == 2
+
+    def test_board_invalid_book_id_returns_400(self, client):
+        resp = client.get("/api/mastery-paths/progress/a\\b/board")
+        assert resp.status_code == 400
+
+
 # -- DELETE /progress/{book_id} -------------------------------------------
 
 
@@ -743,6 +978,8 @@ class TestObjectiveReport:
         assert objective["gate"] == "qualitative"  # concept type
         assert [a["prompt"] for a in objective["attempts"]] == ["What is 2+2?"]
         assert objective["attempts"][0]["answer"] == "4"
+        assert objective["evidence_count"] == 1
+        assert objective["evidence"][0]["assessment_type"] == "quiz"
         assert "do-not-expose" not in resp.text
 
     def test_report_for_unknown_objective_returns_404(self, client):

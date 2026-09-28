@@ -9,6 +9,7 @@ let dispatchedEvents: Array<{ type: string; detail: any }> = [];
 
 function mockWindow() {
   global.window = {
+    location: { search: "", origin: "http://localhost" },
     localStorage: {
       getItem: (key: string) => mockLocalStorage[key] ?? null,
       setItem: (key: string, value: string) => {
@@ -40,7 +41,10 @@ mockWindow();
 
 import * as settingsContext from "../features/settings/store/SettingsStore";
 import {
+  CODE_BLOCK_SHOW_LINE_NUMBERS_STORAGE_KEY,
   CODE_BLOCK_SETTINGS_EVENT,
+  CODE_BLOCK_THEME_STORAGE_KEY,
+  CODE_BLOCK_WRAP_LONG_LINES_STORAGE_KEY,
   readStoredCodeBlockShowLineNumbers,
   readStoredCodeBlockTheme,
   readStoredCodeBlockWrapLongLines,
@@ -106,7 +110,7 @@ test("settings-context: persistUiSettingsPatch sends only the changed code-block
     },
   );
 
-  assert.match(String(capturedInput), /\/api\/settings\/ui$/);
+  assert.match(String(capturedInput), /\/api\/settings\/ui\?dt_workspace=$/);
   assert.equal(capturedInit?.method, "PUT");
   assert.deepEqual(JSON.parse(String(capturedInit?.body)), {
     code_block_theme: "dracula",
@@ -133,54 +137,6 @@ test("settings-context: persistUiSettingsPatch can save theme without sending co
   assert.deepEqual(JSON.parse(String(capturedInit?.body)), {
     theme: "dark",
   });
-});
-
-test("settings-context: boolean values survive reload cycle from localStorage", () => {
-  const sync = (settingsContext as any).syncLoadedCodeBlockSettingsToAppShell;
-
-  mockLocalStorage = {};
-  sync({
-    code_block_theme: "dracula",
-    code_block_show_line_numbers: true,
-    code_block_wrap_long_lines: true,
-  });
-
-  assert.equal(readStoredCodeBlockTheme(), "dracula");
-  assert.equal(readStoredCodeBlockShowLineNumbers(), true);
-  assert.equal(readStoredCodeBlockWrapLongLines(), true);
-
-  assert.equal(
-    readStoredCodeBlockTheme(),
-    "dracula",
-    "Theme should persist across reload",
-  );
-  assert.equal(
-    readStoredCodeBlockShowLineNumbers(),
-    true,
-    "Show line numbers should persist across reload",
-  );
-  assert.equal(
-    readStoredCodeBlockWrapLongLines(),
-    true,
-    "Wrap long lines should persist across reload",
-  );
-
-  const secondSync = sync({
-    code_block_theme: "dracula",
-    code_block_show_line_numbers: true,
-    code_block_wrap_long_lines: true,
-  });
-
-  assert.equal(
-    secondSync.code_block_show_line_numbers,
-    true,
-    "Show line numbers should remain true after backend sync",
-  );
-  assert.equal(
-    secondSync.code_block_wrap_long_lines,
-    true,
-    "Wrap long lines should remain true after backend sync",
-  );
 });
 
 test("settings-context: syncLoadedCodeBlockSettingsToAppShell handles string boolean representations from backend", () => {
@@ -221,9 +177,9 @@ test("settings-context: backend values override localStorage values during sync"
 
   // Simulate localStorage having different (old/stale) values
   mockLocalStorage = {
-    "deeptutor.codeBlockShowLineNumbers": "false",
-    "deeptutor.codeBlockWrapLongLines": "false",
-    "deeptutor.codeBlockTheme": "oneDark",
+    [CODE_BLOCK_SHOW_LINE_NUMBERS_STORAGE_KEY]: "false",
+    [CODE_BLOCK_WRAP_LONG_LINES_STORAGE_KEY]: "false",
+    [CODE_BLOCK_THEME_STORAGE_KEY]: "oneDark",
   };
 
   // Backend returns true values
@@ -285,16 +241,8 @@ test("settings-context: routes code-block state through the AppShell single sour
     /syncLoadedCodeBlockSettingsToAppShell\(\s*payload\.ui,?\s*\)/,
     "loadSettings should push backend-loaded code-block values into the AppShell source.",
   );
-  // User edits delegate to the AppShell setters (which normalize, persist to
-  // localStorage, and notify consumers) rather than a local mirror.
-  assert.match(
-    source,
-    /setAppShellCodeBlockShowLineNumbers\(next\)/,
-    "updateCodeBlockShowLineNumbers should delegate to the AppShell setter.",
-  );
-  assert.match(
-    source,
-    /setAppShellCodeBlockWrapLongLines\(next\)/,
-    "updateCodeBlockWrapLongLines should delegate to the AppShell setter.",
-  );
+  // User edits stay in the global draft until Apply publishes to AppShell.
+  assert.match(source, /stageUi\(\{ code_block_show_line_numbers \}\)/);
+  assert.match(source, /stageUi\(\{ code_block_wrap_long_lines \}\)/);
+  assert.match(source, /syncLoadedCodeBlockSettingsToAppShell\(ui\)/);
 });

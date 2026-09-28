@@ -13,11 +13,11 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from deeptutor.core.stream import StreamEvent, StreamEventType
-from deeptutor.services.path_service import get_path_service
 from deeptutor.services.session.protocol import SessionStoreProtocol
 from deeptutor.services.session.scope import store_scope
 
 from .._turn_runtime_shared import (
+    _coerce_bool,
     _LiveSubscriber,
     _TurnExecution,
 )
@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from deeptutor.services.app_update import UpdateJob
 
 logger = logging.getLogger(__name__)
+_SUBSCRIPTION_POLL_SECONDS = 5.0
 
 
 class TurnLifecycle:
@@ -198,15 +199,31 @@ class TurnLifecycle:
         failure_code: str = "",
         retryable: bool = False,
     ) -> bool:
-        return await self.store.transition_turn(
-            execution.turn_id,
-            status,
-            expected_status="running",
-            fencing_token=(execution.lease.fencing_token if execution.lease is not None else None),
-            error=error,
-            failure_code=failure_code,
-            retryable=retryable,
-        )
+        # A turn parked on ``ask_user`` sits at ``waiting_input``, and the
+        # waiter's ``finally`` fires its restore to ``running`` through
+        # ``asyncio.shield`` — fire-and-forget, so on a cancellation it races
+        # this write and loses about as often as it wins. A terminal write
+        # that accepts only ``running`` therefore no-ops on exactly the turns
+        # a learner stopped mid-question: no terminal row, no ``done`` event,
+        # and a durable ``waiting_input`` row that ``_begin_turn_sync`` counts
+        # as active — every later message in that session is refused with
+        # "Session already has an active turn" (#1297, #1359). Both are live
+        # states owned by this execution, so both are valid predecessors of
+        # its terminal state; the fencing token is what proves ownership, and
+        # it is unchanged.
+        fencing_token = execution.lease.fencing_token if execution.lease is not None else None
+        for expected in ("running", "waiting_input"):
+            if await self.store.transition_turn(
+                execution.turn_id,
+                status,
+                expected_status=expected,
+                fencing_token=fencing_token,
+                error=error,
+                failure_code=failure_code,
+                retryable=retryable,
+            ):
+                return True
+        return False
 
     async def _coordinate_execution(self, execution: _TurnExecution) -> None:
         """Renew ownership and consume commands addressed to this worker."""
@@ -230,11 +247,34 @@ class TurnLifecycle:
                             execution.task.cancel()
                         return
                     if command.kind == "submit_user_reply":
-                        await self.submit_user_reply(
+                        delivered = await self.submit_user_reply(
                             execution.turn_id,
                             text=command.payload.get("text"),
                             answers=command.payload.get("answers"),
                         )
+                        if not delivered:
+                            turn = await self.store.get_turn(execution.turn_id)
+                            persisted_status = str((turn or {}).get("status") or "")
+                            logger.warning(
+                                "submit_user_reply command %s for turn %s was "
+                                "accepted (lease owner=%s) but not delivered: no "
+                                "waiter is registered (persisted status=%s)",
+                                command.command_id,
+                                execution.turn_id,
+                                lease.owner_id,
+                                persisted_status or "unknown",
+                            )
+                            if persisted_status == "waiting_input":
+                                # The owner lease is alive, but the execution
+                                # that owned the ask_user waiter is not. A
+                                # queued command can never reach a queue that
+                                # no longer exists, so the false-positive ACK
+                                # must be followed by a terminal stream; the
+                                # cancellation path persists error+done and
+                                # frees the session for the next turn.
+                                if execution.task is not None and not execution.task.done():
+                                    execution.task.cancel()
+                                return
                     elif command.kind == "user_input":
                         from deeptutor.runtime.stream_bus import get_bus
 
@@ -324,11 +364,16 @@ class TurnLifecycle:
         # the frontend's ``isStreaming`` state clears immediately rather than
         # waiting on the 45s heartbeat-timeout + reconnect catchup path.
         done_yielded = False
+        terminal_error_yielded = False
 
         def _track(item: dict[str, Any]) -> dict[str, Any]:
-            nonlocal done_yielded
+            nonlocal done_yielded, terminal_error_yielded
             if str(item.get("type") or "") == "done":
                 done_yielded = True
+            if str(item.get("type") or "") == "error" and (item.get("metadata") or {}).get(
+                "turn_terminal"
+            ):
+                terminal_error_yielded = True
             return item
 
         for item in backlog:
@@ -371,7 +416,11 @@ class TurnLifecycle:
                 # persisted history above — synthesise one so the caller can
                 # still close out its streaming state cleanly.
                 if not done_yielded:
-                    if turn is not None and str(turn.get("status") or "") == "failed":
+                    if (
+                        not terminal_error_yielded
+                        and turn is not None
+                        and str(turn.get("status") or "") == "failed"
+                    ):
                         error_event = self._synthesize_error_event(
                             turn_id,
                             turn,
@@ -386,14 +435,49 @@ class TurnLifecycle:
                         seq=last_seq + 1,
                     )
                 return
-            # A running turn may be owned by another worker. Subscription is a
-            # read-only operation; distributed coordinators attach a live event
-            # source above this local-runtime fallback.
-            return
+            # A running turn may be owned by another worker, including one
+            # whose lease is about to be recovered. Keep watching persisted
+            # events so recovery can reach this subscriber without requiring
+            # the browser to reconnect after its long idle timeout.
         queue_drained = False
         try:
             while True:
-                item = await queue.get()
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=_SUBSCRIPTION_POLL_SECONDS)
+                except TimeoutError:
+                    # A dead producer cannot put a sentinel on its old local
+                    # queue. Reconcile against the durable turn, including a
+                    # recovery worker's terminal events, while the socket is
+                    # still open (#1570).
+                    for persisted in await self.store.get_turn_events(turn_id, after_seq=last_seq):
+                        seq = int(persisted.get("seq") or 0)
+                        if seq <= last_seq:
+                            continue
+                        last_seq = seq
+                        yield _track(persisted)
+                    persisted_turn = await self.store.get_turn(turn_id)
+                    if persisted_turn is None or str(persisted_turn.get("status") or "") in {
+                        "failed",
+                        "cancelled",
+                        "completed",
+                    }:
+                        if not done_yielded:
+                            if (
+                                not terminal_error_yielded
+                                and persisted_turn is not None
+                                and persisted_turn.get("status") == "failed"
+                            ):
+                                error_event = self._synthesize_error_event(
+                                    turn_id, persisted_turn, seq=last_seq + 1
+                                )
+                                if error_event is not None:
+                                    yield error_event
+                                    last_seq += 1
+                            yield self._synthesize_done_event(
+                                turn_id, persisted_turn, seq=last_seq + 1
+                            )
+                        break
+                    continue
                 if item is None:
                     queue_drained = True
                     break
@@ -459,6 +543,11 @@ class TurnLifecycle:
         metadata: dict[str, Any] = {"status": status, "synthesized": True}
         if error:
             metadata["error"] = error
+        failure_code = str((turn or {}).get("failure_code") or "")
+        if failure_code:
+            metadata["error_code"] = failure_code
+        if _coerce_bool((turn or {}).get("retryable"), False):
+            metadata["retryable"] = True
         return {
             "type": "done",
             "source": "turn_runtime",
@@ -491,6 +580,8 @@ class TurnLifecycle:
                 "status": "failed",
                 "synthesized": True,
                 "turn_terminal": True,
+                "error_code": str((turn or {}).get("failure_code") or ""),
+                "retryable": _coerce_bool((turn or {}).get("retryable"), False),
             },
             "session_id": str((turn or {}).get("session_id") or ""),
             "turn_id": turn_id,
@@ -531,6 +622,33 @@ class TurnLifecycle:
                 type=StreamEventType.SESSION_META,
                 source="turn_runtime",
                 metadata={"mastery_path_id": ended_on},
+            ),
+        )
+
+    async def _publish_mastery_mode_change(
+        self,
+        execution: _TurnExecution,
+        *,
+        started_in: str,
+        ended_in: str,
+    ) -> None:
+        """Announce a mode the tutor switched into, so the client stops lying.
+
+        The three mode buttons above the transcript are the learner's only sign
+        of which tools the tutor may reach for. A switch the tutor made itself
+        already reached the conversation's stored preference, but an open
+        client would keep the old one highlighted until a reload — so the tutor
+        would say "I have switched to outline mode" over a header still reading
+        "Study", which is the product contradicting itself out loud.
+        """
+        if not ended_in or ended_in == started_in:
+            return
+        await self._publish_live_event(
+            execution,
+            StreamEvent(
+                type=StreamEventType.SESSION_META,
+                source="turn_runtime",
+                metadata={"mastery_session_mode": ended_in},
             ),
         )
 
@@ -614,12 +732,10 @@ class TurnLifecycle:
                 return
             execution.persisted_events = persisted_events + list(persisted_batch)
             execution.events_persisted = len(execution.persisted_events) == len(events)
-            await self._mirror_events_to_workspace(execution, persisted_batch)
             execution.events_flushed = True
             return
 
         try:
-            mirrored: list[dict[str, Any]] = []
             for index, payload in enumerate(pending):
                 try:
                     persisted = await self.store.append_turn_event(execution.turn_id, payload)
@@ -639,7 +755,6 @@ class TurnLifecycle:
                     )
                     break
                 persisted_events.append(persisted)
-                mirrored.append(persisted)
         except Exception:
             # Cache a committed prefix so retries continue after it instead of
             # duplicating already persisted events on non-batching backends.
@@ -647,37 +762,4 @@ class TurnLifecycle:
             raise
         execution.persisted_events = persisted_events
         execution.events_persisted = len(persisted_events) == len(events)
-        await self._mirror_events_to_workspace(execution, mirrored)
         execution.events_flushed = True
-
-    async def _mirror_events_to_workspace(
-        self, execution: _TurnExecution, payloads: list[dict[str, Any]]
-    ) -> None:
-        """Mirror turn events to the task-local ``events.jsonl`` under ``data/user/workspace``.
-
-        One open/write for the whole batch, off the event loop: the previous
-        per-event ``open()+append`` ran synchronously on the loop thread and
-        stretched turn finalisation (and every other connection) on slow
-        storage. ``to_thread`` copies contextvars, so the per-user path scope
-        resolves the same as on the loop.
-        """
-        if not payloads:
-            return
-        await asyncio.to_thread(self._mirror_events_to_workspace_sync, execution, payloads)
-
-    @staticmethod
-    def _mirror_events_to_workspace_sync(
-        execution: _TurnExecution, payloads: list[dict[str, Any]]
-    ) -> None:
-        try:
-            path_service = get_path_service()
-            task_dir = path_service.get_task_workspace(execution.capability, execution.turn_id)
-            task_dir.mkdir(parents=True, exist_ok=True)
-            event_file = task_dir / "events.jsonl"
-            lines = "".join(
-                json.dumps(payload, ensure_ascii=False, default=str) + "\n" for payload in payloads
-            )
-            with open(event_file, "a", encoding="utf-8") as f:
-                f.write(lines)
-        except Exception:
-            logger.debug("Failed to mirror turn events to workspace", exc_info=True)

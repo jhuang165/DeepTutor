@@ -58,7 +58,13 @@ def _material(*, duration: int = 100) -> dict[str, object]:
         "metadata": {"duration_seconds": duration},
         "transcript": {
             "status": "ready",
-            "cues": [{"start": 1.25, "end": 3.5, "text": "one\n<script>two</script>"}],
+            "cues": [
+                {
+                    "start": 1.25,
+                    "end": 3.5,
+                    "text": "one&nbsp;&nbsp;&amp;\n<script>two</script>",
+                }
+            ],
         },
         "learning": {"last_position": 0},
         "provider_cache": {
@@ -190,6 +196,59 @@ def test_video_note_errors_are_bounded_and_useful(client: TestClient) -> None:
     assert client.put(f"{notes_url}/missing-note", json={"body": "Note"}).status_code == 404
 
 
+def test_video_notes_export_markdown_and_stay_account_scoped(
+    client: TestClient,
+    notebook_manager: NotebookManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    material = _material()
+    material["metadata"]["title"] = "Timestamped lesson"
+    material["transcript"]["cues"] = [
+        {"start": 1.25, "end": 3.5, "text": "First quoted idea."},
+        {"start": 65, "end": 70, "text": "Second quoted idea."},
+        {"start": 80, "end": 90, "text": "Unquoted transcript tail."},
+    ]
+    service.get_timed_media_store().save(material)
+    material_id = str(material["material_id"])
+    notes_url = f"/api/video-learning/materials/{material_id}/notes"
+    export_url = f"{notes_url}.md"
+
+    empty_response = client.get(export_url)
+    assert empty_response.status_code == 200
+    assert empty_response.headers["content-type"].startswith("text/markdown")
+    assert empty_response.text == (
+        "# Video notes: Timestamped lesson\n\n_No timestamped notes captured yet._\n"
+    )
+
+    client.post(notes_url, json={"body": "Opening note", "time_seconds": 2})
+    client.post(notes_url, json={"body": "Later note", "time_seconds": 66})
+
+    response = client.get(export_url)
+    assert response.status_code == 200
+    assert response.headers["content-disposition"] == 'attachment; filename="video-notes.md"'
+    assert response.text == (
+        "# Video notes: Timestamped lesson\n\n"
+        "## 0:02\n\nOpening note\n\n> First quoted idea.\n\n"
+        "## 1:06\n\nLater note\n\n> Second quoted idea.\n"
+    )
+    assert "Unquoted transcript tail" not in response.text
+    assert "https://youtu.be" not in response.text
+    assert "provider_cache" not in response.text
+    assert "dQw4w9WgXcQ" not in response.text
+
+    other_manager = NotebookManager(
+        base_dir=str(notebook_manager.base_dir.parent / "export-account-notebooks")
+    )
+    monkeypatch.setattr(video_notes, "get_notebook_manager", lambda: other_manager)
+    isolated = client.get(export_url)
+    assert isolated.status_code == 200
+    assert "Opening note" not in isolated.text
+    assert "Later note" not in isolated.text
+
+    monkeypatch.setattr(video_notes, "get_notebook_manager", lambda: notebook_manager)
+    assert client.get("/api/video-learning/materials/0123456789abcdef/notes.md").status_code == 404
+
+
 def test_progress_does_not_replace_known_duration_with_client_value(client: TestClient) -> None:
     material = _material(duration=100)
     service.get_timed_media_store().save(material)
@@ -231,7 +290,8 @@ def test_subtitles_are_valid_vtt_and_escape_markup(client: TestClient) -> None:
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/vtt")
     assert "00:00:01.250 --> 00:00:03.500" in response.text
-    assert "one &lt;script&gt;two&lt;/script&gt;" in response.text
+    assert "one &amp; &lt;script&gt;two&lt;/script&gt;" in response.text
+    assert "&nbsp;" not in response.text
     assert "\n<script>" not in response.text
 
 

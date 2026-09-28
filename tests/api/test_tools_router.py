@@ -23,6 +23,7 @@ async def test_list_builtin_tools_marks_toggleable_set(
     can render the right control per row."""
     settings_file = tmp_path / "interface.json"
     monkeypatch.setattr(settings_router, "_settings_file", lambda: settings_file)
+    monkeypatch.setattr(interface_settings, "_interface_settings_file", lambda: settings_file)
 
     response = await tools_router.list_builtin_tools()
     by_name = {tool.name: tool for tool in response.tools}
@@ -46,6 +47,7 @@ async def test_list_builtin_tools_marks_toggleable_set(
         "brainstorm",
         "web_search",
         "paper_search",
+        "zotero_search",
         "reason",
         "geogebra_analysis",
         "imagegen",
@@ -106,9 +108,15 @@ async def test_list_builtin_tools_reflects_user_toggle(
     assert by_name["reason"].enabled is True
     assert by_name["brainstorm"].enabled is False
     assert by_name["paper_search"].enabled is False
-    # Locked-on tools stay on regardless (code_execution is now auto-mounted,
+    # Locked-on tools stay on regardless (exec is auto-mounted,
     # gated by sandbox availability rather than a user toggle).
-    assert by_name["code_execution"].enabled is True
+    assert by_name["exec"].enabled is True
+    assert "code_execution" not in by_name
+    exec_parameters = {parameter.name: parameter for parameter in by_name["exec"].parameters}
+    assert set(exec_parameters) == {"code", "language", "stdin", "timeout"}
+    assert exec_parameters["code"].required is True
+    assert exec_parameters["language"].enum == ["python", "c", "cpp", "shell"]
+    assert exec_parameters["language"].default == "python"
     assert by_name["rag"].enabled is True
     assert by_name["web_fetch"].enabled is True
 

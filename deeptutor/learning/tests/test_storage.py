@@ -4,11 +4,14 @@ from pathlib import Path
 import sqlite3
 import time
 
+from pydantic import ValidationError
 import pytest
 
 from deeptutor.learning.models import (
     InteractionStatus,
+    KnowledgePoint,
     KnowledgeType,
+    LearningModule,
     LearningProgress,
     MasteryInteraction,
     PendingQuestion,
@@ -23,6 +26,7 @@ from deeptutor.learning.storage import (
     LearningStoreError,
     PathLeaseConflictError,
     _atomic_write_text,
+    _initialized_db_paths,
 )
 
 
@@ -58,6 +62,318 @@ class TestSaveLoad:
         store.save(lp)
         loaded = store.load("book1")
         assert loaded.repetition_states["kp1"].interval_index == 2
+        assert loaded.repetition_states["kp1"].stability == 0.0
+
+    def test_learning_evidence_roundtrip(self, store):
+        from deeptutor.learning.models import LearningEvidence
+
+        lp = LearningProgress(book_id="book1")
+        lp.learning_evidence.append(
+            LearningEvidence(
+                knowledge_point_id="kp1",
+                assessment_type="quiz",
+                result="incorrect",
+                quality=0.0,
+            )
+        )
+        lp.repetition_states["kp1"] = RepetitionState(
+            interval_index=1,
+            next_review_at=time.time() + 86400,
+            stability=4.0,
+            retrievability=0.8,
+            desired_retention=0.9,
+            review_count=2,
+            lapse_count=1,
+            last_review_at=time.time(),
+        )
+        store.save(lp)
+        loaded = store.load("book1")
+        assert loaded.learning_evidence[0].result == "incorrect"
+        assert loaded.repetition_states["kp1"].stability == 4.0
+        assert loaded.repetition_states["kp1"].lapse_count == 1
+
+    def test_learning_evidence_is_projected_and_queryable(self, store):
+        from deeptutor.learning.models import LearningEvidence
+
+        progress = LearningProgress(book_id="evidence-index")
+        progress.learning_evidence = [
+            LearningEvidence(
+                knowledge_point_id="kp1",
+                assessment_type="quiz",
+                result="incorrect",
+                quality=0.0,
+            ),
+            LearningEvidence(
+                knowledge_point_id="kp2",
+                assessment_type="review",
+                result="correct",
+                quality=1.0,
+            ),
+        ]
+        store.save(progress)
+
+        assert store.count_learning_evidence("evidence-index") == 2
+        evidence = store.list_learning_evidence("evidence-index", "kp1")
+        assert len(evidence) == 1
+        assert evidence[0].result == "incorrect"
+        with sqlite3.connect(store.db_path) as conn:
+            assert (
+                conn.execute(
+                    "SELECT COUNT(*) FROM mastery_learning_evidence WHERE path_id = ?",
+                    ("evidence-index",),
+                ).fetchone()[0]
+                == 2
+            )
+
+    def test_evidence_projection_appends_without_rewriting_history(self, store):
+        from deeptutor.learning.models import LearningEvidence
+
+        progress = LearningProgress(book_id="append-only-evidence")
+        progress.learning_evidence = [
+            LearningEvidence(knowledge_point_id="kp1", result="incorrect", quality=0.0)
+        ]
+        store.save(progress)
+        with sqlite3.connect(store.db_path) as conn:
+            conn.execute(
+                """
+                CREATE TRIGGER reject_existing_evidence_update
+                BEFORE UPDATE ON mastery_learning_evidence
+                WHEN OLD.path_id = 'append-only-evidence'
+                BEGIN SELECT RAISE(ABORT, 'history rewrite'); END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER reject_existing_evidence_delete
+                BEFORE DELETE ON mastery_learning_evidence
+                WHEN OLD.path_id = 'append-only-evidence'
+                BEGIN SELECT RAISE(ABORT, 'history delete'); END
+                """
+            )
+
+        progress = store.load("append-only-evidence")
+        progress.learning_evidence.append(
+            LearningEvidence(knowledge_point_id="kp1", result="correct", quality=1.0)
+        )
+        store.save(progress)
+
+        assert [event.result for event in store.list_learning_evidence("append-only-evidence")] == [
+            "correct",
+            "incorrect",
+        ]
+
+    def test_unrelated_path_save_does_not_write_historical_evidence(self, store):
+        from deeptutor.learning.models import LearningEvidence
+
+        progress = LearningProgress(book_id="unchanged-evidence")
+        progress.learning_evidence = [
+            LearningEvidence(knowledge_point_id="kp1", quality=0.5, timestamp=float(index))
+            for index in range(100)
+        ]
+        store.save(progress)
+        with sqlite3.connect(store.db_path) as conn:
+            conn.execute(
+                """
+                CREATE TRIGGER reject_unchanged_evidence_write
+                BEFORE INSERT ON mastery_learning_evidence
+                WHEN NEW.path_id = 'unchanged-evidence'
+                BEGIN SELECT RAISE(ABORT, 'unrelated write touched evidence'); END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER reject_unchanged_evidence_update
+                BEFORE UPDATE ON mastery_learning_evidence
+                WHEN NEW.path_id = 'unchanged-evidence'
+                BEGIN SELECT RAISE(ABORT, 'unrelated write touched evidence'); END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER reject_unchanged_evidence_delete
+                BEFORE DELETE ON mastery_learning_evidence
+                WHEN OLD.path_id = 'unchanged-evidence'
+                BEGIN SELECT RAISE(ABORT, 'unrelated write touched evidence'); END
+                """
+            )
+        progress.name = "renamed"
+        store.save(progress)
+        assert store.load("unchanged-evidence").name == "renamed"
+        assert store.count_learning_evidence("unchanged-evidence") == 100
+
+    def test_explicit_evidence_projection_rebuild_repairs_missing_rows(self, store):
+        from deeptutor.learning.models import LearningEvidence
+
+        progress = LearningProgress(book_id="rebuild-evidence")
+        progress.learning_evidence = [
+            LearningEvidence(knowledge_point_id="kp1", timestamp=float(index)) for index in range(3)
+        ]
+        store.save(progress)
+        with sqlite3.connect(store.db_path) as conn:
+            conn.execute(
+                "DELETE FROM mastery_learning_evidence WHERE path_id = ? AND ordinal = 1",
+                ("rebuild-evidence",),
+            )
+        assert store.count_learning_evidence("rebuild-evidence") == 2
+        store.rebuild_learning_evidence_projection("rebuild-evidence")
+        assert store.count_learning_evidence("rebuild-evidence") == 3
+        assert [event.timestamp for event in store.list_learning_evidence("rebuild-evidence")] == [
+            2.0,
+            1.0,
+            0.0,
+        ]
+
+    def test_existing_paths_receive_evidence_projection_on_upgrade(self, store):
+        from deeptutor.learning.models import LearningEvidence
+
+        progress = LearningProgress(book_id="legacy-evidence")
+        progress.learning_evidence = [
+            LearningEvidence(knowledge_point_id="kp1", result="incorrect", quality=0.0)
+        ]
+        store.save(progress)
+        before = store.load("legacy-evidence")
+        with sqlite3.connect(store.db_path) as conn:
+            conn.execute("DELETE FROM mastery_learning_evidence")
+            conn.execute(
+                "DELETE FROM mastery_schema_migrations WHERE name='learning_evidence_projection_v1'"
+            )
+        _initialized_db_paths.discard(store.db_path.resolve())
+        upgraded = LearningStore(root=store.db_path.parent)
+        assert upgraded.count_learning_evidence("legacy-evidence") == 1
+        assert upgraded.load("legacy-evidence").model_dump() == before.model_dump()
+
+    def test_legacy_json_without_retention_fields_imports(self, store, tmp_path):
+        legacy_path = tmp_path / "old-srs.json"
+        legacy_path.write_text(
+            json.dumps(
+                {
+                    "book_id": "old-srs",
+                    "repetition_states": {
+                        "kp1": {
+                            "interval_index": 2,
+                            "consecutive_correct": 1,
+                            "consecutive_wrong": 0,
+                            "next_review_at": 123456.0,
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        loaded = store.load("old-srs")
+        assert loaded is not None
+        state = loaded.repetition_states["kp1"]
+        assert state.interval_index == 2
+        assert state.next_review_at == 123456.0
+        assert state.stability == 0.0
+        assert loaded.learning_evidence == []
+
+    def test_legacy_path_review_survives_restart_with_evidence_and_queue(self, store, tmp_path):
+        from deeptutor.learning.models import LearningEvidence
+        from deeptutor.learning.scheduler import SpacedRepetitionScheduler
+
+        now = 1_700_000_000.0
+        (tmp_path / "legacy-review.json").write_text(
+            json.dumps(
+                {
+                    "book_id": "legacy-review",
+                    "mastery_levels": {"kp1": 0.6, "kp2": 0.3},
+                    "knowledge_types": {"kp1": "memory", "kp2": "concept"},
+                    "repetition_states": {
+                        "kp1": {"interval_index": 2, "next_review_at": now},
+                        "kp2": {"interval_index": 1, "next_review_at": now - 86400},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        progress = store.load("legacy-review")
+        assert progress is not None
+        scheduler = SpacedRepetitionScheduler()
+        event = LearningEvidence(
+            knowledge_point_id="kp1",
+            timestamp=now + 86400,
+            result="correct",
+            quality=0.9,
+        )
+        progress.learning_evidence.append(event)
+        scheduler.schedule_review(progress.repetition_states["kp1"], KnowledgeType.MEMORY, event)
+        progress.review_queue = scheduler.build_review_queue(progress, now=event.timestamp)
+        expected_order = [task.knowledge_point_id for task in progress.review_queue]
+        expected_state = progress.repetition_states["kp1"].model_dump()
+        store.save(progress)
+
+        restarted = LearningStore(root=tmp_path).load("legacy-review")
+        assert restarted is not None
+        assert restarted.mastery_levels == {"kp1": 0.6, "kp2": 0.3}
+        assert restarted.repetition_states["kp1"].model_dump() == expected_state
+        assert [task.knowledge_point_id for task in restarted.review_queue] == expected_order
+        assert [item.model_dump() for item in restarted.learning_evidence] == [event.model_dump()]
+        assert store.count_learning_evidence("legacy-review") == 1
+
+    def test_changed_retention_and_late_evidence_replay_after_restart(self, store, tmp_path):
+        from deeptutor.learning.models import LearningEvidence
+        from deeptutor.learning.scheduler import SpacedRepetitionScheduler
+
+        start = 1_700_000_000.0
+        scheduler = SpacedRepetitionScheduler()
+        progress = LearningProgress(book_id="late-srs")
+        progress.knowledge_types["kp1"] = KnowledgeType.CONCEPT
+        state = scheduler.get_initial_state(KnowledgeType.CONCEPT, now=start)
+        first = LearningEvidence(
+            evidence_id="guided-first",
+            knowledge_point_id="kp1",
+            timestamp=start,
+            result="correct",
+            quality=1.0,
+        )
+        second = LearningEvidence(
+            evidence_id="guided-second",
+            knowledge_point_id="kp1",
+            timestamp=start + 7 * 86400,
+            result="incorrect",
+            quality=0.0,
+        )
+        for event in (first, second):
+            progress.learning_evidence.append(event)
+            scheduler.schedule_review(state, KnowledgeType.CONCEPT, event)
+        progress.repetition_states["kp1"] = state
+        store.save(progress)
+
+        changed = LearningStore(root=tmp_path).load("late-srs")
+        assert changed is not None
+        scheduler.set_desired_retention(changed, 0.97, now=second.timestamp)
+        store.save(changed)
+
+        reopened = LearningStore(root=tmp_path).load("late-srs")
+        assert reopened is not None
+        late = LearningEvidence(
+            evidence_id="late-book-attempt",
+            knowledge_point_id="kp1",
+            timestamp=start + 86400,
+            source="book",
+            result="correct",
+            quality=1.0,
+        )
+        reopened.learning_evidence.append(late)
+        scheduler.schedule_review(reopened.repetition_states["kp1"], KnowledgeType.CONCEPT, late)
+        reopened.review_queue = scheduler.build_review_queue(reopened, now=second.timestamp)
+        store.save(reopened)
+
+        restarted = LearningStore(root=tmp_path).load("late-srs")
+        assert restarted is not None
+        replayed = scheduler.replay(
+            KnowledgeType.CONCEPT,
+            restarted.learning_evidence,
+            desired_retention=restarted.desired_retention,
+        )
+        assert restarted.repetition_states["kp1"].model_dump() == replayed.model_dump()
+        assert [item.evidence_id for item in restarted.learning_evidence] == [
+            "guided-first",
+            "guided-second",
+            "late-book-attempt",
+        ]
+        assert restarted.review_queue[0].evidence_id == "late-book-attempt"
 
     def test_updated_at_auto_updates(self, store):
         lp = LearningProgress(book_id="book1")
@@ -341,6 +657,59 @@ class TestLegacyMigration:
         assert store.list_session_ids("legacy-bound") == ["session-1"]
 
 
+class TestSingleMembership:
+    """A conversation is on exactly one path — the rule the topic screens read."""
+
+    def test_moving_to_another_path_leaves_the_first_one(self, store):
+        store.bind_session("topic-japanese", "session-1")
+
+        store.bind_session("topic-english", "session-1")
+
+        assert store.list_session_ids("topic-japanese") == []
+        assert store.list_session_ids("topic-english") == ["session-1"]
+        assert store.path_id_for_session("session-1") == "topic-english"
+
+    def test_taking_the_lease_on_another_path_moves_the_membership(self, store):
+        """``mastery_switch`` mid-turn goes through the lease, not bind_session."""
+        store.bind_session("topic-japanese", "session-1")
+
+        store.acquire_path_lease("topic-english", "session-1", "turn-1")
+
+        assert store.list_session_ids("topic-japanese") == []
+        assert store.path_id_for_session("session-1") == "topic-english"
+
+    def test_a_path_still_holds_the_conversations_that_stayed(self, store):
+        store.bind_session("topic-a", "session-1")
+        store.bind_session("topic-a", "session-2")
+
+        store.bind_session("topic-b", "session-2")
+
+        assert store.list_session_ids("topic-a") == ["session-1"]
+        assert store.list_session_ids("topic-b") == ["session-2"]
+
+    def test_a_database_written_before_the_rule_converges_on_open(self, tmp_path):
+        """Rows left behind by the old append-only binding are cleaned up once."""
+        store = LearningStore(root=tmp_path)
+        store.bind_session("topic-japanese", "session-1")
+        store.bind_session("topic-english", "session-1")
+        with sqlite3.connect(store.db_path) as conn:
+            # Re-create the shape the old code could persist.
+            conn.execute("DROP INDEX idx_mastery_sessions_membership")
+            conn.execute(
+                """
+                INSERT INTO mastery_path_sessions (
+                    path_id, session_id, created_at, last_seen_at
+                ) VALUES ('topic-japanese', 'session-1', 1.0, 1.0)
+                """
+            )
+        _initialized_db_paths.discard(store.db_path.resolve())
+
+        reopened = LearningStore(root=tmp_path)
+
+        assert reopened.list_session_ids("topic-japanese") == []
+        assert reopened.path_id_for_session("session-1") == "topic-english"
+
+
 class TestPathSessionOwnership:
     def test_legacy_session_keyed_path_is_deleted_on_detach(self, store):
         store.save(LearningProgress(book_id="legacy-session"))
@@ -369,6 +738,39 @@ class TestPathSessionOwnership:
         store.bind_session("path-1", "session-1", owns_path=False)
 
         assert store.detach_session("session-1") == []
+        assert store.exists("path-1") is True
+
+    def test_scratch_path_still_dies_with_its_creator_after_it_moved_on(self, store):
+        """Ownership is the path's, so moving the conversation cannot orphan it."""
+        store.bind_session("scratch", "owner", owns_path=True)
+        store.bind_session("topic-a", "owner")
+
+        assert store.detach_session("owner") == ["scratch"]
+        assert store.exists("scratch") is False
+        assert store.exists("topic-a") is True
+
+    def test_a_built_path_outlives_the_conversation_that_created_it(self, store):
+        store.bind_session("path-1", "owner", owns_path=True)
+        progress = store.load("path-1")
+        assert progress is not None
+        progress.modules = [
+            LearningModule(
+                id="m1",
+                name="Module 1",
+                order=1,
+                knowledge_points=[
+                    KnowledgePoint(
+                        id="kp1",
+                        name="Objective 1",
+                        type=KnowledgeType.CONCEPT,
+                        module_id="m1",
+                    )
+                ],
+            )
+        ]
+        store.save(progress)
+
+        assert store.detach_session("owner") == []
         assert store.exists("path-1") is True
 
 
@@ -471,6 +873,88 @@ class TestInteractionsAndEvents:
         persisted = store.get_interaction("path-1", "question-1")
         assert persisted is not None
         assert persisted.status == InteractionStatus.GRADED
+
+
+# ── Reading learning records ─────────────────────────────────────────────
+
+
+class TestReadingLearningRecords:
+    def test_reading_tables_migrate_into_an_existing_learning_database(self, tmp_path):
+        db_path = tmp_path / LearningStore._DB_FILENAME
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE mastery_paths (
+                    path_id TEXT PRIMARY KEY,
+                    state_json TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+
+        store = LearningStore(root=tmp_path)
+        store.record_reading_position("rm_one", locator=1, percentage=0.1)
+
+        assert store.list_reading_records().progress[0].material_id == "rm_one"
+
+    def test_position_progress_keeps_latest_and_furthest_views(self, store):
+        first = store.record_reading_position("rm_one", locator=3, percentage=0.3)
+        assert first.latest_locator == first.furthest_locator == 3
+
+        second = store.record_reading_position("rm_one", locator=5, percentage=0.5)
+        store.record_reading_position("rm_one", locator=4, percentage=0.4)
+
+        records = store.list_reading_records()
+        assert len(records.progress) == 1
+        assert records.progress[0].material_id == "rm_one"
+        assert records.progress[0].latest_locator == 4
+        assert records.progress[0].latest_percentage == 0.4
+        assert records.progress[0].furthest_locator == 5
+        assert records.progress[0].furthest_percentage == 0.5
+
+    def test_activity_records_keep_metadata_without_source_content(self, store):
+        first = store.record_reading_activity(
+            "rm_one",
+            extension_id="guided_learning",
+            action="guide",
+            locator=2,
+            result_type="card",
+        )
+        second = store.record_reading_activity(
+            "rm_one",
+            extension_id="vocabulary",
+            action="explain",
+            locator=3,
+            result_type="card",
+        )
+
+        records = store.list_reading_records()
+        assert {row.activity_id for row in records.activities} == {
+            first.activity_id,
+            second.activity_id,
+        }
+        assert all(row.material_id == "rm_one" for row in records.activities)
+        assert all("visible_text" not in row.model_dump() for row in records.activities)
+
+    def test_activity_result_type_is_schema_bounded(self, store):
+        with pytest.raises(ValidationError):
+            store.record_reading_activity(
+                "rm_one",
+                extension_id="sample",
+                action="open",
+                locator=1,
+                result_type="javascript",
+            )
+
+    def test_reading_ids_and_values_are_validated(self, store):
+        with pytest.raises(ValueError, match="Invalid book_id"):
+            store.record_reading_position("../escape", locator=1, percentage=0.1)
+        with pytest.raises(ValidationError):
+            store.record_reading_position("rm_one", locator=0, percentage=0.1)
+        with pytest.raises(ValidationError):
+            store.record_reading_position("rm_one", locator=1, percentage=1.1)
 
 
 # ── atomic write ──────────────────────────────────────────────────────────

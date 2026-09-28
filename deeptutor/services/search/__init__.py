@@ -263,6 +263,11 @@ def get_current_config() -> dict[str, Any]:
     """Get effective web search configuration for UI/CLI display."""
     config = _get_web_search_config()
     resolved = resolve_search_runtime_config()
+    source_filtering = dict(_get_source_filter_settings())
+    # Never surface the bearer token to Settings / CLI — only whether Moderation
+    # is wired (key present + use_moderation). Same for the Web Risk API key.
+    source_filtering["moderation_configured"] = bool(source_filtering.pop("moderation_api_key", ""))
+    source_filtering["web_risk_configured"] = bool(source_filtering.pop("web_risk_api_key", ""))
     return {
         "enabled": config.get("enabled", True),
         "provider": resolved.provider,
@@ -277,7 +282,7 @@ def get_current_config() -> dict[str, Any]:
         "supported_providers": sorted(SUPPORTED_SEARCH_PROVIDERS),
         "deprecated_providers": sorted(DEPRECATED_SEARCH_PROVIDERS),
         "consolidation_template": config.get("consolidation_template") or None,
-        "source_filtering": _get_source_filter_settings(),
+        "source_filtering": source_filtering,
         "template_providers": list(PROVIDER_TEMPLATES.keys()),
     }
 

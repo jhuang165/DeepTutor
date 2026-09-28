@@ -6,20 +6,36 @@
  *
  * A mastery session is a chat session, so the learner gets the whole
  * composer: attachments, `@`-space references, the knowledge picker, the
- * model selector, dictation. Two of those controls are session-scoped
- * rather than per-turn — the knowledge bases in play and the pinned model —
- * so both are driven straight off the session state instead of a second
- * copy inside the composer.
+ * model selector, dictation, and the Skills/MCP narrowing Chat uses. Those
+ * last controls are session-scoped rather than per-turn — knowledge bases,
+ * the pinned model, and the resource selection — so they are driven
+ * straight off the session state instead of a second copy inside the
+ * composer.
+ *
+ * What it does NOT get is the action menu. This screen runs one loop — the
+ * tutor — and it used to open on "Chat" instead, which reached the same tutor
+ * by a different route (the workspace flag made a chat turn mount the mastery
+ * tools). Two entrances to one place, with the visible label naming the wrong
+ * one. The action is now the screen itself.
  */
 
 import { useCallback } from "react";
+import { useTranslation } from "react-i18next";
 
 import StandaloneComposer, {
   type StandaloneComposerSubmission,
 } from "@/components/chat/home/StandaloneComposer";
+import { MASTERY_CAPABILITY_VALUE } from "@/features/capabilities/presentation";
 import { useChatStateAdapter } from "@/features/chat/ChatStateAdapter";
+import { useChatWorkspaces } from "@/hooks/useChatWorkspaces";
+import { useComposerResources } from "@/hooks/useComposerResources";
+import { useContextBudget } from "@/hooks/useContextBudget";
 import { useWorkspaceChatActions } from "@/hooks/useWorkspaceChatActions";
-import { hasPendingAskUser } from "@/lib/ask-user-state";
+import {
+  hasPendingAskUser,
+  REPLY_SENT_AS_NEW_MESSAGE,
+} from "@/lib/ask-user-state";
+import { notify } from "@/lib/notifications";
 
 export function MasteryComposer({
   placeholder,
@@ -43,12 +59,27 @@ export function MasteryComposer({
     setKBs,
     setLLMSelection,
     setPersonaSelection,
+    setResourceSelection,
   } = useChatStateAdapter();
-  const { capabilities, activeCapabilityValue, selectCapability } =
-    useWorkspaceChatActions();
+  // A mastery session is a chat session in a workspace, so the same skills and
+  // MCP servers are on offer here. Without the catalog the composer had no
+  // Skills entry at all, and a learner whose workspace allows a skill could
+  // only reach it by opening the chat page instead (#1534).
+  const { workspaces } = useChatWorkspaces();
+  const resourceCatalog = useComposerResources(state.workspaceId, workspaces);
+  // Pins the turn to the tutor loop; returns no capabilities to offer.
+  useWorkspaceChatActions({ pinnedCapability: MASTERY_CAPABILITY_VALUE });
+  const contextBudget = useContextBudget(state.messages);
+  const { t } = useTranslation();
 
   // A turn paused on an ask_user card is still "streaming", but typing an
   // answer is exactly how it moves forward — the composer stays live.
+  //
+  // A question card is NOT that: posing one ends the turn, so what the learner
+  // types next is a new message — an answer they would rather write out, or a
+  // question about the material. Routing it as a same-turn reply sent it into
+  // a turn that was already over, and every message after a question came back
+  // "this question is no longer active" until they reloaded.
   const awaitingUserReply = hasPendingAskUser(
     state.messages[state.messages.length - 1]?.events,
   );
@@ -56,42 +87,47 @@ export function MasteryComposer({
   const handleSubmit = useCallback(
     (submission: StandaloneComposerSubmission) => {
       if (disabled) return;
-      // A turn paused on a question: what the user typed is their answer,
-      // not a new message. See page.tsx's handleSend for the same routing.
-      if (awaitingUserReply) {
-        if (submission.content.trim()) {
-          submitUserReply({ text: submission.content });
-        }
+      const sendAsNewMessage = () =>
+        sendMessage(
+          submission.content,
+          submission.attachments,
+          // How many times the tutor may consult the selected agent this turn.
+          // Absent when no agent is picked, which is the ordinary case.
+          submission.subagentBudget
+            ? {
+                ...(submission.config ?? {}),
+                subagent_consult_budget: submission.subagentBudget,
+              }
+            : submission.config,
+          submission.notebookReferences,
+          submission.historyReferences,
+          { bookReferences: submission.bookReferences },
+          submission.questionNotebookReferences,
+          submission.persona ?? undefined,
+          submission.memoryReferences,
+        );
+
+      // A turn paused on a question: what the learner typed is their answer,
+      // not a new message. See ChatWorkspace's handleSend for the same routing
+      // — including the fall-through, which is the part that matters: the
+      // composer has already cleared the box, so stopping on a refusal
+      // discarded what they wrote.
+      if (awaitingUserReply && submission.content.trim()) {
+        void submitUserReply({ text: submission.content }).then((sent) => {
+          if (sent) return;
+          notify(t(REPLY_SENT_AS_NEW_MESSAGE));
+          sendAsNewMessage();
+        });
         return;
       }
-      sendMessage(
-        submission.content,
-        submission.attachments,
-        // How many times the tutor may consult the selected agent this turn.
-        // Absent when no agent is picked, which is the ordinary case.
-        submission.subagentBudget
-          ? {
-              ...(submission.config ?? {}),
-              subagent_consult_budget: submission.subagentBudget,
-            }
-          : submission.config,
-        submission.notebookReferences,
-        submission.historyReferences,
-        { bookReferences: submission.bookReferences },
-        submission.questionNotebookReferences,
-        submission.persona ?? undefined,
-        submission.memoryReferences,
-      );
+      sendAsNewMessage();
     },
-    [awaitingUserReply, disabled, sendMessage, submitUserReply],
+    [awaitingUserReply, disabled, sendMessage, submitUserReply, t],
   );
 
   return (
     <StandaloneComposer
-      capabilities={capabilities}
-      activeCapValue={activeCapabilityValue}
-      onSelectCapability={selectCapability}
-      showCapabilityChip
+      showCapabilityChip={false}
       hasMessages={state.messages.length > 0}
       isStreaming={state.isStreaming}
       awaitingUserReply={awaitingUserReply}
@@ -101,6 +137,9 @@ export function MasteryComposer({
       onLLMSelectionChange={setLLMSelection}
       personaSelection={state.personaSelection}
       onPersonaSelectionChange={setPersonaSelection}
+      resourceCatalog={resourceCatalog}
+      resourceSelection={state.resourceSelection}
+      onResourceSelectionChange={setResourceSelection}
       onSubmit={handleSubmit}
       onCancelStreaming={cancelStreamingTurn}
       // The suggested question *is* the placeholder once there is one: naming
@@ -109,6 +148,10 @@ export function MasteryComposer({
       inputPlaceholder={askHint || placeholder}
       inputPlaceholderCompletion={askHint}
       prefillInputRef={prefillInputRef}
+      // A tutoring transcript fills a window faster than a chat one — a topic's
+      // materials, the map, and the whole history of questions all ride along —
+      // so the reading belongs here at least as much as on the chat page.
+      contextBudget={contextBudget}
     />
   );
 }

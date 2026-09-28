@@ -25,6 +25,10 @@ from deeptutor.services.config import load_system_settings
 from deeptutor.services.keypool import KeyPool, primary_api_key
 from deeptutor.services.llm import get_token_limit_kwargs, supports_tools
 from deeptutor.services.llm.capabilities import catalog_capability_override
+from deeptutor.services.llm.exceptions import (
+    LLMProviderError,
+    LLMProviderTransportError,
+)
 from deeptutor.services.llm.openai_http_client import (
     openai_sdk_client_kwargs,
     sanitize_invalid_ssl_env,
@@ -184,7 +188,8 @@ class _KeyRotatingCompletions:
         self._clients = clients
 
     async def create(self, **kwargs: Any) -> Any:
-        for attempt in range(2):
+        attempts = max(2, len(self._key_pool))
+        for attempt in range(attempts):
             api_key = self._key_pool.next()
             try:
                 return await self._clients[api_key].chat.completions.create(**kwargs)
@@ -195,7 +200,7 @@ class _KeyRotatingCompletions:
                 if status != 429:
                     raise
                 self._key_pool.mark_429(api_key)
-                if attempt:
+                if attempt == attempts - 1:
                     raise
         raise RuntimeError("LLM key rotation exhausted")
 
@@ -233,11 +238,17 @@ def build_openai_client(config: LLMClientConfig) -> Any:
     handle itself owns an HTTP connection pool, so reusing it is both faster
     and prevents a new allocator/socket high-water mark on every turn.
     """
+    from deeptutor.services.llm.metrics import instrument_client
+
     disable_ssl_verify = bool(load_system_settings()["disable_ssl_verify"])
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        return _build_openai_client(config, disable_ssl_verify=disable_ssl_verify)
+        return instrument_client(
+            _build_openai_client(config, disable_ssl_verify=disable_ssl_verify),
+            model=config.model or "",
+            provider=config.binding,
+        )
 
     key = _client_cache_key(config, loop, disable_ssl_verify)
     with _agentic_client_pool_lock:
@@ -245,7 +256,11 @@ def build_openai_client(config: LLMClientConfig) -> Any:
         if cached is not None:
             _agentic_client_pool.move_to_end(key)
             return cached
-        client = _build_openai_client(config, disable_ssl_verify=disable_ssl_verify)
+        client = instrument_client(
+            _build_openai_client(config, disable_ssl_verify=disable_ssl_verify),
+            model=config.model or "",
+            provider=config.binding,
+        )
         _agentic_client_pool[key] = client
         _agentic_client_pool.move_to_end(key)
         while len(_agentic_client_pool) > _AGENTIC_CLIENT_POOL_MAXSIZE:
@@ -436,6 +451,8 @@ class _ProviderOpenAIAdapter:
                             _openai_tool_call(tool_call, index=index)
                             for index, tool_call in enumerate(response.tool_calls or [])
                         ],
+                        reasoning_content=response.reasoning_content,
+                        thinking_blocks=response.thinking_blocks,
                         provider_specific_fields=response.provider_specific_fields,
                     ),
                     finish_reason=(
@@ -445,6 +462,25 @@ class _ProviderOpenAIAdapter:
             ],
             usage=response.usage or None,
         )
+
+
+def _provider_streams_tool_args(provider: Any) -> bool:
+    """Whether *provider* declares the live tool-argument callback.
+
+    Probed rather than passed unconditionally: every provider in this family
+    forwards its unknown keyword arguments into the request body, so handing
+    the callback to one that does not name it would serialise a function into
+    an API call. A provider that has not opted in simply keeps the old
+    behaviour — its tool calls arrive whole.
+    """
+    chat_stream = getattr(provider, "chat_stream", None)
+    if not callable(chat_stream):
+        return False
+    try:
+        parameters = inspect.signature(chat_stream).parameters
+    except (TypeError, ValueError):
+        return False
+    return "on_tool_args_delta" in parameters
 
 
 class _ProviderOpenAIStream:
@@ -473,6 +509,7 @@ class _ProviderOpenAIStream:
         self._queue: asyncio.Queue[Any] | None = None
         self._task: asyncio.Task[None] | None = None
         self._emitted_content = False
+        self._emitted_reasoning = False
 
     def __aiter__(self) -> "_ProviderOpenAIStream":
         if self._queue is None:
@@ -495,6 +532,39 @@ class _ProviderOpenAIStream:
         if self._task and not self._task.done():
             self._task.cancel()
 
+    def _raise_for_error_response(self, response: Any) -> None:
+        """Turn an error-shaped response back into the exception it describes.
+
+        Providers in this family do not raise; they *return* ``finish_reason ==
+        "error"`` with an operator-facing string in ``content`` (see
+        ``LLMProvider._handle_error`` and the stream-stall branch of
+        ``AnthropicProvider.chat_stream``). Forwarded as an ordinary chunk,
+        that string streams into the reply as if the model had written it —
+        "Error calling LLM: stream stalled for more than 90 seconds" arriving
+        as the tutor's answer — and because nothing was raised, neither the
+        provider's own retry nor the loop's transport retry ever ran.
+
+        Retrying is left to the caller rather than done here: the loop already
+        knows whether this round put text on the wire, and replaying a stream
+        that half-succeeded would splice a second attempt onto the visible
+        first one.
+        """
+        if str(getattr(response, "finish_reason", "") or "") != "error":
+            return
+        message = str(getattr(response, "content", "") or "").strip()
+        detail = message or "The model provider returned an error."
+        # A provider may narrow the marker list; fall back to the shared one
+        # rather than treating an unclassifiable failure as permanent, which
+        # would skip a retry that the base policy would have granted.
+        is_transient = getattr(self._provider, "_is_transient_error", None)
+        if not callable(is_transient):
+            from deeptutor.services.llm.provider_core.base import LLMProvider
+
+            is_transient = LLMProvider._is_transient_error
+        if is_transient(message):
+            raise LLMProviderTransportError(detail, partial_response=self._emitted_content)
+        raise LLMProviderError(detail)
+
     async def _run(self) -> None:
         assert self._queue is not None
 
@@ -502,6 +572,32 @@ class _ProviderOpenAIStream:
             if text:
                 self._emitted_content = True
                 await self._queue.put(_openai_stream_chunk(content=text))
+
+        async def _on_reasoning_delta(text: str) -> None:
+            if text:
+                self._emitted_reasoning = True
+                await self._queue.put(_openai_stream_chunk(reasoning_content=text))
+
+        async def _on_tool_args_delta(call_id: str, name: str, arguments: str) -> None:
+            # A side channel, not the call itself: the finished tool call is
+            # still queued whole below. Consumers that do not know the field
+            # see an ordinary chunk with an empty delta and skip it, so this
+            # cannot double-count arguments in a tool-call accumulator.
+            await self._queue.put(
+                _openai_stream_chunk(
+                    provider_specific_fields={
+                        "tool_args_preview": {
+                            "id": call_id,
+                            "name": name,
+                            "arguments": arguments,
+                        }
+                    }
+                )
+            )
+
+        extra_call_kwargs: dict[str, Any] = {}
+        if _provider_streams_tool_args(self._provider):
+            extra_call_kwargs["on_tool_args_delta"] = _on_tool_args_delta
 
         try:
             response = await self._provider.chat_stream(
@@ -513,8 +609,17 @@ class _ProviderOpenAIStream:
                 reasoning_effort=self._reasoning_effort,
                 tool_choice=self._tool_choice,
                 on_content_delta=_on_content_delta,
+                on_reasoning_delta=_on_reasoning_delta,
+                **extra_call_kwargs,
                 **self._extra_kwargs,
             )
+            self._raise_for_error_response(response)
+            # A provider that reports reasoning only on the finished message
+            # still gets it onto the thinking channel, once.
+            if response.reasoning_content and not self._emitted_reasoning:
+                await self._queue.put(
+                    _openai_stream_chunk(reasoning_content=response.reasoning_content)
+                )
             if response.content and not self._emitted_content:
                 await self._queue.put(_openai_stream_chunk(content=response.content))
             for index, tool_call in enumerate(response.tool_calls or []):
@@ -522,6 +627,12 @@ class _ProviderOpenAIStream:
             provider_fields = dict(response.provider_specific_fields or {})
             if response.reasoning_content:
                 provider_fields["reasoning_content"] = response.reasoning_content
+            if response.thinking_blocks:
+                # Anthropic requires the *signed* thinking blocks of a turn to
+                # be replayed verbatim on the next request. The provider parsed
+                # them out, but nothing carried them back, so the loop had no
+                # way to return them and every round dropped its signature.
+                provider_fields["thinking_blocks"] = response.thinking_blocks
             await self._queue.put(
                 _openai_stream_chunk(
                     finish_reason=(
@@ -557,6 +668,7 @@ def _openai_tool_call(tool_call: Any, *, index: int) -> Any:
 def _openai_stream_chunk(
     *,
     content: str | None = None,
+    reasoning_content: str | None = None,
     tool_call: Any | None = None,
     index: int = 0,
     finish_reason: str | None = None,
@@ -566,10 +678,16 @@ def _openai_stream_chunk(
     tool_calls = None
     if tool_call is not None:
         tool_calls = [_openai_tool_call(tool_call, index=index)]
+    # ``reasoning_content`` is read off the delta by the agent loop, the same
+    # way an OpenAI-compatible reasoning model reports it. Only set the
+    # attribute when there is one, so a plain chunk stays plain.
+    delta_fields: dict[str, Any] = {"content": content, "tool_calls": tool_calls}
+    if reasoning_content is not None:
+        delta_fields["reasoning_content"] = reasoning_content
     return SimpleNamespace(
         choices=[
             SimpleNamespace(
-                delta=SimpleNamespace(content=content, tool_calls=tool_calls),
+                delta=SimpleNamespace(**delta_fields),
                 finish_reason=finish_reason,
                 provider_specific_fields=provider_specific_fields,
             )

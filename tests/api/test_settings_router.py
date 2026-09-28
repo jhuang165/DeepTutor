@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from copy import deepcopy
 import json
 from types import SimpleNamespace
@@ -72,6 +73,60 @@ async def test_ui_languages_are_persisted_independently(
 
     assert response["language"] == "en"
     assert response["response_language"] == "zh"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("language", ["fr", "uk"])
+async def test_ui_settings_persist_supported_languages_independently(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, language: str
+) -> None:
+    settings_file = tmp_path / "interface.json"
+    monkeypatch.setattr(settings_router, "_settings_file", lambda: settings_file)
+
+    response = await settings_router.update_ui_settings(
+        settings_router.UISettingsUpdate(theme="snow", language=language, response_language="en")
+    )
+
+    assert response["language"] == language
+    assert response["response_language"] == "en"
+    persisted = settings_router.load_ui_settings()
+    assert persisted["language"] == language
+    assert persisted["response_language"] == "en"
+    assert (await settings_router.get_ui_settings())["language"] == language
+    assert settings_router.LanguageUpdate(language=language).language == language
+
+
+def test_ui_settings_update_rejects_unsupported_language() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        settings_router.UISettingsUpdate(language="xx")
+    with pytest.raises(ValidationError):
+        settings_router.UISettingsUpdate(response_language="xx")
+
+
+@pytest.mark.asyncio
+async def test_ui_accepts_extended_response_languages(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    settings_file = tmp_path / "interface.json"
+    monkeypatch.setattr(settings_router, "_settings_file", lambda: settings_file)
+
+    response = await settings_router.update_ui_settings(
+        settings_router.UISettingsUpdate(language="en", response_language="ja")
+    )
+    assert response["response_language"] == "ja"
+
+    response = await settings_router.update_ui_settings(
+        settings_router.UISettingsUpdate(response_language="pt")
+    )
+    assert response["response_language"] == "pt"
+
+    response = await settings_router.update_ui_settings(
+        settings_router.UISettingsUpdate(response_language="ms")
+    )
+    assert response["response_language"] == "ms"
+    assert settings_router.load_ui_settings()["response_language"] == "ms"
 
 
 class _FakeEmbeddingAdapter:
@@ -602,7 +657,7 @@ def test_media_and_voice_provider_choices_include_dashscope() -> None:
     )
     assert dashscope["tts"]["default_model"] == "qwen3-tts-flash"
     assert dashscope["tts"]["default_voice"] == "Cherry"
-    assert dashscope["stt"]["default_model"] == "paraformer-v2"
+    assert dashscope["stt"]["default_model"] == "paraformer-realtime-v2"
     assert dashscope["imagegen"]["default_model"] == "wanx2.1-t2i-turbo"
     assert dashscope["videogen"]["default_model"] == "wanx2.1-t2v-turbo"
 
@@ -612,6 +667,20 @@ def test_llm_provider_choices_include_atlascloud() -> None:
 
     assert llm["atlascloud"]["label"] == "Atlas Cloud"
     assert llm["atlascloud"]["base_url"] == "https://api.atlascloud.ai/v1"
+
+
+def test_llm_provider_choices_include_unifically() -> None:
+    llm = {item["value"]: item for item in settings_router._provider_choices()["llm"]}
+
+    assert llm["unifically"]["label"] == "Unifically"
+    assert llm["unifically"]["base_url"] == "https://api.unifically.com/v1"
+
+
+def test_llm_provider_choices_include_cheaperinference() -> None:
+    llm = {item["value"]: item for item in settings_router._provider_choices()["llm"]}
+
+    assert llm["cheaperinference"]["label"] == "Cheaper Inference"
+    assert llm["cheaperinference"]["base_url"] == "https://api.cheaperinference.com/v1"
 
 
 def test_llm_provider_choices_include_novita() -> None:
@@ -778,6 +847,194 @@ async def test_apply_catalog_invalidates_runtime_caches(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
+async def test_reapplying_an_unchanged_catalog_keeps_the_runtime_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An apply that changes nothing must not reset the shared clients.
+
+    The clients are process-wide singletons; resetting them flips the client
+    out from under any turn that is mid-call and hangs that turn in the
+    provider retry ladder. A settings visit that re-applies the same
+    configuration — the shape a cold-start first message keeps meeting
+    (#1421) — has nothing to invalidate.
+    """
+    catalog = _build_catalog(
+        llm_model="gpt-same",
+        llm_base_url="https://same-llm.example/v1",
+        llm_api_key="same-llm-key",
+        embedding_model="text-embedding-same",
+        embedding_base_url="https://same-embedding.example/v1/embeddings",
+        embedding_api_key="same-embedding-key",
+    )
+    service = _FakeCatalogService(catalog)
+    _patch_runtime(monkeypatch, service)
+
+    llm_config_module.get_llm_config()
+    old_llm_client = llm_client_module.get_llm_client()
+    old_embedding_client = embedding_client_module.get_embedding_client()
+
+    response = await settings_router.apply_catalog(settings_router.CatalogPayload(catalog=catalog))
+
+    new_llm_client = llm_client_module.get_llm_client()
+    new_embedding_client = embedding_client_module.get_embedding_client()
+
+    assert response["catalog"] == settings_router.redact_catalog_secrets(catalog)
+    assert new_llm_client is old_llm_client
+    assert new_embedding_client is old_embedding_client
+    assert new_llm_client.config.model == "gpt-same"
+
+
+@pytest.mark.asyncio
+async def test_re_saving_an_unchanged_catalog_keeps_the_runtime_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``PUT /catalog`` with the stored catalog skips the reset too."""
+    catalog = _build_catalog(
+        llm_model="gpt-put",
+        llm_base_url="https://put-llm.example/v1",
+        llm_api_key="put-llm-key",
+        embedding_model="text-embedding-put",
+        embedding_base_url="https://put-embedding.example/v1/embeddings",
+        embedding_api_key="put-embedding-key",
+    )
+    service = _FakeCatalogService(catalog)
+    _patch_runtime(monkeypatch, service)
+
+    old_llm_client = llm_client_module.get_llm_client()
+    old_embedding_client = embedding_client_module.get_embedding_client()
+
+    response = await settings_router.update_catalog(settings_router.CatalogPayload(catalog=catalog))
+
+    assert response == {"catalog": settings_router.redact_catalog_secrets(catalog)}
+    assert llm_client_module.get_llm_client() is old_llm_client
+    assert embedding_client_module.get_embedding_client() is old_embedding_client
+
+
+@pytest.mark.asyncio
+async def test_finishing_the_tour_without_edits_keeps_the_runtime_clients(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The tour is the cold start #1421 described, and it applies on exit.
+
+    Completing it with nothing changed used to reset the shared clients while
+    the learner's first message was already in flight.
+    """
+    catalog = _build_catalog(
+        llm_model="gpt-tour",
+        llm_base_url="https://tour-llm.example/v1",
+        llm_api_key="tour-llm-key",
+        embedding_model="text-embedding-tour",
+        embedding_base_url="https://tour-embedding.example/v1/embeddings",
+        embedding_api_key="tour-embedding-key",
+    )
+    service = _FakeCatalogService(catalog)
+    _patch_runtime(monkeypatch, service)
+    monkeypatch.setattr(settings_router, "_tour_cache_file", lambda: tmp_path / "tour.json")
+
+    old_llm_client = llm_client_module.get_llm_client()
+    old_embedding_client = embedding_client_module.get_embedding_client()
+
+    await settings_router.complete_tour(None)
+
+    assert llm_client_module.get_llm_client() is old_llm_client
+    assert embedding_client_module.get_embedding_client() is old_embedding_client
+
+
+@pytest.mark.asyncio
+async def test_reapplying_one_unchanged_service_keeps_the_runtime_clients(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Applying a single service that already holds that value resets nothing."""
+    catalog = _build_catalog(
+        llm_model="gpt-service",
+        llm_base_url="https://service-llm.example/v1",
+        llm_api_key="service-llm-key",
+        embedding_model="text-embedding-service",
+        embedding_base_url="https://service-embedding.example/v1/embeddings",
+        embedding_api_key="service-embedding-key",
+    )
+    from deeptutor.services.config.settings_draft import SettingsDraftService
+
+    service = _FakeCatalogService(catalog)
+    _patch_runtime(monkeypatch, service)
+    draft_service = SettingsDraftService(tmp_path / "settings_draft.json")
+    monkeypatch.setattr(settings_router, "get_settings_draft_service", lambda: draft_service)
+
+    old_llm_client = llm_client_module.get_llm_client()
+    old_embedding_client = embedding_client_module.get_embedding_client()
+
+    await settings_router.apply_catalog_service(
+        settings_router.CatalogServicePayload(service="llm", config=catalog["services"]["llm"])
+    )
+
+    assert llm_client_module.get_llm_client() is old_llm_client
+    assert embedding_client_module.get_embedding_client() is old_embedding_client
+
+
+@pytest.mark.asyncio
+async def test_apply_catalog_service_only_promotes_the_selected_service_and_updates_saved_draft(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    from deeptutor.services.config.settings_draft import SettingsDraftService
+
+    live = _build_catalog(
+        llm_model="gpt-live",
+        llm_base_url="https://llm.example/v1",
+        llm_api_key="llm-key",
+        embedding_model="text-embedding-live",
+        embedding_base_url="https://embedding.example/v1/embeddings",
+        embedding_api_key="embedding-key",
+    )
+    live["services"]["stt"] = {
+        "active_profile_id": "stt-profile",
+        "active_model_id": "stt-model",
+        "profiles": [
+            {
+                "id": "stt-profile",
+                "name": "Live STT",
+                "binding": "openai",
+                "base_url": "https://old-stt.example/v1",
+                "api_key": "old-stt-key",
+                "api_version": "",
+                "extra_headers": {},
+                "models": [{"id": "stt-model", "name": "Whisper", "model": "whisper-1"}],
+            }
+        ],
+    }
+    draft = deepcopy(live)
+    draft["services"]["stt"]["profiles"][0]["base_url"] = "https://new-stt.example/v1"
+    draft["services"]["stt"]["profiles"][0]["api_key"] = "new-stt-key"
+    draft["services"]["llm"]["profiles"][0]["name"] = "Unapplied LLM edit"
+
+    catalog_service = _FakeCatalogService(live)
+    draft_service = SettingsDraftService(tmp_path / "settings_draft.json")
+    draft_service.save({"catalog": draft, "extensions": {"network": {"backend_port": 9000}}})
+    monkeypatch.setattr(settings_router, "get_model_catalog_service", lambda: catalog_service)
+    monkeypatch.setattr(settings_router, "get_settings_draft_service", lambda: draft_service)
+    monkeypatch.setattr(settings_router, "_runtime_catalog_write", contextlib.nullcontext)
+
+    response = await settings_router.apply_catalog_service(
+        settings_router.CatalogServicePayload(service="stt", config=draft["services"]["stt"])
+    )
+
+    applied = catalog_service.load()
+    assert applied["services"]["stt"]["profiles"][0]["base_url"] == ("https://new-stt.example/v1")
+    assert applied["services"]["stt"]["profiles"][0]["api_key"] == "new-stt-key"
+    assert applied["services"]["llm"]["profiles"][0]["name"] == ("Default LLM Endpoint")
+
+    remaining_draft = draft_service.load()
+    assert remaining_draft["catalog"]["services"]["stt"] == applied["services"]["stt"]
+    assert remaining_draft["catalog"]["services"]["llm"]["profiles"][0]["name"] == (
+        "Unapplied LLM edit"
+    )
+    assert remaining_draft["extensions"] == {"network": {"backend_port": 9000}}
+    assert response["draft"] is not None
+    assert response["catalog"]["services"]["stt"]["profiles"][0]["api_key"] == (
+        settings_router.CATALOG_SECRET_MASK
+    )
+
+
+@pytest.mark.asyncio
 async def test_update_catalog_restores_masked_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
     current = _build_catalog(
         llm_model="gpt-4o-mini",
@@ -789,7 +1046,7 @@ async def test_update_catalog_restores_masked_secrets(monkeypatch: pytest.Monkey
     )
     service = _FakeCatalogService(current)
     monkeypatch.setattr(settings_router, "get_model_catalog_service", lambda: service)
-    monkeypatch.setattr(settings_router, "_invalidate_runtime_caches", lambda: None)
+    monkeypatch.setattr(settings_router, "_runtime_catalog_write", contextlib.nullcontext)
     draft = settings_router.redact_catalog_secrets(current)
     draft["services"]["llm"]["profiles"][0]["name"] = "Renamed"
 
@@ -838,7 +1095,7 @@ async def test_catalog_writes_preserve_current_managed_codex_metadata(
     current["services"]["llm"]["active_model_id"] = managed_model["id"]
     service = _FakeCatalogService(current)
     monkeypatch.setattr(settings_router, "get_model_catalog_service", lambda: service)
-    monkeypatch.setattr(settings_router, "_invalidate_runtime_caches", lambda: None)
+    monkeypatch.setattr(settings_router, "_runtime_catalog_write", contextlib.nullcontext)
 
     stale_draft = deepcopy(current)
     stale_draft["services"]["embedding"]["profiles"][0]["name"] = "Unsaved edit"
@@ -895,7 +1152,7 @@ async def test_catalog_write_rejects_unbound_or_cross_account_codex_reasoning_ch
     current["services"]["llm"]["profiles"].append(current_profile)
     service = _FakeCatalogService(current)
     monkeypatch.setattr(settings_router, "get_model_catalog_service", lambda: service)
-    monkeypatch.setattr(settings_router, "_invalidate_runtime_caches", lambda: None)
+    monkeypatch.setattr(settings_router, "_runtime_catalog_write", contextlib.nullcontext)
 
     stale_draft = deepcopy(current)
     stale_profile = stale_draft["services"]["llm"]["profiles"][1]
@@ -939,7 +1196,7 @@ async def test_catalog_write_uses_current_managed_codex_profile_presence(
         stale_draft["services"]["llm"]["profiles"].append(managed_profile)
     service = _FakeCatalogService(current)
     monkeypatch.setattr(settings_router, "get_model_catalog_service", lambda: service)
-    monkeypatch.setattr(settings_router, "_invalidate_runtime_caches", lambda: None)
+    monkeypatch.setattr(settings_router, "_runtime_catalog_write", contextlib.nullcontext)
 
     await settings_router.update_catalog(settings_router.CatalogPayload(catalog=stale_draft))
 
@@ -973,7 +1230,7 @@ async def test_incomplete_catalog_write_preserves_the_current_managed_codex_prof
     current["services"]["llm"]["profiles"].append(managed_profile)
     service = _FakeCatalogService(current)
     monkeypatch.setattr(settings_router, "get_model_catalog_service", lambda: service)
-    monkeypatch.setattr(settings_router, "_invalidate_runtime_caches", lambda: None)
+    monkeypatch.setattr(settings_router, "_runtime_catalog_write", contextlib.nullcontext)
     payload = settings_router.CatalogPayload(catalog={"version": 1})
 
     if operation == "save":
@@ -1601,3 +1858,22 @@ async def test_ui_endpoints_do_not_freeze_defaults_into_the_file(
     assert stored == {"theme": "dark"}, f"only the changed field belongs on disk: {stored}"
     # The read path still reports the full picture.
     assert settings_router.load_ui_settings()["language"] == "en"
+
+
+@pytest.mark.asyncio
+async def test_voice_math_speak_persists_without_freezing_defaults(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    settings_file = tmp_path / "interface.json"
+    monkeypatch.setattr(settings_router, "_settings_file", lambda: settings_file)
+
+    response = await settings_router.update_voice_math_speak(
+        settings_router.VoiceMathSpeakUpdate(voice_math_speak=False)
+    )
+
+    assert response == {"voice_math_speak": False}
+    stored = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert stored == {"voice_math_speak": False}
+    loaded = settings_router.load_ui_settings()
+    assert loaded["voice_math_speak"] is False
+    assert loaded["voice_autoplay"] is False

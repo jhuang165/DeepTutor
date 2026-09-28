@@ -30,11 +30,13 @@ from deeptutor.knowledge.kb_types import (
     is_connected_kb,
 )
 from deeptutor.knowledge.manifest import iter_kb_documents
+from deeptutor.knowledge.naming import validate_knowledge_base_name
 from deeptutor.services.file_io import atomic_write_json
 from deeptutor.services.rag.factory import (
     DEFAULT_PROVIDER,
     IMA_PROVIDER,
     KNOWN_PROVIDERS,
+    LIGHTRAG_PROVIDER,
     LIGHTRAG_SERVER_PROVIDER,
     PAGEINDEX_OSS_PROVIDER,
     PAGEINDEX_PROVIDER,
@@ -52,6 +54,23 @@ from deeptutor.services.rag.index_probe import (
 from deeptutor.services.web_source.crawler import MAX_CRAWL_DEPTH, MAX_CRAWL_PAGES
 
 logger = logging.getLogger(__name__)
+
+
+def _assert_move_id_available(base_dir: Path, name: str) -> None:
+    """Prevent a new registration from shadowing a saved moved-KB redirect."""
+    from deeptutor.services.workspace.knowledge import (
+        canonical_kb_id,
+        qualified_kb_id,
+        workspace_id_for_kb_base_dir,
+    )
+
+    workspace_id = workspace_id_for_kb_base_dir(base_dir)
+    if workspace_id is None:
+        # A manager targeting a partner's separate directory has no catalog ID.
+        return
+    resource_id = qualified_kb_id(name, workspace_id)
+    if canonical_kb_id(resource_id) != resource_id:
+        raise ValueError("This knowledge base ID is reserved by an earlier move.")
 
 
 # How long an entry can be missing its KB directory before ``list_knowledge_bases``
@@ -154,9 +173,10 @@ def _reconcile_embedding_flags(knowledge_bases: dict, base_dir: Path | None = No
     fp = _get_embedding_fingerprint()
     signature = signature_from_embedding_config()
     changed = False
+    if base_dir is not None:
+        from deeptutor.services.rag.embedding_binding import reconcile_bindings
 
-    if signature is None and not fp:
-        return False
+        changed = reconcile_bindings(knowledge_bases, base_dir)
 
     for kb_name, kb_entry in knowledge_bases.items():
         if not isinstance(kb_entry, dict):
@@ -169,6 +189,53 @@ def _reconcile_embedding_flags(knowledge_bases: dict, base_dir: Path | None = No
             continue
 
         provider = normalize_provider_name(kb_entry.get("rag_provider"))
+        if provider == LIGHTRAG_PROVIDER and base_dir is not None:
+            from deeptutor.services.embedding.config import embedding_config_scope
+            from deeptutor.services.rag.embedding_binding import (
+                binding_status,
+                bound_graph_storage_root,
+                entry_signature,
+            )
+            from deeptutor.services.rag.pipelines.lightrag.storage import (
+                embedding_matches,
+                latest_published_root,
+            )
+
+            kb_dir = base_dir / kb_name
+            kb_entry["index_versions"] = inspect_kb_versions(kb_dir, provider)
+            published = latest_published_root(kb_dir)
+            state, bound_config = binding_status(kb_entry)
+            if state in {"missing", "unconfigured"}:
+                continue
+            if bound_config is not None:
+                with embedding_config_scope(bound_config):
+                    try:
+                        published = bound_graph_storage_root(kb_dir, provider, published)
+                    except ValueError:
+                        pass  # Check the unmatched published index below.
+            lightrag_mismatch = published is not None and not embedding_matches(
+                published, entry_signature(kb_entry)
+            )
+            lightrag_mismatch = lightrag_mismatch or state == "changed"
+            if lightrag_mismatch and not kb_entry.get("embedding_mismatch"):
+                kb_entry["embedding_mismatch"] = True
+                kb_entry["needs_reindex"] = True
+                changed = True
+            elif (
+                published is not None
+                and not lightrag_mismatch
+                and kb_entry.pop("embedding_mismatch", None)
+            ):
+                kb_entry["needs_reindex"] = False
+                changed = True
+            continue
+
+        if kb_entry.get("embedding_selection"):
+            continue
+
+        if signature is None and not fp:
+            continue
+
         if not provider_uses_embedding_versions(provider):
             kb_dir = (base_dir / kb_name) if base_dir is not None else None
             if kb_dir is not None:
@@ -482,19 +549,17 @@ class KnowledgeBaseManager:
                     "embedding_mismatch",
                 ):
                     kb_config.pop(key, None)
-            else:
+            elif not kb_config.get("embedding_selection"):
                 fp = _get_embedding_fingerprint()
                 if fp:
                     kb_config["embedding_model"], kb_config["embedding_dim"] = fp
             # Record the active signature + the on-disk version registry so
             # the UI can render version chips without recomputing.
             try:
-                from deeptutor.services.rag.embedding_signature import (
-                    signature_from_embedding_config,
-                )
+                from deeptutor.services.rag.embedding_binding import entry_signature
 
-                sig = None if pageindex_provider else signature_from_embedding_config()
-                if sig is not None:
+                sig = None if pageindex_provider else entry_signature(kb_config)
+                if sig is not None and not kb_config.get("embedding_selection"):
                     kb_config["embedding_signature"] = sig.hash()
                 kb_dir = self.base_dir / name
                 if kb_dir.is_dir():
@@ -595,9 +660,9 @@ class KnowledgeBaseManager:
                     continue
 
                 # Check if this is a valid KB directory (flat versions or legacy stores)
+                rag_storage = item / "rag_storage"
                 from deeptutor.services.rag.index_versioning import list_kb_versions
 
-                rag_storage = item / "rag_storage"
                 versions = list_kb_versions(item)
                 detected_provider = _detect_provider_from_versions(versions)
                 is_valid_kb = has_ready_provider_index(item, detected_provider) or (
@@ -690,6 +755,8 @@ class KnowledgeBaseManager:
 
     def register_knowledge_base(self, name: str, description: str = "", set_default: bool = False):
         """Register a knowledge base"""
+        name = validate_knowledge_base_name(name)
+        _assert_move_id_available(self.base_dir, name)
         kb_dir = self.base_dir / name
         if not kb_dir.exists():
             raise ValueError(f"Knowledge base directory does not exist: {kb_dir}")
@@ -705,6 +772,33 @@ class KnowledgeBaseManager:
 
         self._save_config()
 
+    def register_connected_entry(self, name: str, entry: dict) -> bool:
+        """Adopt an already-built connected-KB entry under this manager.
+
+        Every other ``register_*`` method builds a pointer entry from user
+        input. This one takes an entry that already exists elsewhere: a
+        connected KB has no ``<kb>/`` tree under ``base_dir``, so handing one
+        to a partner workspace means copying its ``kb_config.json`` row rather
+        than the folder that provisioning copies for an indexed KB.
+
+        Returns ``False`` when the name is already registered here, leaving
+        the existing entry untouched, so callers can provision idempotently.
+        """
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("Knowledge base name is required.")
+        if not is_connected_kb(entry):
+            raise ValueError(f"Not a connected knowledge base entry: {name}")
+        _assert_move_id_available(self.base_dir, name)
+
+        self.config = self._load_config()
+        knowledge_bases = self.config.setdefault("knowledge_bases", {})
+        if name in knowledge_bases:
+            return False
+        knowledge_bases[name] = dict(entry)
+        self._save_config()
+        return True
+
     def register_obsidian_vault(self, name: str, vault_path: str, description: str = "") -> dict:
         """Register a connected Obsidian vault as a pointer-type KB.
 
@@ -713,9 +807,8 @@ class KnowledgeBaseManager:
         user's existing vault directory, which the Obsidian capability reads
         live. Raises ``ValueError`` on a missing/invalid path or a name clash.
         """
-        name = (name or "").strip()
-        if not name:
-            raise ValueError("Knowledge base name is required.")
+        name = validate_knowledge_base_name(name)
+        _assert_move_id_available(self.base_dir, name)
         vault = Path(vault_path).expanduser()
         if not vault.is_dir():
             raise ValueError(f"Vault path is not a directory: {vault_path}")
@@ -758,9 +851,8 @@ class KnowledgeBaseManager:
         folder with the probe helper first; this only guards basic invariants.
         Raises ``ValueError`` on a missing/invalid path or a name clash.
         """
-        name = (name or "").strip()
-        if not name:
-            raise ValueError("Knowledge base name is required.")
+        name = validate_knowledge_base_name(name)
+        _assert_move_id_available(self.base_dir, name)
         provider = normalize_provider_name(provider)
         folder = Path(external_path).expanduser()
         if not folder.is_dir():
@@ -799,23 +891,14 @@ class KnowledgeBaseManager:
         agent_kind: str,
         *,
         cwd: str = "",
-        partner_id: str = "",
         description: str = "",
     ) -> dict:
-        """Register a connected subagent (local Claude Code / Codex, or a partner) as a KB.
-
-        Like the other connected types this creates no folder and runs no index:
-        it records a ``type: subagent`` pointer naming the backend (``agent_kind``)
-        and its target — an optional working directory (``cwd``) for a local CLI,
-        or the bound ``partner_id`` for the partner backend. The subagent
-        capability drives the live agent; there is nothing on disk to retrieve or
-        reconcile. Raises ``ValueError`` on a missing name/kind or a name clash.
-        """
-        name = (name or "").strip()
+        """Register a local or remote agent connection without creating an index."""
+        name = validate_knowledge_base_name(name)
+        _assert_move_id_available(self.base_dir, name)
         agent_kind = (agent_kind or "").strip()
-        partner_id = (partner_id or "").strip()
-        if not name:
-            raise ValueError("Connection name is required.")
+        if agent_kind == "partner":
+            raise ValueError("Select partners directly through Ask partner instead.")
         if not agent_kind:
             raise ValueError("agent_kind is required.")
         resolved_cwd = ""
@@ -836,7 +919,6 @@ class KnowledgeBaseManager:
             "type": SUBAGENT_KB_TYPE,
             "agent_kind": agent_kind,
             "cwd": resolved_cwd,
-            "partner_id": partner_id,
             "description": description or f"Connected subagent: {name}",
             "status": "ready",
             "created_at": now,
@@ -865,10 +947,9 @@ class KnowledgeBaseManager:
         guards basic invariants. Raises ``ValueError`` on a missing name/URL or a
         name clash.
         """
-        name = (name or "").strip()
+        name = validate_knowledge_base_name(name)
+        _assert_move_id_available(self.base_dir, name)
         server_url = (server_url or "").strip().rstrip("/")
-        if not name:
-            raise ValueError("Knowledge base name is required.")
         if not server_url:
             raise ValueError("LightRAG server URL is required.")
 
@@ -914,9 +995,8 @@ class KnowledgeBaseManager:
         ``ValueError`` on a missing name, a name clash, or a store already
         claimed by another library.
         """
-        name = (name or "").strip()
-        if not name:
-            raise ValueError("Knowledge base name is required.")
+        name = validate_knowledge_base_name(name)
+        _assert_move_id_available(self.base_dir, name)
 
         self.config = self._load_config()
         knowledge_bases = self.config.setdefault("knowledge_bases", {})
@@ -995,12 +1075,11 @@ class KnowledgeBaseManager:
         Raises ``ValueError`` on a missing field, a half-filled credential pair,
         or a name clash.
         """
-        name = (name or "").strip()
+        name = validate_knowledge_base_name(name)
+        _assert_move_id_available(self.base_dir, name)
         client_id = (client_id or "").strip()
         api_key = (api_key or "").strip()
         knowledge_base_id = (knowledge_base_id or "").strip()
-        if not name:
-            raise ValueError("Knowledge base name is required.")
         if bool(client_id) != bool(api_key):
             raise ValueError("IMA Client ID and API Key must be given together.")
         if not knowledge_base_id:
@@ -1040,12 +1119,11 @@ class KnowledgeBaseManager:
         description: str = "",
     ) -> dict:
         """Register a self-hosted WeKnora knowledge base as a pointer KB."""
-        name = (name or "").strip()
+        name = validate_knowledge_base_name(name)
+        _assert_move_id_available(self.base_dir, name)
         server_url = (server_url or "").strip().rstrip("/")
         api_key = (api_key or "").strip()
         knowledge_base_id = (knowledge_base_id or "").strip()
-        if not name:
-            raise ValueError("Knowledge base name is required.")
         if not server_url or not knowledge_base_id:
             raise ValueError("WeKnora server URL and knowledge base ID are required.")
         if not api_key:
@@ -1071,6 +1149,46 @@ class KnowledgeBaseManager:
             "updated_at": now,
         }
         knowledge_bases[name] = entry
+        self._save_config()
+        return entry
+
+    def register_kiwix_kb(
+        self,
+        name: str,
+        server_url: str,
+        zim_name: str,
+        *,
+        zim_title: str = "",
+    ) -> dict:
+        """Register a read-only pointer to one ZIM already served by Kiwix."""
+        from deeptutor.knowledge.kb_types import KIWIX_KB_TYPE
+        from deeptutor.services.rag.pipelines.kiwix.client import (
+            normalize_base_url,
+            validate_zim_name,
+        )
+
+        name = validate_knowledge_base_name(name)
+        server_url = normalize_base_url(server_url)
+        zim_name = validate_zim_name(zim_name)
+        self.config = self._load_config()
+        bases = self.config.setdefault("knowledge_bases", {})
+        if name in bases:
+            raise ValueError(f"A knowledge base named '{name}' already exists.")
+        now = datetime.now().isoformat()
+        entry = {
+            "path": name,
+            "type": KIWIX_KB_TYPE,
+            "rag_provider": KIWIX_KB_TYPE,
+            "server_url": server_url,
+            "zim_name": zim_name,
+            "zim_title": zim_title[:300],
+            "description": f"Kiwix archive: {zim_title or zim_name}",
+            "status": "ready",
+            "needs_reindex": False,
+            "created_at": now,
+            "updated_at": now,
+        }
+        bases[name] = entry
         self._save_config()
         return entry
 
@@ -1104,12 +1222,17 @@ class KnowledgeBaseManager:
     def get_rag_storage_path(self, name: str | None = None) -> Path:
         """Get active index storage path for a knowledge base."""
         kb_dir = self.get_knowledge_base_path(name)
-        from deeptutor.services.rag.embedding_signature import signature_from_embedding_config
+        from deeptutor.services.rag.embedding_binding import binding_status, entry_signature
         from deeptutor.services.rag.index_versioning import (
             resolve_storage_dir_for_read,
         )
 
-        active_storage = resolve_storage_dir_for_read(kb_dir, signature_from_embedding_config())
+        entry = self.config.get("knowledge_bases", {}).get(name or kb_dir.name, {})
+        if entry.get("embedding_selection") and binding_status(entry)[0] != "ready":
+            raise ValueError(
+                "The bound embedding model is unavailable or changed. Check this knowledge base's model settings."
+            )
+        active_storage = resolve_storage_dir_for_read(kb_dir, entry_signature(entry))
         legacy_storage = kb_dir / "rag_storage"
         if active_storage is not None:
             return active_storage
@@ -1182,7 +1305,7 @@ class KnowledgeBaseManager:
     def _embedding_fields(kb_config: dict) -> dict:
         """Extract embedding fingerprint fields from a KB config entry."""
         fields = {}
-        for key in ("embedding_model", "embedding_dim"):
+        for key in ("embedding_model", "embedding_dim", "embedding_selection", "embedding_status"):
             val = kb_config.get(key)
             if val is not None:
                 fields[key] = val
@@ -1227,6 +1350,8 @@ class KnowledgeBaseManager:
                 # LightRAG server pointer (the URL is safe to surface; the API
                 # key deliberately is not).
                 "server_url": kb_config.get("server_url"),
+                "zim_name": kb_config.get("zim_name"),
+                "zim_title": kb_config.get("zim_title"),
                 # IMA pointer. The library id identifies which IMA knowledge
                 # base this KB reads; the client id and API key are credentials
                 # and are deliberately absent from this allowlist.
@@ -1389,6 +1514,75 @@ class KnowledgeBaseManager:
         # Same split for IMA: the library id is shown, the credentials are not.
         if kb_config.get("knowledge_base_id"):
             metadata["knowledge_base_id"] = kb_config.get("knowledge_base_id")
+        if kb_config.get("zim_name"):
+            metadata["zim_name"] = kb_config.get("zim_name")
+            metadata["zim_title"] = kb_config.get("zim_title") or ""
+
+        if rag_provider == LIGHTRAG_PROVIDER:
+            from deeptutor.services.rag.pipelines.lightrag.storage import (
+                published_root_for_embedding,
+                read_published_policy,
+            )
+
+            binding_signature = (
+                kb_config.get("embedding_signature")
+                if kb_config.get("embedding_selection")
+                else None
+            )
+            published_root = (
+                published_root_for_embedding(kb_dir, binding_signature) if dir_exists else None
+            )
+            indexing_policy = read_published_policy(published_root)
+            if published_root is not None:
+                metadata["indexed_version"] = published_root.name
+            if indexing_policy is None:
+                pending = kb_config.get("pending_indexing_policy")
+                indexing_policy = (
+                    {"policy": "defaults"}
+                    if not index_versions
+                    else pending
+                    if isinstance(pending, dict)
+                    else {"policy": "legacy_unpinned"}
+                )
+            from deeptutor.services.rag.pipelines.lightrag.indexing_policy import public_policy
+
+            metadata["indexing_policy"] = public_policy(indexing_policy)
+            if published_root is not None and indexing_policy.get("policy") == "pinned":
+                from deeptutor.services.rag.pipelines.lightrag.indexing_policy import (
+                    IndexingPolicyError,
+                    snapshot_from_persisted,
+                )
+
+                try:
+                    snapshot_from_persisted(indexing_policy)
+                except (IndexingPolicyError, ValueError, PermissionError):
+                    # This is local catalog/access validation, not a model health probe.
+                    # Keep credential/provider exception details out of public metadata.
+                    metadata["indexing_model_unavailable"] = True
+            for version in index_versions:
+                if isinstance(version.get("indexing_policy"), dict):
+                    version["indexing_policy"] = public_policy(version["indexing_policy"])
+            if published_root is not None or kb_config.get("embedding_selection"):
+                from deeptutor.services.rag.embedding_binding import entry_signature
+
+                published = next(
+                    (
+                        v
+                        for v in index_versions
+                        if published_root is not None and v.get("version") == published_root.name
+                    ),
+                    {},
+                )
+                metadata["indexed_embedding_model"] = published.get(
+                    "embedding_model"
+                ) or kb_config.get("embedding_model")
+                metadata["indexed_embedding_dim"] = published.get("embedding_dim") or kb_config.get(
+                    "embedding_dim"
+                )
+                current_embedding = entry_signature(kb_config)
+                if current_embedding is not None:
+                    metadata["current_embedding_model"] = current_embedding.model
+                    metadata["current_embedding_dim"] = current_embedding.dimension
 
         metadata.update(self._embedding_fields(kb_config))
 
@@ -1437,7 +1631,6 @@ class KnowledgeBaseManager:
                 pass
 
         # Check rag_initialized from provider-owned real output, not metadata alone.
-        from deeptutor.services.rag.embedding_signature import signature_from_embedding_config
         from deeptutor.services.rag.index_versioning import (
             find_matching_version,
         )
@@ -1446,7 +1639,9 @@ class KnowledgeBaseManager:
         rag_initialized = has_ready_provider
 
         pageindex_provider = rag_provider in {PAGEINDEX_PROVIDER, PAGEINDEX_OSS_PROVIDER}
-        active_signature = None if pageindex_provider else signature_from_embedding_config()
+        from deeptutor.services.rag.embedding_binding import entry_signature
+
+        active_signature = None if pageindex_provider else entry_signature(kb_config)
         if provider_uses_embedding_versions(rag_provider):
             matched_entry = (
                 find_matching_version(kb_probe_dir, active_signature)
@@ -1467,6 +1662,9 @@ class KnowledgeBaseManager:
                 )
         else:
             active_match = rag_initialized
+
+        if kb_config.get("embedding_status") in {"missing", "changed", "unconfigured"}:
+            active_match = False
 
         info["statistics"] = {
             "raw_documents": raw_count,
@@ -1726,6 +1924,7 @@ class KnowledgeBaseManager:
             "path": str(folder),
             "added_at": datetime.now().isoformat(),
             "file_count": len(files),
+            "last_sync": None,
         }
         metadata["linked_folders"].append(folder_info)
 
@@ -1875,7 +2074,13 @@ class KnowledgeBaseManager:
             "modified_count": len(modified_files),
         }
 
-    def update_folder_sync_state(self, kb_name: str, folder_id: str, synced_files: list[str]):
+    def update_folder_sync_state(
+        self,
+        kb_name: str,
+        folder_id: str,
+        synced_files: list[str],
+        source_mtimes: dict[str, str] | None = None,
+    ):
         """
         Update the sync state for a linked folder after successful sync.
 
@@ -1886,6 +2091,7 @@ class KnowledgeBaseManager:
             kb_name: Knowledge base name
             folder_id: Folder ID
             synced_files: List of file paths that were successfully synced
+            source_mtimes: Modification times captured before source staging.
         """
         if kb_name not in self.list_knowledge_bases():
             raise ValueError(f"Knowledge base not found: {kb_name}")
@@ -1913,10 +2119,14 @@ class KnowledgeBaseManager:
                 file_states = folder.get("synced_files", {})
                 for file_path in synced_files:
                     try:
-                        p = Path(file_path)
-                        if p.exists():
-                            mtime = datetime.fromtimestamp(p.stat().st_mtime)
-                            file_states[file_path] = mtime.isoformat()
+                        if source_mtimes is not None:
+                            if file_path in source_mtimes:
+                                file_states[file_path] = source_mtimes[file_path]
+                        else:
+                            p = Path(file_path)
+                            if p.exists():
+                                mtime = datetime.fromtimestamp(p.stat().st_mtime)
+                                file_states[file_path] = mtime.isoformat()
                     except Exception:
                         pass
 
@@ -2049,6 +2259,8 @@ class KnowledgeBaseManager:
             "max_depth": max_depth,
             "max_pages": max_pages,
             "enabled": True,
+            "auto_sync_enabled": True,
+            "sync_interval_hours": 24,
             "page_hashes": {},
             "page_count": 0,
             "last_synced_at": "",
@@ -2095,6 +2307,29 @@ class KnowledgeBaseManager:
                 source.update(fields)
                 atomic_write_json(metadata_file, metadata)
                 return
+
+    def update_web_source_schedule(
+        self,
+        kb_name: str,
+        source_id: str,
+        *,
+        auto_sync_enabled: bool,
+        sync_interval_hours: int,
+    ) -> dict:
+        """Persist the reviewable schedule fields for one web source."""
+        source = next(
+            (item for item in self.get_web_sources(kb_name) if item.get("id") == source_id),
+            None,
+        )
+        if source is None:
+            raise ValueError(f"Source '{source_id}' not found")
+        self.update_web_source_state(
+            kb_name,
+            source_id,
+            auto_sync_enabled=auto_sync_enabled,
+            sync_interval_hours=sync_interval_hours,
+        )
+        return next(item for item in self.get_web_sources(kb_name) if item.get("id") == source_id)
 
     def get_all_web_sources(self) -> list[tuple[str, dict]]:
         """Scan every KB and return (kb_name, source_dict) pairs."""

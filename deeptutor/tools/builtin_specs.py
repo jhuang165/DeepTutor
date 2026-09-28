@@ -50,10 +50,11 @@ BUILTIN_TOOL_SPECS: tuple[BuiltinToolSpec, ...] = (
             ("brainstorm", "BrainstormTool"),
             ("rag", "RAGTool"),
             ("kb_files", "KbFilesTool"),
+            ("knowledge_frontier", "KnowledgeFrontierTool"),
             ("web_search", "WebSearchTool"),
-            ("code_execution", "CodeExecutionTool"),
             ("reason", "ReasonTool"),
             ("paper_search", "PaperSearchToolWrapper"),
+            ("zotero_search", "ZoteroSearchToolWrapper"),
             ("read_source", "ReadSourceTool"),
             ("read_memory", "ReadMemoryTool"),
             ("write_memory", "WriteMemoryTool"),
@@ -70,6 +71,16 @@ BUILTIN_TOOL_SPECS: tuple[BuiltinToolSpec, ...] = (
         ),
     ),
     BuiltinToolSpec("exec", "deeptutor.tools.exec_tool:ExecTool"),
+    *_specs(
+        "deeptutor.tools.workspace",
+        (
+            ("workspace_list", "WorkspaceListTool"),
+            ("workspace_read", "WorkspaceReadTool"),
+            ("workspace_search", "WorkspaceSearchTool"),
+            ("workspace_present", "WorkspacePresentTool"),
+            ("workspace_export", "WorkspaceExportTool"),
+        ),
+    ),
     BuiltinToolSpec("submit_visualization", "deeptutor.visualizers.tool:SubmitVisualizationTool"),
     BuiltinToolSpec("imagegen", "deeptutor.tools.media_gen_tool:ImagegenTool"),
     BuiltinToolSpec("videogen", "deeptutor.tools.media_gen_tool:VideogenTool"),
@@ -89,8 +100,13 @@ BUILTIN_TOOL_SPECS: tuple[BuiltinToolSpec, ...] = (
             ("mastery_quiz", "MasteryQuizTool"),
             ("mastery_grade", "MasteryGradeTool"),
             ("mastery_skip_question", "MasterySkipQuestionTool"),
+            ("mastery_repair_question", "MasteryRepairQuestionTool"),
+            ("mastery_defer_objective", "MasteryDeferObjectiveTool"),
             ("mastery_assess", "MasteryAssessTool"),
             ("mastery_build", "MasteryBuildTool"),
+            ("mastery_mode", "MasteryModeTool"),
+            ("mastery_profile", "MasteryProfileTool"),
+            ("mastery_revise", "MasteryReviseTool"),
             ("mastery_paths", "MasteryPathsTool"),
             ("mastery_switch", "MasterySwitchTool"),
             ("mastery_leave", "MasteryLeaveTool"),
@@ -151,6 +167,7 @@ BUILTIN_TOOL_SPECS: tuple[BuiltinToolSpec, ...] = (
             ("material_outline", "MaterialOutlineTool"),
             ("search_material", "SearchMaterialTool"),
             ("read_material", "ReadMaterialTool"),
+            ("view_figure", "ViewFigureTool"),
             ("reader_goto", "ReaderGotoTool"),
             ("reader_annotate", "ReaderAnnotateTool"),
         ),
@@ -198,11 +215,10 @@ BUILTIN_TOOL_SPEC_BY_NAME: dict[str, BuiltinToolSpec] = {
 }
 
 TOOL_ALIASES: dict[str, tuple[str, dict[str, object]]] = {
+    "pdf": ("read_source", {}),
     "rag_hybrid": ("rag", {"mode": "hybrid"}),
     "rag_naive": ("rag", {"mode": "naive"}),
     "rag_search": ("rag", {}),
-    "code_execute": ("code_execution", {}),
-    "run_code": ("code_execution", {}),
 }
 
 if len(BUILTIN_TOOL_SPEC_BY_NAME) != len(BUILTIN_TOOL_SPECS):

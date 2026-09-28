@@ -6,17 +6,19 @@ import re
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 import httpx
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
+from deeptutor.multi_user.paths import current_owner_id
 from deeptutor.services.notebook.service import NotebookCorruptedError
 from deeptutor.video_learning import (
     TimedMediaError,
     TimedMediaNotFound,
     get_timed_media_store,
+    invidious_account,
     load_video_learning_settings,
     material_with_playback,
     refresh_invidious_transcript,
@@ -111,6 +113,69 @@ async def test_invidious(payload: VideoLearningSettingsRequest) -> dict[str, Any
         raise _http_error(exc) from exc
 
 
+@router.post("/invidious/account/authorize")
+async def authorize_invidious_account() -> dict[str, str]:
+    try:
+        url = invidious_account.begin_invidious_account_authorization(
+            owner_id=current_owner_id(),
+            redirect_uri=invidious_account.invidious_redirect_uri(),
+        )
+    except Exception as exc:
+        raise _http_error(exc) from exc
+    return {"authorize_url": url}
+
+
+@router.get("/invidious/account/callback")
+async def invidious_account_callback(token: str = "", state: str = "") -> RedirectResponse:
+    result = "connected"
+    try:
+        await invidious_account.complete_invidious_account_authorization(
+            owner_id=current_owner_id(),
+            state=state,
+            token=token,
+        )
+    except Exception as exc:
+        result = invidious_account.authorization_failure_code(exc, has_token=bool(token))
+    return RedirectResponse(
+        f"/watching?account={result}",
+        status_code=303,
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+    )
+
+
+@router.get("/invidious/browse/{kind}")
+async def browse_invidious(
+    kind: str,
+    q: str = Query(default="", max_length=500),
+    page: int = Query(default=1, ge=1, le=1000),
+    playlist_id: str = Query(default="", max_length=100),
+) -> JSONResponse:
+    try:
+        payload = await invidious_account.browse_invidious(
+            owner_id=current_owner_id(),
+            kind=kind,
+            query=q,
+            page=page,
+            playlist_id=playlist_id,
+        )
+    except Exception as exc:
+        raise _http_error(exc) from exc
+    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/invidious/account/status")
+async def get_invidious_account_status() -> dict[str, Any]:
+    return invidious_account.invidious_account_status(current_owner_id())
+
+
+@router.post("/invidious/account/disconnect")
+async def disconnect_invidious_account() -> dict[str, Any]:
+    try:
+        return await invidious_account.disconnect_invidious_account(owner_id=current_owner_id())
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
 @router.post("/materials/resolve")
 async def resolve_video(payload: ResolveRequest) -> dict[str, Any]:
     try:
@@ -146,7 +211,7 @@ async def save_video_progress(material_id: str, payload: ProgressRequest) -> dic
     try:
         store = get_timed_media_store()
         with store.lock(material_id):
-            material = store.get(material_id)
+            material = store.get(material_id, lock_held=True)
             known_duration = float(material.get("metadata", {}).get("duration_seconds") or 0)
             duration = known_duration or float(payload.duration_seconds or 0)
             position = min(payload.time_seconds, duration) if duration > 0 else payload.time_seconds
@@ -163,6 +228,22 @@ async def save_video_progress(material_id: str, payload: ProgressRequest) -> dic
 async def list_video_notes(material_id: str) -> list[dict[str, Any]]:
     try:
         return video_notes.list_notes(video_notes.get_notebook_manager(), material_id)
+    except Exception as exc:
+        raise _note_error(exc) from exc
+
+
+@router.get("/materials/{material_id}/notes.md")
+async def export_video_notes(material_id: str) -> Response:
+    try:
+        markdown = video_notes.export_notes(video_notes.get_notebook_manager(), material_id)
+        return Response(
+            markdown,
+            media_type="text/markdown",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": 'attachment; filename="video-notes.md"',
+            },
+        )
     except Exception as exc:
         raise _note_error(exc) from exc
 

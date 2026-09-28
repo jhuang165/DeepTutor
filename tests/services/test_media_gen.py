@@ -9,6 +9,7 @@ config resolution, and the public facades.
 from __future__ import annotations
 
 import base64
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -21,6 +22,7 @@ from deeptutor.services.config.provider_runtime import (
 from deeptutor.services.generation_http import (
     GenerationProviderError,
     build_auth_headers,
+    decode_base64_media,
     join_api_path,
 )
 from deeptutor.services.imagegen import generate_image
@@ -32,6 +34,7 @@ from deeptutor.services.videogen import generate_video, probe_video
 from deeptutor.services.videogen.adapters.async_task import AsyncTaskVideogenAdapter
 from deeptutor.services.videogen.adapters.dashscope import DashScopeVideogenAdapter
 from deeptutor.services.videogen.config import VideogenConfig
+from deeptutor.tools.media_gen_tool import ImagegenTool, VideogenTool
 
 
 def _patch_http(
@@ -73,6 +76,13 @@ def test_build_auth_headers_styles() -> None:
     assert build_auth_headers("bearer", "") == {}
 
 
+def test_decode_base64_media_rejects_invalid_or_empty_payloads() -> None:
+    with pytest.raises(GenerationProviderError, match="invalid base64"):
+        decode_base64_media("%%%not-base64%%%", "Image generation")
+    with pytest.raises(GenerationProviderError, match="empty base64"):
+        decode_base64_media("", "Image generation")
+
+
 def test_join_api_path_appends_and_preserves_full_url() -> None:
     assert (
         join_api_path("https://api.openai.com/v1", "images/generations")
@@ -80,6 +90,29 @@ def test_join_api_path_appends_and_preserves_full_url() -> None:
     )
     full = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
     assert join_api_path(full, "images/generations") == full
+
+
+@pytest.mark.parametrize(
+    ("tool", "language", "expected"),
+    [
+        (ImagegenTool(), "en", "generative visual requests"),
+        (ImagegenTool(), "zh", "生成式视觉请求"),
+        (VideogenTool(), "en", "long-running media service"),
+        (VideogenTool(), "zh", "耗时较长的媒体服务"),
+    ],
+)
+def test_media_tool_prompt_hints_distinguish_generation_from_exec(
+    tool: ImagegenTool | VideogenTool, language: str, expected: str
+) -> None:
+    hints = tool.get_prompt_hints(language)
+    rendered = " ".join(
+        [hints.short_description, hints.when_to_use, hints.input_format, hints.guideline]
+    )
+    assert expected in rendered
+    assert "outputs/" in rendered
+    assert "workspace" in rendered
+    for removed_name in ("code_execution", "run_code", "code_execute"):
+        assert removed_name not in rendered
 
 
 # ── imagegen adapter ────────────────────────────────────────────────────────
@@ -113,6 +146,18 @@ async def test_imagegen_adapter_url_is_downloaded(monkeypatch: pytest.MonkeyPatc
     images = await OpenAICompatImagegenAdapter().generate("dog", config)
     assert images == [(b"DOWNLOADED", "image/png")]
     assert captured["gets"][0]["url"] == "https://cdn/x.png"
+
+
+@pytest.mark.asyncio
+async def test_imagegen_adapter_rejects_empty_url_download(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    post_resp = httpx.Response(200, json={"data": [{"url": "https://cdn/empty.png"}]})
+    get_resp = httpx.Response(200, content=b"", headers={"content-type": "image/png"})
+    _patch_http(monkeypatch, post=post_resp, get=get_resp)
+    config = ImagegenConfig(model="seedream", base_url="https://ark/api/v3", api_key="k")
+    with pytest.raises(GenerationProviderError, match="empty data"):
+        await OpenAICompatImagegenAdapter().generate("dog", config)
 
 
 @pytest.mark.asyncio
@@ -154,7 +199,9 @@ async def test_dashscope_imagegen_task_polls_and_downloads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def post_router(url: str, _kwargs: Any) -> httpx.Response:
-        assert url == "https://dashscope.aliyuncs.com/api/v1/services/aigc/image-synthesis"
+        assert (
+            url == "https://dashscope.aliyuncs.com/api/v1/services/aigc/text2image/image-synthesis"
+        )
         return httpx.Response(200, json={"output": {"task_id": "image-task"}})
 
     def get_router(url: str, _kwargs: Any) -> httpx.Response:
@@ -302,12 +349,15 @@ async def test_dashscope_videogen_task_polls_and_downloads(
         progress_messages.append(message)
 
     def post_router(url: str, kwargs: Any) -> httpx.Response:
-        assert url == "https://dashscope.aliyuncs.com/api/v1/services/aigc/video-generation"
+        assert (
+            url
+            == "https://dashscope.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis"
+        )
         assert kwargs["headers"]["X-DashScope-Async"] == "enable"
         assert kwargs["json"] == {
             "model": "wanx2.1-t2v-turbo",
             "input": {"prompt": "a wave"},
-            "parameters": {"ratio": "16:9", "duration": 5, "resolution": "720p"},
+            "parameters": {"size": "1280*720"},
         }
         return httpx.Response(200, json={"output": {"task_id": "video-task"}})
 
@@ -339,6 +389,50 @@ async def test_dashscope_videogen_task_polls_and_downloads(
     assert video == b"MP4DATA"
     assert content_type == "video/mp4"
     assert progress_messages[0].startswith("Submitted DashScope video task")
+
+
+@pytest.mark.parametrize(
+    ("model", "ratio", "resolution", "expected_size"),
+    [
+        ("wanx2.1-t2v-turbo", "9:16", "480p", "480*832"),
+        ("wanx2.1-t2v-turbo", "1:1", "", "960*960"),
+        ("wan2.2-t2v-plus", "16:9", "480p", "832*480"),
+        ("wan2.2-t2v-plus", "4:3", "1080p", "1632*1248"),
+        ("wan2.6-t2v", "4:3", "1080p", "1632*1248"),
+        ("wan2.6-t2v", "", "1280*720", "1280*720"),
+    ],
+)
+def test_dashscope_videogen_uses_concrete_size(
+    model: str, ratio: str, resolution: str, expected_size: str
+) -> None:
+    config = VideogenConfig(model=model, aspect_ratio=ratio, resolution=resolution)
+    assert DashScopeVideogenAdapter._payload("a wave", config)["parameters"] == {
+        "size": expected_size
+    }
+
+
+@pytest.mark.parametrize(
+    ("model", "ratio", "resolution", "message"),
+    [
+        ("wanx2.1-t2v-plus", "16:9", "480p", "does not support 480p"),
+        ("wan2.2-t2v-plus", "16:9", "720p", "does not support 720p"),
+        ("wan2.2-t2v-plus", "", "1280*720", "does not support 720p"),
+        ("wanx2.1-t2v-turbo", "4:3", "480p", "Unsupported DashScope"),
+        ("wanx2.1-t2v-turbo", "9:16", "1280*720", "conflicts with aspect ratio"),
+    ],
+)
+def test_dashscope_videogen_rejects_unsupported_size(
+    model: str, ratio: str, resolution: str, message: str
+) -> None:
+    config = VideogenConfig(model=model, aspect_ratio=ratio, resolution=resolution)
+    with pytest.raises(GenerationProviderError, match=message):
+        DashScopeVideogenAdapter._payload("a wave", config)
+
+
+def test_dashscope_videogen_rejects_non_five_second_legacy_duration() -> None:
+    config = VideogenConfig(model="wanx2.1-t2v-turbo", duration="10")
+    with pytest.raises(GenerationProviderError, match="only supports a 5-second video"):
+        DashScopeVideogenAdapter._payload("a wave", config)
 
 
 @pytest.mark.asyncio
@@ -481,76 +575,109 @@ async def test_generate_image_facade(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_imagegen_tool_saves_public_artifact(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The tool must write generated bytes to a path /files/outputs can serve.
-
-    Regression: media landed under ``<task>/media`` which was not on the
-    public-output allowlist, so artifacts collected empty ("no saved files").
-    """
-    import shutil
-
+async def test_imagegen_tool_saves_then_presents_selected_workspace_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Mock E2E: provider bytes -> outputs/ -> opaque openable snapshot."""
     import deeptutor.services.imagegen as imagegen_mod
-    from deeptutor.services.path_service import get_path_service
+    from deeptutor.services.workspace import get_content_workspace_service
     from deeptutor.tools.media_gen_tool import ImagegenTool
+    from deeptutor.tools.workspace import WorkspacePresentTool
 
     async def fake_generate_image(prompt: str, **_kwargs: Any) -> list[tuple[bytes, str]]:
         return [(b"\x89PNG\r\n\x1a\nfake", "image/png")]
 
     monkeypatch.setattr(imagegen_mod, "generate_image", fake_generate_image)
+    selected = tmp_path / "selected-workspace"
+    selected.mkdir()
+    monkeypatch.setenv("DEEPTUTOR_WORKSPACE_ROOT", str(selected))
+    workspace_service = get_content_workspace_service()
+    runtime = workspace_service.create_runtime_context(
+        capability="chat", session_id="session-a", turn_id="turn-a"
+    )
 
-    workspace = get_path_service().get_task_workspace("chat", "test_imagegen_tool") / "media"
-    workspace.mkdir(parents=True, exist_ok=True)
-    try:
-        result = await ImagegenTool().execute(prompt="a cat", _workspace_dir=str(workspace))
-        assert result.success, result.content
-        artifacts = result.metadata.get("artifacts") or []
-        assert artifacts, "tool produced no artifacts"
-        assert artifacts[0]["url"].startswith("/files/outputs/")
-        assert artifacts[0]["mime_type"] == "image/png"
-    finally:
-        shutil.rmtree(
-            get_path_service().get_task_workspace("chat", "test_imagegen_tool"),
-            ignore_errors=True,
-        )
+    result = await ImagegenTool().execute(
+        prompt="a cat",
+        _workspace_dir=str(Path(runtime.output_dir) / "media"),
+        _workspace_id=runtime.workspace_id,
+    )
+
+    assert result.success, result.content
+    artifacts = result.metadata.get("artifacts") or []
+    assert len(artifacts) == 1
+    assert artifacts[0]["relative_path"].startswith("outputs/chat/session-a/turn-a/media/imagegen_")
+    assert artifacts[0]["path"] == artifacts[0]["relative_path"]
+    assert artifacts[0]["url"] == ""
+    assert artifacts[0]["mime_type"] == "image/png"
+    assert str(selected) not in result.content
+
+    assert result.metadata.get("workspace_items") == []
+    assert result.sources == []
+    assert "not yet presented" in result.content
+    presentation = await WorkspacePresentTool().execute(
+        items=[{"path": artifacts[0]["relative_path"]}],
+        _workspace_id=runtime.workspace_id,
+    )
+    items = presentation.metadata.get("workspace_items") or []
+    assert len(items) == 1
+    assert items[0]["url"].startswith("/files/workspace-items/")
+    assert items[0]["relative_path"] == artifacts[0]["relative_path"]
+    assert items[0]["generated"] is True
+    snapshot, published = workspace_service.resolve_published_item(
+        runtime.workspace_id, items[0]["workspace_item_id"]
+    )
+    assert snapshot.read_bytes() == b"\x89PNG\r\n\x1a\nfake"
+    assert published.mime_type == "image/png"
 
 
 @pytest.mark.asyncio
 async def test_imagegen_tool_without_injected_workspace_uses_public_fallback(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Direct tool calls still need a real public workspace, not a phantom agent dir."""
-    import shutil
-
+    """Direct SDK calls use the selected workspace's outputs/, never legacy data paths."""
     import deeptutor.services.imagegen as imagegen_mod
-    from deeptutor.services.path_service import get_path_service
+    from deeptutor.services.workspace import get_content_workspace_service
     from deeptutor.tools.media_gen_tool import ImagegenTool
+    from deeptutor.tools.workspace import WorkspacePresentTool
 
     async def fake_generate_image(prompt: str, **_kwargs: Any) -> list[tuple[bytes, str]]:
         return [(b"\x89PNG\r\n\x1a\nfake", "image/png")]
 
     monkeypatch.setattr(imagegen_mod, "generate_image", fake_generate_image)
+    selected = tmp_path / "sdk-workspace"
+    selected.mkdir()
+    monkeypatch.setenv("DEEPTUTOR_WORKSPACE_ROOT", str(selected))
 
-    task_root = get_path_service().get_task_workspace("chat", "media_gen")
-    try:
-        result = await ImagegenTool().execute(prompt="fallback image")
-        assert result.success, result.content
-        artifacts = result.metadata.get("artifacts") or []
-        assert artifacts, "tool produced no artifacts"
-        assert artifacts[0]["url"].startswith("/files/outputs/")
-        assert "/workspace/chat/chat/media_gen/media/" in artifacts[0]["url"]
-    finally:
-        shutil.rmtree(task_root, ignore_errors=True)
+    result = await ImagegenTool().execute(prompt="fallback image")
+
+    assert result.success, result.content
+    artifacts = result.metadata.get("artifacts") or []
+    assert len(artifacts) == 1
+    assert artifacts[0]["relative_path"].startswith("outputs/chat/direct/media_gen/media/imagegen_")
+    assert (selected / artifacts[0]["relative_path"]).read_bytes().endswith(b"fake")
+    assert result.metadata.get("workspace_items") == []
+    assert result.sources == []
+    service = get_content_workspace_service()
+    binding = service.current_binding()
+    presentation = await WorkspacePresentTool().execute(
+        items=[{"path": artifacts[0]["relative_path"]}],
+        _workspace_id=binding.workspace_id,
+    )
+    items = presentation.metadata.get("workspace_items") or []
+    assert len(items) == 1
+    assert items[0]["url"].startswith("/files/workspace-items/")
 
 
 @pytest.mark.asyncio
-async def test_videogen_tool_forwards_progress_and_saves(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_videogen_tool_forwards_progress_then_presents(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """videogen must forward progress to its event_sink (resets the chat idle
     watchdog during long renders) and save the video to a public path."""
-    import shutil
-
-    from deeptutor.services.path_service import get_path_service
     import deeptutor.services.videogen as videogen_mod
+    from deeptutor.services.workspace import get_content_workspace_service
     from deeptutor.tools.media_gen_tool import VideogenTool
+    from deeptutor.tools.workspace import WorkspacePresentTool
 
     async def fake_generate_video(
         prompt: str, *, progress: Any = None, **_kwargs: Any
@@ -566,25 +693,43 @@ async def test_videogen_tool_forwards_progress_and_saves(monkeypatch: pytest.Mon
     async def event_sink(event_type: str, message: str = "", metadata: Any = None) -> None:
         events.append((event_type, message))
 
-    workspace = get_path_service().get_task_workspace("chat", "test_videogen_tool") / "media"
-    workspace.mkdir(parents=True, exist_ok=True)
-    try:
-        result = await VideogenTool().execute(
-            prompt="an ocean wave",
-            _workspace_dir=str(workspace),
-            event_sink=event_sink,
-        )
-        assert result.success, result.content
-        assert any("rendering" in message for _, message in events), events
-        artifacts = result.metadata.get("artifacts") or []
-        assert artifacts, "tool produced no artifacts"
-        assert artifacts[0]["url"].startswith("/files/outputs/")
-        assert artifacts[0]["mime_type"] == "video/mp4"
-    finally:
-        shutil.rmtree(
-            get_path_service().get_task_workspace("chat", "test_videogen_tool"),
-            ignore_errors=True,
-        )
+    selected = tmp_path / "video-workspace"
+    selected.mkdir()
+    monkeypatch.setenv("DEEPTUTOR_WORKSPACE_ROOT", str(selected))
+    workspace_service = get_content_workspace_service()
+    runtime = workspace_service.create_runtime_context(
+        capability="chat", session_id="session-v", turn_id="turn-v"
+    )
+
+    result = await VideogenTool().execute(
+        prompt="an ocean wave",
+        _workspace_dir=str(Path(runtime.output_dir) / "media"),
+        _workspace_id=runtime.workspace_id,
+        event_sink=event_sink,
+    )
+
+    assert result.success, result.content
+    assert any("rendering" in message for _, message in events), events
+    artifacts = result.metadata.get("artifacts") or []
+    assert len(artifacts) == 1
+    assert artifacts[0]["relative_path"].startswith("outputs/chat/session-v/turn-v/media/videogen_")
+    assert artifacts[0]["path"] == artifacts[0]["relative_path"]
+    assert artifacts[0]["url"] == ""
+    assert artifacts[0]["mime_type"] == "video/mp4"
+    assert result.metadata.get("workspace_items") == []
+    assert result.sources == []
+    assert "not yet presented" in result.content
+    presentation = await WorkspacePresentTool().execute(
+        items=[{"path": artifacts[0]["relative_path"]}],
+        _workspace_id=runtime.workspace_id,
+    )
+    items = presentation.metadata.get("workspace_items") or []
+    assert len(items) == 1
+    snapshot, published = workspace_service.resolve_published_item(
+        runtime.workspace_id, items[0]["workspace_item_id"]
+    )
+    assert snapshot.read_bytes() == b"MP4DATA"
+    assert published.mime_type == "video/mp4"
 
 
 @pytest.mark.asyncio

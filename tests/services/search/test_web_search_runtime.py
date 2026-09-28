@@ -2,12 +2,57 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, wait
+import threading
+import time
+
 import pytest
 
 from deeptutor.services.config.provider_runtime import ResolvedSearchConfig
 from deeptutor.services.search import web_search
-from deeptutor.services.search.source_filter import filter_web_search_response
+from deeptutor.services.search.source_filter import (
+    EDUCATIONAL_TRUSTED_DOMAINS,
+    filter_web_search_response,
+    settings_from_config,
+)
 from deeptutor.services.search.types import Citation, SearchResult, WebSearchResponse
+
+
+@pytest.fixture(autouse=True)
+def _reset_web_risk_cache():
+    """Keep the module-level Web Risk TTL cache from leaking between tests."""
+    from deeptutor.services.search import source_filter
+
+    source_filter._web_risk_cache.clear()
+    yield
+    source_filter._web_risk_cache.clear()
+
+
+def _expected_source_filter(
+    *,
+    removed_citations: int = 0,
+    removed_search_results: int = 0,
+    rejected_hosts: list[str] | None = None,
+    rejected_reasons: list[str] | None = None,
+    answer_invalidated: bool = False,
+    content_filtering: bool = True,
+    moderation_enabled: bool = False,
+    web_risk_enabled: bool = False,
+    educational_trusted_domains: bool = False,
+    citations_renumbered: bool = False,
+) -> dict:
+    return {
+        "removed_citations": removed_citations,
+        "removed_search_results": removed_search_results,
+        "rejected_hosts": rejected_hosts or [],
+        "rejected_reasons": rejected_reasons or [],
+        "answer_invalidated": answer_invalidated,
+        "content_filtering": content_filtering,
+        "moderation_enabled": moderation_enabled,
+        "web_risk_enabled": web_risk_enabled,
+        "educational_trusted_domains": educational_trusted_domains,
+        **({"citations_renumbered": True} if citations_renumbered else {}),
+    }
 
 
 class _FakeProvider:
@@ -265,7 +310,7 @@ def test_web_search_explicit_provider_uses_its_own_key(monkeypatch) -> None:
     assert captured["kwargs"]["api_key"] == "tavily-key"
 
 
-def test_source_filter_removes_unsafe_references_and_preserves_ids() -> None:
+def test_source_filter_removes_unsafe_references_and_renumbers_ids() -> None:
     response = WebSearchResponse(
         query="safe references",
         answer="",
@@ -283,15 +328,20 @@ def test_source_filter_removes_unsafe_references_and_preserves_ids() -> None:
 
     filtered = filter_web_search_response(response)
 
-    assert [citation.id for citation in filtered.citations] == [2]
-    assert [citation.reference for citation in filtered.citations] == ["[2]"]
+    assert [citation.id for citation in filtered.citations] == [1]
+    assert [citation.reference for citation in filtered.citations] == ["[1]"]
     assert [result.title for result in filtered.search_results] == ["Safe"]
-    assert filtered.metadata["source_filter"] == {
-        "removed_citations": 2,
-        "removed_search_results": 1,
-        "rejected_hosts": ["example.com", "127.0.0.1"],
-        "answer_invalidated": False,
-    }
+    assert filtered.metadata["source_filter"] == _expected_source_filter(
+        removed_citations=2,
+        removed_search_results=1,
+        rejected_hosts=["example.com", "127.0.0.1"],
+        rejected_reasons=[
+            "unsupported_scheme",
+            "embedded_credentials",
+            "unsupported_port",
+        ],
+        citations_renumbered=True,
+    )
 
 
 def test_source_filter_supports_blocked_and_trusted_domain_policies() -> None:
@@ -360,15 +410,16 @@ def test_web_search_filters_provider_results_before_consolidation(monkeypatch) -
     assert "spam.example" not in result["answer"]
     assert "**[1] School**" in result["answer"]
     assert [row["url"] for row in result["search_results"]] == ["https://school.example/a"]
-    assert result["source_filter"] == {
-        "removed_citations": 1,
-        "removed_search_results": 1,
-        "rejected_hosts": ["spam.example"],
-        "answer_invalidated": False,
-    }
+    assert result["source_filter"] == _expected_source_filter(
+        removed_citations=1,
+        removed_search_results=1,
+        rejected_hosts=["spam.example"],
+        rejected_reasons=["blocked_domain"],
+        citations_renumbered=True,
+    )
 
 
-def test_web_search_filters_answer_provider_citations_without_renumbering(monkeypatch) -> None:
+def test_web_search_filters_answer_provider_citations_with_renumbering(monkeypatch) -> None:
     class _AnswerProvider(_FakeProvider):
         def __init__(self, name: str):
             super().__init__(name, supports_answer=True)
@@ -414,6 +465,426 @@ def test_web_search_filters_answer_provider_citations_without_renumbering(monkey
 
     assert "Unsafe claim" not in result["answer"]
     assert "School" in result["answer"]
-    assert [citation["reference"] for citation in result["citations"]] == ["[2]"]
+    assert [citation["reference"] for citation in result["citations"]] == ["[1]"]
     assert result["source_filter"]["removed_citations"] == 1
     assert result["source_filter"]["answer_invalidated"] is True
+    assert result["source_filter"]["citations_renumbered"] is True
+
+
+def test_source_filter_drops_unsafe_title_and_snippet_content() -> None:
+    response = WebSearchResponse(
+        query="math",
+        answer="",
+        provider="test",
+        citations=[
+            Citation(
+                id=1,
+                reference="[1]",
+                url="https://lesson.example/algebra",
+                title="Free porn tube clips",
+                snippet="watch now",
+            ),
+            Citation(
+                id=2,
+                reference="[2]",
+                url="https://lesson.example/geometry",
+                title="Triangle congruence",
+                snippet="SAS and ASA",
+            ),
+        ],
+        search_results=[
+            SearchResult(
+                title="Online casino jackpots",
+                url="https://lesson.example/casino",
+                snippet="spin the wheel",
+            ),
+            SearchResult(
+                title="Pythagorean theorem",
+                url="https://lesson.example/pythagoras",
+                snippet="a^2 + b^2 = c^2",
+            ),
+        ],
+    )
+
+    filtered = filter_web_search_response(response)
+
+    assert [c.id for c in filtered.citations] == [1]
+    assert [c.reference for c in filtered.citations] == ["[1]"]
+    assert [r.title for r in filtered.search_results] == ["Pythagorean theorem"]
+    assert "unsafe_content" in filtered.metadata["source_filter"]["rejected_reasons"]
+    assert filtered.metadata["source_filter"]["content_filtering"] is True
+
+
+def test_source_filter_content_filtering_can_be_disabled() -> None:
+    response = WebSearchResponse(
+        query="math",
+        answer="",
+        provider="test",
+        citations=[
+            Citation(
+                id=1,
+                reference="[1]",
+                url="https://lesson.example/a",
+                title="Free porn tube clips",
+                snippet="nsfw",
+            ),
+        ],
+        search_results=[],
+    )
+
+    filtered = filter_web_search_response(response, content_filtering=False)
+
+    assert len(filtered.citations) == 1
+    assert filtered.metadata["source_filter"]["content_filtering"] is False
+    assert filtered.metadata["source_filter"]["removed_citations"] == 0
+
+
+def test_source_filter_educational_trusted_domains_are_opt_in() -> None:
+    response = WebSearchResponse(
+        query="history",
+        answer="",
+        provider="test",
+        citations=[
+            Citation(id=1, reference="[1]", url="https://en.wikipedia.org/wiki/Gravity"),
+            Citation(id=2, reference="[2]", url="https://random.blog.example/post"),
+        ],
+        search_results=[],
+    )
+
+    # Without the educational preset, an empty trusted list means no allowlist.
+    open_policy = filter_web_search_response(response)
+    assert len(open_policy.citations) == 2
+    assert open_policy.metadata["source_filter"]["educational_trusted_domains"] is False
+
+    locked = filter_web_search_response(
+        WebSearchResponse(
+            query="history",
+            answer="",
+            provider="test",
+            citations=[
+                Citation(id=1, reference="[1]", url="https://en.wikipedia.org/wiki/Gravity"),
+                Citation(id=2, reference="[2]", url="https://random.blog.example/post"),
+            ],
+            search_results=[],
+        ),
+        use_educational_trusted_domains=True,
+    )
+    assert [c.url for c in locked.citations] == ["https://en.wikipedia.org/wiki/Gravity"]
+    assert locked.metadata["source_filter"]["educational_trusted_domains"] is True
+    assert "untrusted_domain" in locked.metadata["source_filter"]["rejected_reasons"]
+    assert "wikipedia.org" in EDUCATIONAL_TRUSTED_DOMAINS
+
+
+def test_source_filter_optional_moderation_uses_injected_requester() -> None:
+    calls: list[list[str]] = []
+
+    def _fake_moderation(texts: list[str], *, api_key: str) -> list[bool]:
+        assert api_key == "sk-test"
+        calls.append(texts)
+        return ["flag this" in text.lower() for text in texts]
+
+    response = WebSearchResponse(
+        query="news",
+        answer="",
+        provider="test",
+        citations=[
+            Citation(
+                id=1,
+                reference="[1]",
+                url="https://news.example/a",
+                title="Ordinary headline",
+                snippet="flag this please",
+            ),
+            Citation(
+                id=2,
+                reference="[2]",
+                url="https://news.example/b",
+                title="Keep me",
+                snippet="classroom notes",
+            ),
+        ],
+        search_results=[],
+    )
+
+    filtered = filter_web_search_response(
+        response,
+        content_filtering=False,
+        use_moderation=True,
+        moderation_api_key="sk-test",
+        request_moderation=_fake_moderation,
+    )
+
+    assert [c.id for c in filtered.citations] == [1]
+    assert [c.reference for c in filtered.citations] == ["[1]"]
+    assert filtered.metadata["source_filter"]["moderation_enabled"] is True
+    assert "moderation_flagged" in filtered.metadata["source_filter"]["rejected_reasons"]
+    assert len(calls) == 1
+    assert len(calls[0]) == 2
+
+
+def test_source_filter_moderation_fails_open_on_errors() -> None:
+    def _boom(texts: list[str], *, api_key: str) -> list[bool]:
+        raise RuntimeError("moderation down")
+
+    response = WebSearchResponse(
+        query="news",
+        answer="",
+        provider="test",
+        citations=[
+            Citation(
+                id=1,
+                reference="[1]",
+                url="https://news.example/a",
+                title="Keep me",
+                snippet="classroom notes",
+            ),
+        ],
+        search_results=[],
+    )
+
+    filtered = filter_web_search_response(
+        response,
+        content_filtering=False,
+        use_moderation=True,
+        moderation_api_key="sk-test",
+        request_moderation=_boom,
+    )
+
+    assert len(filtered.citations) == 1
+    assert filtered.metadata["source_filter"]["removed_citations"] == 0
+
+
+def test_settings_from_config_defaults_and_educational_flag(monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPTUTOR_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_WEB_RISK_API_KEY", raising=False)
+    monkeypatch.delenv("WEB_RISK_API_KEY", raising=False)
+
+    defaults = settings_from_config({})
+    assert defaults["enabled"] is True
+    assert defaults["content_filtering"] is True
+    assert defaults["use_educational_trusted_domains"] is False
+    assert defaults["use_moderation"] is False
+    assert defaults["moderation_api_key"] == ""
+    assert defaults["use_web_risk"] is False
+    assert defaults["web_risk_api_key"] == ""
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-from-env")
+    monkeypatch.setenv("GOOGLE_WEB_RISK_API_KEY", "wr-from-env")
+    enabled = settings_from_config(
+        {
+            "source_filtering": {
+                "use_moderation": True,
+                "use_web_risk": True,
+                "use_educational_trusted_domains": True,
+                "content_filtering": False,
+            }
+        }
+    )
+    assert enabled["use_moderation"] is True
+    assert enabled["moderation_api_key"] == "sk-from-env"
+    assert enabled["use_web_risk"] is True
+    assert enabled["web_risk_api_key"] == "wr-from-env"
+    assert enabled["use_educational_trusted_domains"] is True
+    assert enabled["content_filtering"] is False
+
+
+def test_source_filter_optional_web_risk_uses_injected_requester() -> None:
+    looked_up: list[str] = []
+
+    def _fake_web_risk(url: str, *, api_key: str) -> bool:
+        assert api_key == "wr-test"
+        looked_up.append(url)
+        return "scam.example" in url
+
+    response = WebSearchResponse(
+        query="homework",
+        answer="",
+        provider="test",
+        citations=[
+            Citation(id=1, reference="[1]", url="https://scam.example/gift"),
+            Citation(id=2, reference="[2]", url="https://school.example/lesson"),
+            Citation(id=3, reference="[3]", url="https://school.example/lesson"),
+        ],
+        search_results=[],
+    )
+
+    filtered = filter_web_search_response(
+        response,
+        content_filtering=False,
+        use_web_risk=True,
+        web_risk_api_key="wr-test",
+        request_web_risk=_fake_web_risk,
+    )
+
+    # Duplicate URLs are deduplicated before hitting the lookup API.
+    assert looked_up == ["https://scam.example/gift", "https://school.example/lesson"]
+    assert [citation.id for citation in filtered.citations] == [1, 2]
+    assert [citation.reference for citation in filtered.citations] == ["[1]", "[2]"]
+    assert [citation.url for citation in filtered.citations] == [
+        "https://school.example/lesson",
+        "https://school.example/lesson",
+    ]
+    metadata = filtered.metadata["source_filter"]
+    assert metadata["web_risk_enabled"] is True
+    assert metadata["citations_renumbered"] is True
+    assert metadata["rejected_reasons"] == ["web_risk_threat"]
+    assert metadata["rejected_hosts"] == ["scam.example"]
+
+
+def test_source_filter_web_risk_fails_open_on_errors() -> None:
+    def _boom(url: str, *, api_key: str) -> bool:
+        raise RuntimeError("web risk down")
+
+    response = WebSearchResponse(
+        query="homework",
+        answer="",
+        provider="test",
+        citations=[Citation(id=1, reference="[1]", url="https://school.example/lesson")],
+        search_results=[],
+    )
+
+    filtered = filter_web_search_response(
+        response,
+        content_filtering=False,
+        use_web_risk=True,
+        web_risk_api_key="wr-test",
+        request_web_risk=_boom,
+    )
+
+    assert len(filtered.citations) == 1
+    assert filtered.metadata["source_filter"]["removed_citations"] == 0
+    assert "citations_renumbered" not in filtered.metadata["source_filter"]
+
+
+def test_source_filter_web_risk_requires_key_and_skips_earlier_rejections() -> None:
+    looked_up: list[str] = []
+
+    def _fake_web_risk(url: str, *, api_key: str) -> bool:
+        looked_up.append(url)
+        return False
+
+    response = WebSearchResponse(
+        query="homework",
+        answer="",
+        provider="test",
+        citations=[
+            Citation(id=1, reference="[1]", url="https://spam.example/a"),
+            Citation(id=2, reference="[2]", url="https://school.example/lesson"),
+        ],
+        search_results=[],
+    )
+
+    # No key configured: the stage stays off entirely.
+    filtered = filter_web_search_response(
+        response,
+        content_filtering=False,
+        use_web_risk=True,
+        web_risk_api_key="",
+        request_web_risk=_fake_web_risk,
+    )
+    assert len(filtered.citations) == 2
+    assert filtered.metadata["source_filter"]["web_risk_enabled"] is False
+
+    # Blocked-domain rows never reach the lookup.
+    filtered = filter_web_search_response(
+        response,
+        content_filtering=False,
+        blocked_domains=["spam.example"],
+        use_web_risk=True,
+        web_risk_api_key="wr-test",
+        request_web_risk=_fake_web_risk,
+    )
+    assert [citation.url for citation in filtered.citations] == ["https://school.example/lesson"]
+    assert filtered.metadata["source_filter"]["rejected_reasons"] == ["blocked_domain"]
+    assert looked_up == ["https://school.example/lesson"]
+
+
+def test_source_filter_web_risk_caches_lookups() -> None:
+    from deeptutor.services.search import source_filter
+
+    source_filter._web_risk_cache.clear()
+
+    calls: list[str] = []
+
+    def _fake_web_risk(url: str, *, api_key: str) -> bool:
+        calls.append(url)
+        return False
+
+    first = WebSearchResponse(
+        query="q1",
+        answer="",
+        provider="test",
+        citations=[Citation(id=1, reference="[1]", url="https://school.example/lesson")],
+        search_results=[],
+    )
+    second = WebSearchResponse(
+        query="q2",
+        answer="",
+        provider="test",
+        citations=[Citation(id=1, reference="[1]", url="https://school.example/lesson")],
+        search_results=[],
+    )
+
+    filter_web_search_response(
+        first,
+        content_filtering=False,
+        use_web_risk=True,
+        web_risk_api_key="wr-test",
+        request_web_risk=_fake_web_risk,
+    )
+    filter_web_search_response(
+        second,
+        content_filtering=False,
+        use_web_risk=True,
+        web_risk_api_key="wr-test",
+        request_web_risk=_fake_web_risk,
+    )
+
+    assert calls == ["https://school.example/lesson"]
+    source_filter._web_risk_cache.clear()
+
+
+def test_web_risk_batch_has_one_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    from deeptutor.services.search import source_filter
+
+    monkeypatch.setattr(source_filter, "_WEB_RISK_BATCH_TIMEOUT_S", 0.05)
+
+    def slow(_url: str, *, api_key: str) -> bool:
+        time.sleep(0.2)
+        return False
+
+    started = time.monotonic()
+    urls = [f"https://example.org/page-{i}" for i in range(12)]
+    assert source_filter._web_risk_rejections(urls, api_key="test", request_web_risk=slow) == set()
+    assert time.monotonic() - started < 0.15
+    wait(list(source_filter._web_risk_inflight.values()), timeout=2)
+
+
+def test_concurrent_web_risk_calls_share_inflight_lookup() -> None:
+    from deeptutor.services.search import source_filter
+
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def lookup(_url: str, *, api_key: str) -> bool:
+        nonlocal calls
+        calls += 1
+        started.set()
+        assert release.wait(2)
+        return True
+
+    url = "https://example.org/shared-lookup"
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            source_filter._web_risk_rejections, [url], api_key="test", request_web_risk=lookup
+        )
+        assert started.wait(2)
+        second = executor.submit(
+            source_filter._web_risk_rejections, [url], api_key="test", request_web_risk=lookup
+        )
+        release.set()
+        assert first.result(timeout=2) == {url}
+        assert second.result(timeout=2) == {url}
+    assert calls == 1

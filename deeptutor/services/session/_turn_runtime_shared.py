@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 import logging
 import re
 from typing import TYPE_CHECKING, Any, Literal
+import unicodedata
 
 from deeptutor.core.stream import StreamEvent, StreamEventType
 from deeptutor.services.llm.utils import clean_thinking_tags
@@ -28,9 +29,10 @@ MemoryReference = Literal["recent", "profile", "scope", "preferences", "summary"
 
 
 # Content call_kinds that make up the persisted answer. The chat agent loop
-# streams every round's text as ``content`` with ``agent_loop_round``; the
-# finish round (and forced-finish) are the answer, narration rounds are
-# filtered back out via their ``call_role`` marker (see _narration_marker_call_id).
+# streams every round's text as ``content`` with ``agent_loop_round``, and all
+# of it is the answer — the commentary a round wrote before calling a tool
+# included. Only a round a capability retracted is filtered back out (see
+# _retracted_round_call_id).
 _ANSWER_CONTENT_CALL_KINDS = frozenset({"llm_final_response", "agent_loop_round"})
 _FINAL_TURN_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
@@ -83,21 +85,35 @@ def _resolve_turn_outcome(
     return status, error
 
 
-def _narration_marker_call_id(event: StreamEvent) -> str | None:
-    """call_id of a chat-loop round that resolved as narration (a short
-    preamble streamed alongside a tool call). Its text belongs to the trace,
-    not the persisted answer, so it is excluded when assembling content.
+def _resolve_turn_failure_metadata(
+    assistant_events: Sequence[dict[str, Any]],
+) -> tuple[str, bool]:
+    """Recover structured failure metadata from a terminal error event."""
+    for event in reversed(assistant_events):
+        metadata = event.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        if event.get("type") != StreamEventType.ERROR.value or not metadata.get("turn_terminal"):
+            continue
+        code = str(metadata.get("error_code") or "")
+        retryable = _coerce_bool(metadata.get("retryable"), False)
+        return code, retryable
+    return "", False
 
-    A round may explicitly keep learner-facing prose surrounding a call via
-    ``answer_visible`` (for example DSML or mastery tutoring); that narrow
-    exception remains part of the persisted answer.
+
+def _retracted_round_call_id(event: StreamEvent) -> str | None:
+    """call_id of a chat-loop round whose prose was taken back out of the answer.
+
+    Commentary a round wrote before calling a tool is answer content — the
+    reader was shown it as the work happened, and the persisted answer keeps it
+    so a reloaded turn reads the way it did live. The single exception is a
+    round a capability's finish guard rejected, which republishes its marker
+    with ``answer_visible: False``; that text belongs to the trace only.
     """
     metadata = event.metadata or {}
     if (
         metadata.get("trace_kind") == "call_status"
         and metadata.get("call_state") == "complete"
-        and metadata.get("call_role") == "narration"
-        and metadata.get("answer_visible") is not True
+        and metadata.get("answer_visible") is False
     ):
         call_id = metadata.get("call_id")
         return str(call_id) if call_id else None
@@ -106,25 +122,185 @@ def _narration_marker_call_id(event: StreamEvent) -> str | None:
 
 def _assemble_persisted_answer(
     content_segments: Sequence[tuple[str | None, str]],
-    narration_call_ids: set[str],
+    retracted_call_ids: set[str],
 ) -> str:
-    """Replay visible content bytes, excluding trace-only narration rounds."""
+    """Replay visible content bytes, excluding rounds a capability retracted."""
     return clean_thinking_tags(
         "".join(
             text
             for call_id, text in content_segments
-            if not (call_id and call_id in narration_call_ids)
+            if not (call_id and call_id in retracted_call_ids)
         )
     )
 
 
-def _stamp_ask_user_content_offset(
+_FENCED_CODE_BLOCK_RE = re.compile(r"```[\s\S]*?```")
+_INLINE_CODE_SPAN_RE = re.compile(r"`[^`\n]*`")
+_MATH_SPAN_RE = re.compile(
+    r"\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)|\$\$[\s\S]*?\$\$|\$(?!\s)(?:\\.|[^$\n])*?(?<!\s)\$"
+)
+
+
+def _is_escaped(text: str, index: int) -> bool:
+    """Whether the character at index has an odd-length backslash prefix."""
+    slash_count = 0
+    cursor = index - 1
+    while cursor >= 0 and text[cursor] == "\\":
+        slash_count += 1
+        cursor -= 1
+    return slash_count % 2 == 1
+
+
+def _is_emphasis_normal_character(value: str | None) -> bool:
+    return bool(value and (value.isalpha() or value.isnumeric()))
+
+
+def _is_emphasis_punctuation_or_symbol(value: str | None) -> bool:
+    return bool(value and unicodedata.category(value)[0] in {"P", "S"})
+
+
+def _can_open_emphasis(line: str, index: int, marker: str) -> bool:
+    before = line[index - 1] if index else None
+    after_index = index + len(marker)
+    after = line[after_index] if after_index < len(line) else None
+    if after is None or after.isspace():
+        return False
+    if _is_emphasis_punctuation_or_symbol(after):
+        return (
+            before is None
+            or before.isspace()
+            or _is_emphasis_punctuation_or_symbol(before)
+            or _is_emphasis_normal_character(before)
+        )
+    return True
+
+
+def _can_close_emphasis(line: str, index: int, marker: str) -> bool:
+    before = line[index - 1] if index else None
+    after_index = index + len(marker)
+    after = line[after_index] if after_index < len(line) else None
+    if before is None or before.isspace():
+        return False
+    if _is_emphasis_punctuation_or_symbol(before):
+        return (
+            after is None
+            or after.isspace()
+            or _is_emphasis_punctuation_or_symbol(after)
+            or _is_emphasis_normal_character(after)
+        )
+    return True
+
+
+def _paired_emphasis_delimiters(line: str) -> list[tuple[str, int, int]]:
+    """Return only syntactically plausible (marker, left opener, right closer) pairs."""
+    openers: dict[str, list[int]] = {"*": [], "**": []}
+    pairs: list[tuple[str, int, int]] = []
+    cursor = 0
+    while cursor < len(line):
+        if line[cursor] != "*" or _is_escaped(line, cursor):
+            cursor += 1
+            continue
+        run_end = cursor
+        while run_end < len(line) and line[run_end] == "*":
+            run_end += 1
+        marker = line[cursor:run_end]
+        if marker in openers:
+            can_open = _can_open_emphasis(line, cursor, marker)
+            can_close = _can_close_emphasis(line, cursor, marker)
+            if can_close and openers[marker]:
+                pairs.append((marker, openers[marker].pop(), cursor))
+            elif can_open:
+                openers[marker].append(cursor)
+        cursor = run_end
+    return pairs
+
+
+def _repair_chinese_emphasis_line(line: str) -> str:
+    insertions: set[int] = set()
+    for marker, left_opener, right_closer in _paired_emphasis_delimiters(line):
+        left_before = line[left_opener - 1] if left_opener else None
+        left_inside = (
+            line[left_opener + len(marker)] if left_opener + len(marker) < len(line) else None
+        )
+        right_inside = line[right_closer - 1] if right_closer else None
+        right_after_index = right_closer + len(marker)
+        right_after = line[right_after_index] if right_after_index < len(line) else None
+
+        left_needs_space = _is_emphasis_normal_character(
+            left_before
+        ) and _is_emphasis_punctuation_or_symbol(left_inside)
+        right_needs_space = _is_emphasis_punctuation_or_symbol(
+            right_inside
+        ) and _is_emphasis_normal_character(right_after)
+        if left_needs_space:
+            insertions.add(left_opener)
+        if right_needs_space:
+            insertions.add(right_after_index)
+
+        # Only mirror a required repair onto the other marker in THIS pair.
+        if left_needs_space != right_needs_space:
+            if _is_emphasis_normal_character(right_inside) and _is_emphasis_normal_character(
+                right_after
+            ):
+                insertions.add(right_after_index)
+            elif _is_emphasis_normal_character(left_before) and _is_emphasis_normal_character(
+                left_inside
+            ):
+                insertions.add(left_opener)
+
+    for index in sorted(insertions, reverse=True):
+        line = f"{line[:index]} {line[index:]}"
+    return line
+
+
+def _repair_chinese_emphasis_for_persistence(content: str, language: str) -> str:
+    """Normalize CJK Markdown emphasis before the assistant answer is stored.
+
+    This deliberately runs only for Chinese model output and leaves code and
+    mathematics literal, so the persisted source matches its valid rendering.
+    """
+    if not content or not str(language or "").lower().startswith("zh"):
+        return content
+    protected: list[str] = []
+
+    def mask(match: re.Match[str]) -> str:
+        protected.append(match.group(0))
+        return f"\x00CJK_PROTECTED_{len(protected) - 1}\x00"
+
+    masked = _FENCED_CODE_BLOCK_RE.sub(mask, content)
+    masked = _MATH_SPAN_RE.sub(mask, masked)
+    masked = _INLINE_CODE_SPAN_RE.sub(mask, masked)
+    repaired = "\n".join(_repair_chinese_emphasis_line(line) for line in masked.split("\n"))
+    return re.sub(
+        r"\x00CJK_PROTECTED_(\d+)\x00",
+        lambda match: protected[int(match.group(1))],
+        repaired,
+    )
+
+
+def _stamp_content_offset(
     payload_event: dict[str, Any],
     assistant_content: str,
 ) -> None:
-    """Attach the replay boundary to a persisted ask_user resolution event."""
+    """Attach the replay boundary to an event the answer must be laid out around.
+
+    A settled turn is reloaded from an event *preview* that carries no
+    ``content`` events (see the web client's ``compactTracePreview``), so the
+    body has to be rebuilt from the persisted answer string. Without a mark
+    saying how much of that answer had been written when a row appeared, every
+    tool call and card would pile up at one end and the reload would not
+    resemble what the reader watched.
+
+    Two kinds of event carry the mark: a resolved ``ask_user`` card, and the
+    start of a tool call. Both are rendered between runs of answer text.
+    """
     metadata = payload_event.get("metadata")
-    if isinstance(metadata, dict) and metadata.get("ask_user_resolved"):
+    if not isinstance(metadata, dict):
+        return
+    anchors_layout = bool(metadata.get("ask_user_resolved")) or (
+        payload_event.get("type") == StreamEventType.TOOL_CALL.value
+    )
+    if anchors_layout:
         metadata.setdefault("assistant_content_offset", len(assistant_content))
 
 
@@ -411,9 +587,11 @@ def _mastery_action_context(
     return "\n\n".join(lines)
 
 
-# Reading material ids are content hashes; anything else is a client bug or an
+# Reading material ids are content hashes or catalog-minted rm_ ids (a second
+# copy of the same content gets its own catalog row, and the store resolves
+# both to the same content directory); anything else is a client bug or an
 # injection attempt, so the shape is enforced here rather than deeper in.
-_READING_ID_RE = re.compile(r"^[0-9a-f]{8,64}$")
+_READING_ID_RE = re.compile(r"^(?:[0-9a-f]{8,64}|rm_[0-9a-f]{12})$")
 _READING_WORKSPACE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # A selection is quoted back into the prompt, so it is bounded here — the
 # reader has no reason to send more, and a runaway selection must not eat the
@@ -464,6 +642,85 @@ def _reading_viewport(value: Any) -> dict[str, Any]:
     if selection:
         viewport["selection"] = selection[:READING_SELECTION_MAX_CHARS]
     return viewport
+
+
+# Images attached per reading turn when the open page has embedded figures.
+READING_VIEWPORT_MAX_IMAGES = 4
+
+
+def _reading_viewport_page_render(material_id: str, locator: int) -> dict | None:
+    """Thin wrapper over :func:`deeptutor.reading.page_render.page_render_record`.
+
+    The rendering rules (DPI, drawing gate, record shape) live in the reading
+    layer so the capability's viewport narration shares them; this name stays
+    for the session's attachment path.
+    """
+    try:
+        from deeptutor.reading.page_render import page_render_record
+
+        return page_render_record(material_id, locator)
+    except Exception:
+        logger.warning("reading viewport page render failed", exc_info=True)
+        return None
+
+
+def _reading_viewport_image_attachments(material_id: str, viewport: dict[str, Any]) -> list[dict]:
+    """Attachments for the open page: its render first, embedded figures after.
+
+    A drawn page leads with the whole-page raster (the only way a vision model
+    sees a vector diagram); embedded rasters follow. The render consumes one of
+    the ``READING_VIEWPORT_MAX_IMAGES`` slots, and the total is capped there.
+    Pages that do not qualify fall back to the embedded-image records alone.
+    """
+    viewport = viewport if isinstance(viewport, dict) else {}
+    embedded = _reading_viewport_image_records(material_id, viewport)
+    try:
+        locator = int(viewport.get("locator") or 0)
+    except (TypeError, ValueError):
+        locator = 0
+    if not material_id or locator <= 0:
+        return embedded[:READING_VIEWPORT_MAX_IMAGES]
+    rendered = _reading_viewport_page_render(material_id, locator)
+    if rendered is None:
+        return embedded[:READING_VIEWPORT_MAX_IMAGES]
+    return [rendered, *embedded[: READING_VIEWPORT_MAX_IMAGES - 1]]
+
+
+def _reading_viewport_image_records(material_id: str, viewport: dict[str, Any]) -> list[dict]:
+    """Image attachment records for the figures on the currently open page."""
+    try:
+        locator = int(viewport.get("locator") or 0)
+    except (TypeError, ValueError):
+        locator = 0
+    if not material_id or locator <= 0:
+        return []
+    try:
+        import base64
+
+        from deeptutor.reading import ReadingStore
+
+        store = ReadingStore()
+        rows = store.media_items_at(material_id, locator)
+        records: list[dict] = []
+        for index, row in enumerate(rows[:READING_VIEWPORT_MAX_IMAGES], start=1):
+            path = store.media_path(material_id, str(row.get("name") or ""))
+            if path is None:
+                continue
+            records.append(
+                {
+                    "type": "image",
+                    "url": "",
+                    "base64": base64.b64encode(path.read_bytes()).decode("ascii"),
+                    "filename": str(row.get("name") or f"image-{index}.png"),
+                    "mime_type": str(row.get("mime") or "image/png"),
+                    "id": f"rv-{material_id[:12]}-{locator}-{index}",
+                    "embedded": True,
+                }
+            )
+        return records
+    except Exception:
+        logger.warning("reading viewport image lookup failed", exc_info=True)
+        return []
 
 
 def _course_field(value: Any, key: str, default: Any = "") -> Any:
@@ -626,32 +883,54 @@ def _request_snapshot_metadata(
         "enabledTools": _string_list(payload.get("tools")),
         "knowledgeBases": _string_list(payload.get("knowledge_bases")),
         "language": str(payload.get("language", "en") or "en"),
+        # Keep empty values too. A failed turn can be resent after the
+        # conversation preferences have changed; absence would otherwise
+        # cause the retry to pick up the newer tools, sources, or persona.
+        "config": dict(config),
+        "notebookReferences": list(notebook_references),
+        "historyReferences": list(history_references),
+        "partnerGroupReferences": list(partner_group_references),
+        "questionNotebookReferences": list(question_notebook_references),
+        "bookReferences": list(book_references),
+        "readingReferences": list(reading_references),
+        "memoryReferences": list(memory_references),
+        "skills": _string_list(payload.get("skills")),
+        "mcp": _string_list(payload.get("mcp")),
+        "persona": persona,
     }
+    for payload_key, snapshot_key in (
+        ("workspace_id", "workspaceId"),
+        ("course_id", "courseId"),
+        ("mastery_session_mode", "masterySessionMode"),
+        ("auto_route", "autoRoute"),
+    ):
+        if payload_key in payload:
+            snapshot[snapshot_key] = payload[payload_key]
+    for payload_key, snapshot_key in (
+        ("consult_partner_id", "consultPartnerId"),
+        ("partner_discussion_group_id", "partnerDiscussionGroupId"),
+    ):
+        if payload_key in payload:
+            snapshot[snapshot_key] = payload[payload_key]
     workspace_mode = _workspace_mode(payload.get("workspace_mode"), capability=capability)
-    if workspace_mode:
-        snapshot["workspaceMode"] = workspace_mode
+    snapshot["workspaceMode"] = workspace_mode
+    if payload.get("capability_once"):
+        # Kept so a regenerate runs in this mode again without adopting it.
+        snapshot["capabilityOnce"] = True
     if attachments:
         snapshot["attachments"] = attachments
-    if config:
-        snapshot["config"] = dict(config)
     capability_route = payload.get("capability_route")
     if isinstance(capability_route, dict):
         snapshot["capabilityRoute"] = dict(capability_route)
-    if notebook_references:
-        snapshot["notebookReferences"] = notebook_references
-    if history_references:
-        snapshot["historyReferences"] = history_references
-    if partner_group_references:
-        snapshot["partnerGroupReferences"] = partner_group_references
-    if question_notebook_references:
-        snapshot["questionNotebookReferences"] = question_notebook_references
-    if book_references:
-        snapshot["bookReferences"] = book_references
-    if reading_references:
-        snapshot["readingReferences"] = list(reading_references)
     mastery_path_id = _mastery_path_id(payload.get("mastery_path_id"))
-    if mastery_path_id:
-        snapshot["masteryPathId"] = mastery_path_id
+    snapshot["masteryPathId"] = mastery_path_id
+    for payload_key, snapshot_key in (
+        ("mastery_answer", "masteryAnswer"),
+        ("mastery_skip", "masterySkip"),
+    ):
+        value = payload.get(payload_key)
+        if isinstance(value, dict) and value.get("question_id"):
+            snapshot[snapshot_key] = dict(value)
     # Persisted so a regenerate re-runs with the same document open. Without it
     # the reading capability would be inactive on the retry and the answer would
     # silently lose its grounding.
@@ -664,18 +943,26 @@ def _request_snapshot_metadata(
         if reading_material_revision is not None:
             snapshot["readingMaterialRevision"] = reading_material_revision
     reading_workspace_id = _reading_workspace_id(payload.get("reading_workspace_id"))
-    if reading_workspace_id:
-        snapshot["readingWorkspaceId"] = reading_workspace_id
+    snapshot["readingWorkspaceId"] = reading_workspace_id
+    # The passage the question was asked about. Without it the bubble shows a
+    # bare "Explain this" with nothing to say what "this" was, and a
+    # regenerate re-asks it about no passage at all.
+    viewport = _reading_viewport(payload.get("reading_viewport"))
+    if reading_material_id and viewport.get("selection"):
+        snapshot["readingSelection"] = {
+            "quote": viewport["selection"],
+            "locator": viewport.get("locator", 0),
+        }
     timed_media_id = _timed_media_id(payload.get("timed_media_id"))
     if timed_media_id:
         snapshot["timedMediaId"] = timed_media_id
-    if persona:
-        snapshot["persona"] = persona
-    if memory_references:
-        snapshot["memoryReferences"] = memory_references
     if llm_selection:
         snapshot["llmSelection"] = llm_selection
-    return {"request_snapshot": snapshot}
+    metadata: dict[str, Any] = {"request_snapshot": snapshot}
+    client_submission_id = payload.get("client_submission_id")
+    if isinstance(client_submission_id, str) and client_submission_id:
+        metadata["client_submission_id"] = client_submission_id
+    return metadata
 
 
 def _format_question_bank_entry(entry: dict[str, Any]) -> str:

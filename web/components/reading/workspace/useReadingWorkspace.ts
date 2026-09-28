@@ -1,5 +1,7 @@
 "use client";
 
+import { readingCollectionRoute, readingSessionRoute } from "@/lib/learning-routes";
+
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -10,8 +12,7 @@ import { courseSessionConfiguration } from "@/lib/course-session-scope";
 import {
   addBookmark,
   deleteBookmark,
-  getMaterial,
-  getUnitText,
+  getReadingTranscript,
   listBookmarks,
   type ReadingBookmark,
 } from "@/lib/reading-api";
@@ -23,12 +24,10 @@ import { setReadingWorkspace } from "@/lib/reading-turn-state";
 import { READING_WORKSPACE_MODE } from "@/lib/workspace-mode";
 import {
   activateReadingMaterial,
-  deleteReadingConversation,
   generateMasteryPathFromReading,
   getReadingWorkspace,
   listReadingConversations,
   organizeReadingNotes,
-  renameReadingConversation,
   removeReadingWorkspaceMaterial,
   updateReadingWorkspace,
   type OrganizedReadingNotes,
@@ -64,7 +63,6 @@ export function useReadingWorkspace(
     configureSession,
     loadSession,
     newSession,
-    cancelStreamingTurn,
   } = useChatStateAdapter();
 
   const [workspace, setWorkspace] = useState<ReadingWorkspace | null>(null);
@@ -137,21 +135,12 @@ export function useReadingWorkspace(
       closeMaterial();
       return;
     }
-    let cancelled = false;
-    void getMaterial(active.material_id)
-      .then((detail) => {
-        if (!cancelled) return openMaterial(detail);
-      })
-      .catch((caught) => {
-        if (!cancelled)
-          setError(
-            caught instanceof Error ? caught.message : t("Open failed."),
-          );
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [activeTab?.material, closeMaterial, openMaterial, t]);
+    // Let ReadingContext own the request from its first tick. Prefetching the
+    // detail here left `loading` false until that fetch completed, so the
+    // reader briefly rendered its unavailable state between workspace and
+    // material hydration (most visibly in Safari).
+    void openMaterial(active.material_id);
+  }, [activeTab?.material, closeMaterial, openMaterial]);
 
   // Poll while anything is still being processed, backing off as the wait
   // grows. A flat 2.5s forever means a source wedged in "processing" quietly
@@ -240,40 +229,29 @@ export function useReadingWorkspace(
   useEffect(() => {
     if (!material || material.unit !== "segment") return;
     const requestId = ++transcriptRequestRef.current;
-    const limit = Math.min(material.unit_count, 160);
-    void Promise.allSettled(
-      Array.from({ length: limit }, (_, index) => index + 1).map(
-        async (locator) => {
-          const unit = await getUnitText(material.material_id, locator);
-          const ref = material.unit_refs.find((row) => row.locator === locator);
-          if (unit.text === "[Transcript unavailable for this video.]") {
-            return null;
-          }
-          return {
-            locator,
-            title: ref?.title || `${locator}`,
-            text: unit.text,
-            sourceHref: ref?.source_href || "",
-          };
-        },
-      ),
-      // allSettled, not all: one unreadable segment must not discard the other
-      // 159. `all` rejected the whole batch and, with no catch, left the
-      // transcript silently empty behind an unhandled rejection.
-    ).then((results) => {
-      if (transcriptRequestRef.current !== requestId) return;
-      const rows = results
-        .filter(
-          (result): result is PromiseFulfilledResult<TranscriptRow | null> =>
-            result.status === "fulfilled",
-        )
-        .map((result) => result.value)
-        .filter((row): row is TranscriptRow => row !== null);
-      setTranscript(rows);
-      if (!rows.length && results.some((r) => r.status === "rejected")) {
+    // One request for the whole transcript. Segments follow the speaker's
+    // sentences, so a lecture has hundreds of them and fetching each on its own
+    // meant hundreds of round trips before the panel could draw anything.
+    void getReadingTranscript(material.material_id)
+      .then((payload) => {
+        if (transcriptRequestRef.current !== requestId) return;
+        const rows: TranscriptRow[] = payload.segments
+          .filter(
+            (row) => row.text !== "[Transcript unavailable for this video.]",
+          )
+          .map((row) => ({
+            locator: row.locator,
+            title: row.title || `${row.locator}`,
+            text: row.text,
+            sourceHref: row.source_href,
+          }));
+        setTranscript(rows);
+      })
+      .catch(() => {
+        if (transcriptRequestRef.current !== requestId) return;
+        setTranscript([]);
         setNotice(t("This transcript could not be loaded."));
-      }
-    });
+      });
   }, [material, t]);
 
   const activeConversation = useMemo(
@@ -436,7 +414,7 @@ export function useReadingWorkspace(
   const newConversation = useCallback(() => {
     if (!workspace) return;
     newSession({ ...sessionConfiguration, capability: null });
-    router.push(`/reading/${workspace.workspace_id}`);
+    router.push(readingCollectionRoute(workspace.workspace_id));
   }, [
     newSession,
     router,
@@ -468,52 +446,12 @@ export function useReadingWorkspace(
     window.history.replaceState(
       null,
       "",
-      `/reading/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(state.sessionId)}`,
+      readingSessionRoute(workspaceId, state.sessionId),
     );
     void listReadingConversations(workspaceId)
       .then(setConversations)
       .catch(() => {});
   }, [sessionIdParam, state.sessionId, workspaceId]);
-
-  const renameConversation = useCallback(
-    async (sessionId: string, title: string) => {
-      await renameReadingConversation(workspaceId, sessionId, title);
-      setConversations(await listReadingConversations(workspaceId));
-    },
-    [workspaceId],
-  );
-
-  // Mirrors /chat's delete: drop the row, and if it was the conversation on
-  // screen, fall back to a fresh draft rather than leaving the reader looking
-  // at a transcript that no longer exists.
-  const deleteConversation = useCallback(
-    async (sessionId: string) => {
-      await deleteReadingConversation(workspaceId, sessionId);
-      setConversations(await listReadingConversations(workspaceId));
-      if (sessionId === sessionIdParam) {
-        cancelStreamingTurn();
-        newSession({ ...sessionConfiguration, capability: null });
-        router.push(`/reading/${workspaceId}`);
-      }
-    },
-    [
-      cancelStreamingTurn,
-      newSession,
-      router,
-      sessionConfiguration,
-      sessionIdParam,
-      workspaceId,
-    ],
-  );
-
-  const openConversation = useCallback(
-    async (sessionId: string) => {
-      router.push(`/reading/${workspaceId}/sessions/${sessionId}`);
-      await loadSession(sessionId);
-      configureSession(sessionConfiguration, sessionId);
-    },
-    [configureSession, loadSession, router, sessionConfiguration, workspaceId],
-  );
 
   const organizeNotes = useCallback(async () => {
     if (!workspace) return;
@@ -592,9 +530,6 @@ export function useReadingWorkspace(
     switchMaterial,
     removeMaterial,
     newConversation,
-    openConversation,
-    renameConversation,
-    deleteConversation,
     organizeNotes,
     buildMasteryPath,
     renameWorkspace,
