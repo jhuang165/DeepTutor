@@ -42,6 +42,38 @@ export function decideIdleTurnRecovery(
 }
 
 /**
+ * Whether a session snapshot names a turn this tab must subscribe to.
+ *
+ * `running` is the obvious case. `waiting_input` is just as live: the turn is
+ * parked on an ask_user card and its events so far (including the card) exist
+ * only in the turn log, never in the persisted transcript. A page opened or
+ * reloaded in that state has to replay them to show the question at all, and
+ * has to stay subscribed so the answer's continuation arrives.
+ */
+export function shouldSubscribeLoadedTurn(
+  status: string,
+  hasActiveTurn: boolean,
+): boolean {
+  return hasActiveTurn && (status === "running" || status === "waiting_input");
+}
+
+/**
+ * Whether the local copy of a session is mid-turn, so a background snapshot
+ * must not replace it. A turn paused on an ask_user card counts: the card and
+ * the text streamed around it live only in local state.
+ */
+export function hasLiveLocalTurn(session: {
+  isStreaming: boolean;
+  status: string;
+}): boolean {
+  return (
+    session.isStreaming ||
+    session.status === "running" ||
+    session.status === "waiting_input"
+  );
+}
+
+/**
  * Whether a stored `running` status still describes a live turn.
  *
  * The backend sets a session's status to `running` when a turn starts and

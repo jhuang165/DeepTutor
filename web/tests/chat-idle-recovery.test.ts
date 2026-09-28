@@ -4,7 +4,9 @@ import { readFileSync } from "node:fs";
 
 import {
   decideIdleTurnRecovery,
+  hasLiveLocalTurn,
   resolveLoadedRunStatus,
+  shouldSubscribeLoadedTurn,
 } from "../lib/chat-idle-recovery";
 
 test("an idle live turn is resumed instead of being marked failed", () => {
@@ -113,10 +115,31 @@ test("the loader vets the stored status and skips subscribing to a stale turn", 
   assert.match(adapter, /status: restoredStatus,/);
   assert.match(
     adapter,
-    /if \(loadedStatus === "running" && \(activeTurn\?\.turn_id \|\| activeTurn\?\.id\)\)/,
+    /shouldSubscribeLoadedTurn\(\s*loadedStatus,\s*Boolean\(activeTurn\.turn_id \|\| activeTurn\.id\),?\s*\)/,
   );
 
   // And a row with nothing in it is not a message. One such row used to be
   // enough to hide a surface's empty state while rendering an empty bubble.
   assert.match(adapter, /\(message\.attachments\?\.length \?\? 0\) > 0/);
+});
+
+test("a loaded session subscribes to running and paused turns only", () => {
+  assert.equal(shouldSubscribeLoadedTurn("running", true), true);
+  assert.equal(shouldSubscribeLoadedTurn("waiting_input", true), true);
+  assert.equal(shouldSubscribeLoadedTurn("waiting_input", false), false);
+  assert.equal(shouldSubscribeLoadedTurn("completed", true), false);
+  assert.equal(shouldSubscribeLoadedTurn("idle", true), false);
+});
+
+test("a paused local turn is as live as a streaming one", () => {
+  assert.equal(
+    hasLiveLocalTurn({ isStreaming: false, status: "waiting_input" }),
+    true,
+  );
+  assert.equal(hasLiveLocalTurn({ isStreaming: false, status: "running" }), true);
+  assert.equal(hasLiveLocalTurn({ isStreaming: true, status: "idle" }), true);
+  assert.equal(
+    hasLiveLocalTurn({ isStreaming: false, status: "completed" }),
+    false,
+  );
 });

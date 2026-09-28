@@ -50,15 +50,15 @@ export interface ChatOutlineEntry {
 }
 
 /**
- * Stable DOM key for a message bubble. Persisted rows key off their
- * server id; an optimistic (negative-id) or id-less row falls back to
- * its position, which is stable for as long as it is on screen.
+ * Stable DOM key for a rendered message occurrence. The visible-path index
+ * distinguishes duplicate persisted ids and remains stable while the row is
+ * on screen; the id keeps the key traceable to its source message.
  */
 export function turnAnchorKey(
   message: Pick<MessageItem, "id">,
   index: number,
 ): string {
-  return message.id != null ? `m${message.id}` : `i${index}`;
+  return message.id != null ? `m${message.id}-i${index}` : `i${index}`;
 }
 
 /**

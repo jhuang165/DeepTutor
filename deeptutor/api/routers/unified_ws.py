@@ -332,6 +332,13 @@ async def unified_websocket(ws: WebSocket) -> None:
                     )
                 else:
                     await send_command_ack(msg, accepted=True)
+                    if turn_id not in subscription_tasks:
+                        # The reply continues the turn; a socket that never
+                        # subscribed (the page was opened while the turn was
+                        # already paused) would otherwise never see that
+                        # continuation. Replay from 0 is safe: the client's
+                        # transport drops sequence numbers it already has.
+                        await subscribe_turn(turn_id)
                 continue
 
             if msg_type == "regenerate":

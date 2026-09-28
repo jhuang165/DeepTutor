@@ -53,10 +53,23 @@ test("entry keys match the anchor the bubble renders", () => {
   assert.equal(outline[1].key, turnAnchorKey(messages[2], 2));
 });
 
-test("id-less rows fall back to a positional key", () => {
-  assert.equal(turnAnchorKey({ id: 7 }, 3), "m7");
-  assert.equal(turnAnchorKey({ id: -1700000 }, 3), "m-1700000");
+test("message anchor keys include their visible-path position", () => {
+  assert.equal(turnAnchorKey({ id: 7 }, 3), "m7-i3");
+  assert.equal(turnAnchorKey({ id: -1700000 }, 3), "m-1700000-i3");
   assert.equal(turnAnchorKey({}, 3), "i3");
+});
+
+test("duplicate persisted ids produce unique outline keys", () => {
+  const messages: Msg[] = [
+    { id: 1, role: "user", content: "First question", parentMessageId: null },
+    { id: 2, role: "assistant", content: "First answer", parentMessageId: 1 },
+    { id: 1, role: "user", content: "Second question", parentMessageId: 2 },
+  ];
+
+  assert.deepEqual(
+    buildChatOutline(messages, {}).map((entry) => entry.key),
+    ["m1-i0", "m1-i2"],
+  );
 });
 
 test("only the selected edit branch earns ticks", () => {

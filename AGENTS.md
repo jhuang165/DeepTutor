@@ -1,5 +1,9 @@
 # DeepTutor — Agent-Native Architecture
 
+> **Agents working in this fork:** read [CLAUDE.md](CLAUDE.md) first. It is the canonical
+> guide and holds the shared-memory load/checkpoint protocol, local run commands, and
+> verification steps.
+
 ## Overview
 
 DeepTutor is an **agent-native** intelligent learning companion organized

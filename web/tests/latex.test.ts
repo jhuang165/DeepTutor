@@ -47,6 +47,24 @@ test("convertLatexDelimiters: \\\\(...\\\\) → inline $...$", () => {
   assert.ok(result.includes("$x = 2$"));
 });
 
+test("convertLatexDelimiters: protects escaped dollars inside inline math", () => {
+  const input = String.raw`\(\text{ask}-\text{bid}\leq \$0.10\)`;
+  const result = convertLatexDelimiters(input);
+
+  assert.ok(
+    result.includes(String.raw`$\text{ask}-\text{bid}\leq \char36{}0.10$`),
+  );
+  assert.ok(!result.includes(String.raw`\$0.10`));
+});
+
+test("convertLatexDelimiters: leaves escaped dollars outside inline math unchanged", () => {
+  const prose = String.raw`Write \$5 literally.`;
+  const display = String.raw`\[x \leq \$0.10\]`;
+
+  assert.equal(convertLatexDelimiters(prose), prose);
+  assert.ok(convertLatexDelimiters(display).includes(String.raw`x \leq \$0.10`));
+});
+
 test("convertLatexDelimiters: strips \\\\(\\\\) inside $$...$$", () => {
   const input = "$$\\(x^2\\)$$";
   const result = convertLatexDelimiters(input);
