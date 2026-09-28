@@ -31,7 +31,6 @@ from deeptutor.services.web_source.robots import CrawlAccess
 
 # Reuse the SSRF guard and HTML extraction from web_fetch
 from deeptutor.tools.web_fetch import (
-    DEFAULT_MAX_CHARS,
     DEFAULT_TIMEOUT_S,
     DEFAULT_USER_AGENT,
     MAX_RESPONSE_BYTES,
@@ -48,6 +47,9 @@ MAX_CRAWL_DEPTH = 5
 MAX_CRAWL_PAGES = DEFAULT_MAX_PAGES
 DEFAULT_CONCURRENCY = 8
 MAX_REDIRECTS = 5
+# Per-page cap on indexed Markdown. Pages are chunked before retrieval, so this
+# is far above web_fetch's LLM-context cap and only guards against runaway pages.
+MAX_PAGE_CHARS = 500_000
 
 
 @dataclass(frozen=True)
@@ -317,8 +319,8 @@ async def _process_page(
 
     page_headings = extract_headings(body)
 
-    if len(body) > DEFAULT_MAX_CHARS:
-        body = body[:DEFAULT_MAX_CHARS].rstrip() + "\n…[truncated]"
+    if len(body) > MAX_PAGE_CHARS:
+        body = body[:MAX_PAGE_CHARS].rstrip() + "\n…[truncated]"
 
     page = CrawledPage(
         url=final_url,
